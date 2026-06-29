@@ -145,6 +145,8 @@ autostart   = false                        # launch on login
 
 **TeamSpeak / Discord don't see it?** Make sure `pipewire-pulse` is running; Hushmic exposes the mic through it so PulseAudio/ALSA-compat apps can pick it.
 
+**Recording still sounds noisy / unprocessed?** A few apps that use the **Qt Multimedia** backend (some KDE recorders, etc.) capture the hardware device directly and ignore the selected virtual mic. Switch the app to its **PulseAudio/PipeWire** backend, or enable _Set as default microphone_ in the tray so default-following apps pick Hushmic.
+
 ## Alternatives
 
 If Hushmic isn't your thing, these are the other good Linux options:
