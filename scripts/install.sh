@@ -61,12 +61,21 @@ esac
 # ---------------------------------------------------------------------------
 NEED_SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-  if ! mkdir -p "$PREFIX" 2>/dev/null || [ ! -w "$PREFIX" ]; then
+  # A system prefix (anything outside $HOME) needs root even when the prefix
+  # dir itself looks writable: some systems have an oddly user-owned /usr while
+  # its standard subdirs (lib/ladspa, share/...) stay root-owned, which would
+  # otherwise leave a half-written install. Prefixes under $HOME only need sudo
+  # if they are not actually writable.
+  case "$PREFIX/" in
+    "$HOME"/*) _system_prefix=0 ;;
+    *)         _system_prefix=1 ;;
+  esac
+  if [ "$_system_prefix" = 1 ] || ! mkdir -p "$PREFIX" 2>/dev/null || [ ! -w "$PREFIX" ]; then
     if command -v sudo >/dev/null 2>&1; then
       NEED_SUDO="yes"
     else
-      echo "error: writing to '$PREFIX' requires root, and sudo was not found." >&2
-      echo "       Re-run as root, or choose a writable --prefix (e.g. \$HOME/.local)." >&2
+      echo "error: installing to '$PREFIX' requires root, and sudo was not found." >&2
+      echo "       Re-run as root (e.g. 'curl ... | sudo sh') or use --prefix \"\$HOME/.local\"." >&2
       exit 1
     fi
   fi

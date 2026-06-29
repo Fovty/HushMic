@@ -67,7 +67,7 @@ _(Averaged over the 7 scenarios; higher is better, 1–5.)_ DPDFNet came out on 
 **Any distro** (install script, system-wide):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.sh | sudo sh
 ```
 
 **Debian / Ubuntu** (`.deb`):
