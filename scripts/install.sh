@@ -200,8 +200,11 @@ cat > "$uninstaller" <<EOF
 set -eu
 PREFIX="$PREFIX"
 SUDO=""
-if [ "\$(id -u)" -ne 0 ] && [ ! -w "\$PREFIX" ]; then
-  command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+if [ "\$(id -u)" -ne 0 ]; then
+  case "\$PREFIX/" in
+    "\$HOME"/*) [ -w "\$PREFIX" ] || { command -v sudo >/dev/null 2>&1 && SUDO="sudo"; } ;;
+    *)          command -v sudo >/dev/null 2>&1 && SUDO="sudo" ;;
+  esac
 fi
 \$SUDO rm -f "\$PREFIX/bin/hushmic" "\$PREFIX/bin/hushmic-uninstall"
 \$SUDO rm -f "\$PREFIX/lib/ladspa/libdpdfnet_ladspa.so"
