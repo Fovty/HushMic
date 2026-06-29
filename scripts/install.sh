@@ -14,10 +14,11 @@
 set -eu
 
 REPO="Fovty/hushmic"
-VERSION="0.1.0"
 ARCH="x86_64"
-TARBALL="hushmic-${VERSION}-${ARCH}.tar.gz"
-LATEST_URL="https://github.com/${REPO}/releases/latest/download/${TARBALL}"
+# VERSION is derived later from the actual payload (the co-located dir name or
+# the latest release tarball), never hardcoded — so this script does not go
+# stale when the released version changes.
+VERSION=""
 
 PREFIX="/usr"
 ACTION="install"
@@ -138,15 +139,27 @@ if [ -f "$SCRIPT_DIR/bin/hushmic" ]; then
   echo "Installing from co-located release payload: $PAYLOAD"
 else
   echo "No co-located payload; downloading the latest release..."
-  CLEANUP_DIR="$(mktemp -d)"
-  tgz="$CLEANUP_DIR/$TARBALL"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$LATEST_URL" -o "$tgz"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tgz" "$LATEST_URL"
-  else
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     echo "error: need curl or wget to download the release." >&2
     exit 1
+  fi
+  fetch() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"; else wget -qO- "$1"; fi; }
+  # Resolve the latest release's tarball asset URL from the GitHub API, so the
+  # installer is version-independent (works for any future tag, not just 0.1.0).
+  LATEST_URL="$(fetch "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep 'browser_download_url' \
+    | grep -E "hushmic-[0-9][^\"]*-${ARCH}\.tar\.gz" \
+    | head -1 | cut -d'"' -f4)"
+  if [ -z "$LATEST_URL" ]; then
+    echo "error: could not find a hushmic-*-${ARCH}.tar.gz asset in the latest release." >&2
+    exit 1
+  fi
+  CLEANUP_DIR="$(mktemp -d)"
+  tgz="$CLEANUP_DIR/$(basename "$LATEST_URL")"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$LATEST_URL" -o "$tgz"
+  else
+    wget -qO "$tgz" "$LATEST_URL"
   fi
   tar -xzf "$tgz" -C "$CLEANUP_DIR"
   # The tarball has a single top-level dir: hushmic-<ver>-<arch>/
@@ -158,6 +171,11 @@ else
   fi
   echo "Installing from downloaded payload: $PAYLOAD"
 fi
+
+# Version for the summary message, parsed from the payload dir name
+# (hushmic-<ver>-<arch>); falls back gracefully if the name is unexpected.
+VERSION="$(basename "$PAYLOAD" | sed -n "s/^hushmic-\(.*\)-${ARCH}\$/\1/p")"
+[ -n "$VERSION" ] || VERSION="(unknown)"
 
 # ---------------------------------------------------------------------------
 # Install

@@ -48,8 +48,8 @@ jobs:
         with:
           files: |
             dist/hushmic-x86_64.AppImage
-            dist/hushmic_0.1.0-1_amd64.deb
-            dist/hushmic-0.1.0-x86_64.tar.gz
+            dist/hushmic_*_amd64.deb
+            dist/hushmic-*-x86_64.tar.gz
             dist/sha256sums.txt
           generate_release_notes: true
         env:

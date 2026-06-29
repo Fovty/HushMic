@@ -12,7 +12,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-VERSION="0.1.0"
+# Single source of truth: the workspace package version (cargo-deb derives the
+# .deb name from this too, so every artifact name stays consistent on a bump).
+VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
 ARCH="x86_64"
 NAME="hushmic-${VERSION}-${ARCH}"
 DIST="$REPO_ROOT/dist"
