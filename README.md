@@ -1,10 +1,18 @@
-# Hushmic
+<h1 align="center">
+  <img src="docs/img/hushmic-logo.png" alt="Hushmic" width="120"><br>
+  Hushmic
+</h1>
 
-**Real-time microphone noise suppression for Linux, as a system-wide virtual mic.** Open source, runs on the CPU, your audio never leaves the machine.
+<p align="center">
+  <b>Real-time microphone noise suppression for Linux, as a system-wide virtual mic.</b><br>
+  Open source, runs on the CPU, your audio never leaves the machine.
+</p>
 
-[![Release](https://img.shields.io/github/v/release/Fovty/hushmic?sort=semver)](https://github.com/Fovty/hushmic/releases)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Build](https://github.com/Fovty/hushmic/actions/workflows/release.yml/badge.svg)](https://github.com/Fovty/hushmic/actions/workflows/release.yml)
+<p align="center">
+  <a href="https://github.com/Fovty/hushmic/releases"><img src="https://img.shields.io/github/v/release/Fovty/hushmic?sort=semver" alt="Release"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
+  <a href="https://github.com/Fovty/hushmic/actions/workflows/release.yml"><img src="https://github.com/Fovty/hushmic/actions/workflows/release.yml/badge.svg" alt="Build"></a>
+</p>
 
 Hushmic creates a virtual microphone that strips out keyboard clatter, fans, and background chatter in real time. Select **"Hushmic Microphone"** as your input in any app — Discord, TeamSpeak, browsers, OBS, games — and that's it. No EasyEffects graphs to wire up, no terminal, no `setcap`.
 
