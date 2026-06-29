@@ -141,7 +141,7 @@ else
   fi
   tar -xzf "$tgz" -C "$CLEANUP_DIR"
   # The tarball has a single top-level dir: hushmic-<ver>-<arch>/
-  PAYLOAD="$(find "$CLEANUP_DIR" -maxdepth 2 -type f -name hushmic -path '*/bin/hushmic' -exec dirname {} \; | head -1)"
+  PAYLOAD="$(find "$CLEANUP_DIR" -maxdepth 4 -type f -name hushmic -path '*/bin/hushmic' -exec dirname {} \; | head -1)"
   PAYLOAD="${PAYLOAD%/bin}"
   if [ -z "$PAYLOAD" ] || [ ! -f "$PAYLOAD/bin/hushmic" ]; then
     echo "error: could not locate bin/hushmic inside the downloaded tarball." >&2
