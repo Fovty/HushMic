@@ -99,7 +99,9 @@ fn install_signal_handlers() -> Option<std::fs::File> {
     SHUTDOWN_FD.store(fds[1], Ordering::Relaxed);
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_term_signal as usize;
+        // fn item -> pointer -> address (a direct fn-to-integer cast trips
+        // clippy's function_casts_as_integer on newer toolchains)
+        sa.sa_sigaction = on_term_signal as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = libc::SA_RESTART;
         for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
