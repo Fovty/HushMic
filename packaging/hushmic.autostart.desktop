@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=HushMic
-Comment=Real-time microphone noise suppression
-Exec=hushmic --tray
-Icon=hushmic
-Terminal=false
-Categories=AudioVideo;Audio;
-X-GNOME-Autostart-enabled=true

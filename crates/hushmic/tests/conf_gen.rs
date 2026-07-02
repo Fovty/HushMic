@@ -46,6 +46,29 @@ fn conf_contains_required_fields() {
 }
 
 #[test]
+fn conf_escapes_hostile_values() {
+    // Device node names come from hardware/user config: quotes or backslashes
+    // must neither break the conf nor inject keys into it, and a hand-edited
+    // non-finite attn_limit must not render as a literal `NaN` token.
+    let cfg = Config {
+        mic: Some(r#"evil" } inject = { x"#.into()),
+        attn_limit: f32::NAN,
+        ..Config::default()
+    };
+    let paths = Paths {
+        plugin_so: PathBuf::from("/usr/lib/ladspa/libdpdfnet_ladspa.so"),
+        model_dir: PathBuf::from("/usr/share/hushmic/models"),
+        dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
+    };
+    let c = render_conf(&cfg, &paths);
+    assert!(
+        c.contains(r#"target.object  = "evil\" } inject = { x""#),
+        "quotes must be escaped: {c}"
+    );
+    assert!(!c.contains("NaN"), "non-finite attn must be clamped: {c}");
+}
+
+#[test]
 fn conf_omits_target_when_no_mic() {
     // When no specific mic is chosen, there must be no target.object pin so the
     // filter-chain follows the system default capture device.
@@ -62,5 +85,23 @@ fn conf_omits_target_when_no_mic() {
     assert!(
         !c.contains("target.object"),
         "target.object must be absent when no mic chosen"
+    );
+}
+
+#[test]
+fn prefix_derivation_from_binary_location() {
+    use hushmic::controller::prefix_of;
+    assert_eq!(
+        prefix_of(std::path::Path::new("/usr/local/bin/hushmic")),
+        Some(std::path::PathBuf::from("/usr/local"))
+    );
+    assert_eq!(
+        prefix_of(std::path::Path::new("/home/u/.local/bin/hushmic")),
+        Some(std::path::PathBuf::from("/home/u/.local"))
+    );
+    // non-installed layouts must not invent a prefix
+    assert_eq!(
+        prefix_of(std::path::Path::new("/repo/target/release/hushmic")),
+        None
     );
 }

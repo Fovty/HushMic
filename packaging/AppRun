@@ -1,7 +1,12 @@
 #!/bin/bash
 HERE="$(dirname "$(readlink -f "$0")")"
-export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"
+# Append the existing LD_LIBRARY_PATH only when non-empty: a trailing ':'
+# (empty element) would make the loader search the CWD first (CWE-427).
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export ORT_DYLIB_PATH="$HERE/usr/lib/libonnxruntime.so"
 export HUSHMIC_PLUGIN_SO="$HERE/usr/lib/ladspa/libdpdfnet_ladspa.so"
 export HUSHMIC_MODEL_DIR="$HERE/usr/share/hushmic/models"
+# Double-clicking the AppImage passes no args; default to the tray app instead
+# of printing usage to an invisible stderr and exiting.
+[ "$#" -eq 0 ] && set -- --tray
 exec "$HERE/usr/bin/hushmic" "$@"

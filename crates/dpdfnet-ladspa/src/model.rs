@@ -13,9 +13,14 @@ use std::sync::Once;
 
 const DEFAULT_DYLIB: &str = env!("HUSHMIC_DEFAULT_DYLIB");
 static RUNTIME_INIT: Once = Once::new();
+static RUNTIME_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Point ort at the bundled libonnxruntime and commit the environment. Idempotent.
-pub fn ensure_runtime() {
+/// Point ort at the bundled libonnxruntime and commit the environment.
+/// Idempotent; returns whether the runtime dylib actually loaded. Callers must
+/// not touch `Session::builder()` on `false`: without a committed environment
+/// ort's API bootstrap would retry the load itself and PANIC on failure,
+/// bypassing the engine=None graceful-silence path a missing dylib should hit.
+pub fn ensure_runtime() -> bool {
     RUNTIME_INIT.call_once(|| {
         let dylib = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| DEFAULT_DYLIB.to_string());
         // init_from dlopens the dylib and runs ort's version check; commit() installs the env.
@@ -24,10 +29,12 @@ pub fn ensure_runtime() {
         match ort::init_from(&dylib) {
             Ok(builder) => {
                 let _ = builder.commit();
+                RUNTIME_OK.store(true, std::sync::atomic::Ordering::Release);
             }
             Err(e) => eprintln!("[dpdfnet-ladspa] ort init_from({dylib}) failed: {e}"),
         }
     });
+    RUNTIME_OK.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub struct Model {
@@ -44,7 +51,11 @@ fn parse_csv_f32(s: &str) -> Vec<f32> {
 
 impl Model {
     pub fn load(model_path: &Path) -> Result<Model, String> {
-        ensure_runtime();
+        if !ensure_runtime() {
+            return Err("ONNX Runtime unavailable (libonnxruntime failed to load; \
+                        see ORT_DYLIB_PATH)"
+                .to_string());
+        }
         let session = Session::builder()
             .map_err(|e| e.to_string())?
             .with_execution_providers([ort::ep::CPU::default().build()])
@@ -129,7 +140,11 @@ impl Model {
             .run(ort::inputs! { "spec" => spec_t, "state_in" => state_t })
             .map_err(|e| e.to_string())?;
 
-        let (_, e_slice) = outputs["spec_e"]
+        // `outputs[..]` (Index) PANICS on a missing name; use `get` so a model
+        // with unexpected outputs degrades through the Err-to-silence path.
+        let (_, e_slice) = outputs
+            .get("spec_e")
+            .ok_or("model has no output named 'spec_e'")?
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
         if e_slice.len() != spec_e.len() {
@@ -140,7 +155,9 @@ impl Model {
             ));
         }
         spec_e.copy_from_slice(e_slice);
-        let (_, s_slice) = outputs["state_out"]
+        let (_, s_slice) = outputs
+            .get("state_out")
+            .ok_or("model has no output named 'state_out'")?
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
         state_out.clear();

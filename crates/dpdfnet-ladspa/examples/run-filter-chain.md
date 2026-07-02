@@ -83,15 +83,16 @@ wpctl status              | grep -i hushmic   # PipeWire graph
 pactl list short sources  | grep -i hushmic   # pipewire-pulse visibility
 ```
 
-A source named "hushmic Microphone" must appear in **both**. The `pactl`
-listing is the acceptance bar (it proves pipewire-pulse exposes the source to
-PulseAudio clients). If it shows in `wpctl` but not `pactl`, check that
+A source must appear in **both**: `wpctl` shows the description "HushMic",
+`pactl` lists the node name `hushmic_source`. The `pactl` listing is the
+acceptance bar (it proves pipewire-pulse exposes the source to PulseAudio
+clients). If it shows in `wpctl` but not `pactl`, check that
 `playback.props.media.class = Audio/Source` in the config.
 
 ## Confirm it runs without xruns
 
 ```bash
-pw-record --target "hushmic.Microphone" /tmp/hushmic_cap.wav & sleep 6; kill %1
+pw-record --target "hushmic_source" /tmp/hushmic_cap.wav & sleep 6; kill %1
 ls -lh /tmp/hushmic_cap.wav
 journalctl --user -u pipewire --since "1 min ago" | grep -iE "xrun|underrun" \
   || echo "no xruns reported"

@@ -43,21 +43,37 @@ impl Engine {
         self.attn.set_db(db);
     }
 
+    /// `out_hop` is ALWAYS filled, even on `Err`: a transient model failure
+    /// feeds a zero frame through the attenuation delay line and the OLA
+    /// synthesis instead of skipping them, so every ring stays in lockstep
+    /// with the analysis ring and the next good frame reconstructs correctly
+    /// (skipping would desynchronize the overlap-add by one hop for good).
     pub fn process_hop(
         &mut self,
         in_hop: &[f32; HOP],
         out_hop: &mut [f32; HOP],
     ) -> Result<(), String> {
         self.analysis.push_hop(in_hop, &mut self.spec);
-        self.model.run(
+        let result = self.model.run(
             &self.spec,
             &self.state,
             &mut self.spec_e,
             &mut self.state_out,
-        )?;
-        std::mem::swap(&mut self.state, &mut self.state_out);
+        );
+        match &result {
+            Ok(()) => {
+                std::mem::swap(&mut self.state, &mut self.state_out);
+            }
+            Err(_) => {
+                // Keep the recurrent state as-is (last good frame) and emit a
+                // zero spectrum; attn.apply below still blends in the delayed
+                // noisy floor, so a capped limiter degrades to quiet passthrough
+                // rather than a hard dropout.
+                self.spec_e = [0f32; SPEC_LEN];
+            }
+        }
         self.attn.apply(&self.spec, &mut self.spec_e); // blend noisy floor per dB cap
         self.synthesis.add_frame(&self.spec_e, out_hop);
-        Ok(())
+        result
     }
 }

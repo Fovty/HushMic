@@ -81,6 +81,19 @@ impl Tray for HushMicTray {
             label: m.description.clone(),
             ..Default::default()
         }));
+        // A configured mic that is currently absent (unplugged USB device) must
+        // not be displayed as "System default": the rendered conf still pins
+        // target.object to it. Show it truthfully as an extra, selected entry.
+        let missing_mic = match &self.cfg.mic {
+            Some(name) if !self.mics.iter().any(|m| &m.name == name) => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(name) = &missing_mic {
+            mic_opts.push(RadioItem {
+                label: format!("{name} (unavailable)"),
+                ..Default::default()
+            });
+        }
         let mic_selected = match &self.cfg.mic {
             None => 0,
             Some(name) => self
@@ -88,7 +101,7 @@ impl Tray for HushMicTray {
                 .iter()
                 .position(|m| &m.name == name)
                 .map(|i| i + 1)
-                .unwrap_or(0),
+                .unwrap_or(self.mics.len() + 1), // the "(unavailable)" entry
         };
         let mics_for_select = self.mics.clone();
 
@@ -121,7 +134,12 @@ impl Tray for HushMicTray {
                         let pick = if idx == 0 {
                             None
                         } else {
-                            mics_for_select.get(idx - 1).map(|m| m.name.clone())
+                            match mics_for_select.get(idx - 1) {
+                                Some(m) => Some(m.name.clone()),
+                                // the trailing "(unavailable)" entry: already
+                                // selected, nothing to change
+                                None => return,
+                            }
                         };
                         t.cfg.mic = pick.clone();
                         let _ = t.cmd_tx.send(TrayCmd::SelectMic(pick));

@@ -14,15 +14,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust (stable + rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (pinned)
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -47,3 +48,52 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+  # Green fmt/clippy/test says nothing about the tag-time release: this job
+  # runs the ACTUAL release pipeline (build-release.sh: tarball, .deb,
+  # AppImage) in the same ubuntu:22.04 container, incl. the glibc-floor
+  # check, so packaging regressions surface on push instead of on release day.
+  packaging:
+    name: packaging smoke (release pipeline dry-run)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install system dependencies
+        # python3.11 (jammy universe): dpdfnet==0.5.1 requires Python >=3.11,
+        # jammy's default python3 is 3.10; setup-assets.sh honors $PYTHON.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates binutils file \
+            python3.11 python3.11-venv squashfs-tools desktop-file-utils
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (pinned)
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-2204-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --version 3.7.0 --locked
+
+      - name: Build release artifacts
+        run: bash packaging/build-release.sh
+        env:
+          PYTHON: python3.11
+
+      - name: Enforce the glibc floor
+        run: bash scripts/check-glibc-floor.sh
+
+      - name: List artifacts
+        run: ls -lh dist/

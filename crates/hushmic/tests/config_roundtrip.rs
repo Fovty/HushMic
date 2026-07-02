@@ -6,6 +6,26 @@ fn defaults_are_sane() {
     assert_eq!(c.model, "dpdfnet8_48khz_hr");
     assert_eq!(c.attn_limit, 100.0);
     assert!(c.enabled);
+    // Repointing the SYSTEM default input is invasive and must be opt-in
+    // (matches the README's documented flow).
+    assert!(!c.set_default);
+}
+
+#[test]
+fn sanitize_clamps_hand_edited_attn_limit() {
+    // NaN would render as a literal `NaN` token in the filter-chain conf.
+    let mut c = Config {
+        attn_limit: f32::NAN,
+        ..Config::default()
+    };
+    c.sanitize();
+    assert_eq!(c.attn_limit, 100.0);
+    c.attn_limit = -5.0;
+    c.sanitize();
+    assert_eq!(c.attn_limit, 0.0);
+    c.attn_limit = 1e9;
+    c.sanitize();
+    assert_eq!(c.attn_limit, 100.0);
 }
 
 #[test]

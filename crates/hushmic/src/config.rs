@@ -20,7 +20,10 @@ impl Default for Config {
             mic: None,
             model: "dpdfnet8_48khz_hr".into(),
             attn_limit: 100.0,
-            set_default: true,
+            // Opt-in, matching the documented flow: creating the virtual mic is
+            // additive, but repointing the SYSTEM default input is invasive and
+            // must be the user's explicit choice (README: "flip Set as default").
+            set_default: false,
             autostart: false,
         }
     }
@@ -34,10 +37,38 @@ impl Config {
             .join("config.toml")
     }
     pub fn load() -> Self {
-        match fs::read_to_string(Self::path()) {
-            Ok(s) => toml::from_str(&s).unwrap_or_default(),
+        let p = Self::path();
+        let mut cfg = match fs::read_to_string(&p) {
+            Ok(s) => match toml::from_str(&s) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Don't silently replace a hand-edited file with defaults:
+                    // keep the evidence aside and say so, because the defaults
+                    // (enabled=true) have real side effects on next launch.
+                    eprintln!(
+                        "hushmic: {} is invalid ({e}); moving it to config.toml.bad \
+                         and starting from defaults",
+                        p.display()
+                    );
+                    let _ = fs::rename(&p, p.with_extension("toml.bad"));
+                    Config::default()
+                }
+            },
             Err(_) => Config::default(),
+        };
+        cfg.sanitize();
+        cfg
+    }
+
+    /// Clamp hand-editable values to what the rest of the app can represent: a
+    /// non-finite attn_limit would be rendered as a literal `NaN` token in the
+    /// filter-chain conf (which PipeWire rejects), and the plugin's control
+    /// port is bounded 0..=100.
+    pub fn sanitize(&mut self) {
+        if !self.attn_limit.is_finite() {
+            self.attn_limit = 100.0;
         }
+        self.attn_limit = self.attn_limit.clamp(0.0, 100.0);
     }
     pub fn save(&self) -> std::io::Result<()> {
         let p = Self::path();

@@ -1,6 +1,6 @@
 use std::process::Command;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Source {
     pub name: String,
     pub description: String,
@@ -57,38 +57,76 @@ pub fn parse_pwdump_nodes(stdout: &str) -> Vec<Source> {
 
 /// Extract the node name from a pw-metadata value line: value:'{"name":"X"}'.
 pub fn parse_metadata_value(stdout: &str) -> Option<String> {
-    let v = stdout.split("value:'").nth(1)?;
-    let json = v.split('\'').next()?; // {"name":"X"}
-    let after = json.split("\"name\":\"").nth(1)?;
-    Some(after.split('"').next()?.to_string())
+    // pw-metadata prints: update: id:0 key:'…' value:'{"name":"X"}' type:'…'.
+    // The value is single-quoted with no escaping, so slice from after
+    // "value:'" to the LAST "' type:" and hand the payload to a real JSON
+    // parser — node names containing double quotes/backslashes then round-trip
+    // instead of being truncated by naive quote-splitting.
+    let after = stdout.split("value:'").nth(1)?;
+    let json = match after.rfind("' type:") {
+        Some(i) => &after[..i],
+        None => after.split('\'').next()?,
+    };
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(v.get("name")?.as_str()?.to_string())
 }
 
-/// Run `pw-dump` and return its stdout (empty string on any failure).
-fn pw_dump() -> String {
-    Command::new("pw-dump")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+/// Run `pw-dump`. `None` means the PROBE failed (binary missing, daemon
+/// unreachable, non-zero exit) — callers must treat that as "unknown", never
+/// as "no nodes": tearing down a healthy child on a failed probe is exactly
+/// the watchdog misfire this distinction prevents.
+fn pw_dump() -> Option<String> {
+    let o = Command::new("pw-dump").output().ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// List real capture sources, excluding our own `hushmic_source` and any
-/// `.monitor` monitor sources.
-pub fn list_real_sources() -> Vec<Source> {
-    parse_pwdump_nodes(&pw_dump())
-        .into_iter()
+/// One consistent snapshot of every Audio/Source node; `None` = probe failed.
+pub fn sources_snapshot() -> Option<Vec<Source>> {
+    pw_dump().map(|s| parse_pwdump_nodes(&s))
+}
+
+/// The predicate `list_real_sources` applies: everything except our own
+/// virtual node and `.monitor` loopbacks.
+pub fn filter_real(sources: &[Source]) -> Vec<Source> {
+    sources
+        .iter()
         .filter(|s| s.name != "hushmic_source" && !s.name.ends_with(".monitor"))
+        .cloned()
         .collect()
 }
 
-/// True if our virtual mic node `hushmic_source` is currently a live PipeWire
+/// List real capture sources, excluding our own `hushmic_source` and any
+/// `.monitor` monitor sources. Empty on probe failure.
+pub fn list_real_sources() -> Vec<Source> {
+    sources_snapshot()
+        .map(|v| filter_real(&v))
+        .unwrap_or_default()
+}
+
+/// Whether our virtual mic node `hushmic_source` is currently a live PipeWire
 /// source. Used by the watchdog: the host child can linger after a daemon
 /// restart while the node itself is gone, so node presence (not child PID) is
-/// the real liveness signal.
-pub fn hushmic_source_present() -> bool {
-    parse_pwdump_nodes(&pw_dump())
-        .iter()
-        .any(|s| s.name == "hushmic_source")
+/// the real liveness signal. `None` = the probe itself failed (unknown).
+pub fn hushmic_source_present() -> Option<bool> {
+    sources_snapshot().map(|v| v.iter().any(|s| s.name == "hushmic_source"))
+}
+
+/// Poll until `hushmic_source` is definitively present, up to `timeout`.
+/// Returns false on timeout or persistent probe failure.
+pub fn wait_for_hushmic_source(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if hushmic_source_present() == Some(true) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 /// Get the currently configured default source node name.
@@ -102,7 +140,9 @@ pub fn get_default_source() -> Option<String> {
 
 /// Set the default source node name via pw-metadata.
 pub fn set_default_source(node_name: &str) -> std::io::Result<()> {
-    let val = format!("{{\"name\":\"{node_name}\"}}");
+    // serde_json handles escaping; a node name containing `"` or `\` must not
+    // produce malformed metadata JSON (a silently failed restore on disable).
+    let val = serde_json::json!({ "name": node_name }).to_string();
     let st = Command::new("pw-metadata")
         .args([
             "-n",

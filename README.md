@@ -60,8 +60,8 @@ _(Averaged over the 7 scenarios; higher is better, 1–5.)_ DPDFNet came out on 
 
 - One virtual microphone, usable by any PipeWire- or PulseAudio-compatible app.
 - A tray menu for everything: on/off, which mic to clean, model (quality vs. light), suppression strength, set-as-default, start-on-login.
-- The audio runs inside PipeWire's own graph, so the mic keeps working even if the tray app is closed or crashes — and it needs no elevated privileges (`setcap`).
-- Re-creates itself automatically after a PipeWire restart or a suspend/resume, and puts your previous default mic back when you quit.
+- The audio runs in a dedicated PipeWire process, so no elevated privileges (`setcap`) are needed.
+- Re-creates itself automatically after a PipeWire restart or a suspend/resume, and puts your previous default mic back when you quit (the virtual mic is tied to the app: quitting removes it cleanly).
 - ~0.3× real-time on a desktop CPU; no GPU, no network.
 
 ## Requirements
@@ -81,8 +81,8 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.1.2-1_amd64.deb
-sudo apt install ./hushmic_0.1.2-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.1.3-1_amd64.deb
+sudo apt install ./hushmic_0.1.3-1_amd64.deb
 ```
 
 **AppImage** (any distro, no install):
@@ -101,7 +101,7 @@ Launch HushMic from your desktop's application menu, or from a terminal:
 hushmic --tray
 ```
 
-A tray icon appears. Open it, **Enable**, pick your **Microphone**, and choose **"HushMic"** as the input in your app. Or flip **Set as default microphone** and everything that respects the system default uses it automatically. The same menu has the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, and a start-on-login toggle.
+A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The same menu has the on/off toggle (**Enable noise suppression**), the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, and a start-on-login toggle.
 
 <p align="center">
   <img src="docs/img/hushmic-menu-main.png" alt="Main menu" width="270">
@@ -126,7 +126,7 @@ State lives in `~/.config/hushmic/config.toml` (most of it is in the tray menu):
 enabled     = true
 mic         = "alsa_input.usb-RODE..."   # source node name; omit for system default
 model       = "dpdfnet8_48khz_hr"        # or "dpdfnet2_48khz_hr" (lighter)
-attn_limit  = 100.0                        # suppression cap in dB (higher = stronger)
+attn_limit  = 100.0                        # suppression cap in dB, 0-100 (higher = stronger)
 set_default = false                        # make hushmic the system default input
 autostart   = false                        # launch on login
 ```
@@ -135,7 +135,7 @@ autostart   = false                        # launch on login
 
 **Does my audio go anywhere?** No. Everything runs locally on the CPU; nothing is uploaded.
 
-**How much latency does it add?** One 10 ms hop of processing plus PipeWire's normal buffering. Fine for calls, conferences, and gaming.
+**How much latency does it add?** About 20 ms of processing (two 10 ms hops: the causal STFT overlap-add plus one hop of output buffering), plus PipeWire's normal buffering. Fine for calls, conferences, and gaming.
 
 **How much CPU?** Roughly a third of one core in real time (RTF ~0.3) for the quality model; switch to `dpdfnet2` in the tray if you want it lighter.
 
@@ -172,7 +172,7 @@ Produces `target/release/hushmic` (tray app) and `target/release/libdpdfnet_lads
 Two parts:
 
 1. **`dpdfnet-ladspa`** — a LADSPA plugin (Rust) that runs DPDFNet's ONNX model in real time, hop-by-hop, at 48 kHz mono, via [`ort`](https://github.com/pykeio/ort) (ONNX Runtime).
-2. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed and the mic outlives the app.
+2. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed; the mic's lifetime is tied to the app, and quitting tears it down cleanly (restoring your previous default input).
 
 ## License
 

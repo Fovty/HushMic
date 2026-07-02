@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Real-time microphone noise suppression as a system-wide virtual microphone (DPDFNet via PipeWire)."
+homepage = "https://github.com/Fovty/hushmic"
+repository = "https://github.com/Fovty/hushmic"
 
 [[bin]]
 name = "hushmic"
@@ -32,7 +34,9 @@ libc = "0.2"
 # which are wrong for anyone loading the plugin standalone (e.g. EasyEffects) on
 # an installed system. Runtime env (HUSHMIC_MODEL_PATH/ORT_DYLIB_PATH) still wins.
 [package.metadata.deb]
-maintainer = "hushmic"
+# Debian Policy 5.6.2: Maintainer must be name + RFC822 address (lintian
+# errors on a bare name and some tooling rejects the package outright).
+maintainer = "Fovty <38868829+Fovty@users.noreply.github.com>"
 copyright = "2026, hushmic, MIT OR Apache-2.0"
 license-file = ["../../LICENSE-MIT", "0"]
 extended-description = "Real-time microphone noise suppression as a system-wide virtual microphone (DPDFNet via PipeWire)."

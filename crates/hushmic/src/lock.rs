@@ -12,12 +12,18 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Default lock path: `$XDG_RUNTIME_DIR/hushmic.lock` (per-user, wiped on
-/// logout), falling back to the system temp dir when the var is unset.
+/// logout). The fallback lives in the world-shared temp dir, so it is keyed by
+/// uid — a fixed name there could be squatted by another local user (every
+/// launch would then silently exit "already running") and would wrongly
+/// serialize two different users' sessions against each other.
 pub fn default_lock_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("hushmic.lock")
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) => PathBuf::from(d).join("hushmic.lock"),
+        None => {
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("hushmic-{uid}.lock"))
+        }
+    }
 }
 
 /// Try to take the single-instance lock at `path`.
@@ -32,6 +38,25 @@ pub fn try_lock(path: &Path) -> std::io::Result<Option<File>> {
         .write(true)
         .truncate(false)
         .open(path)?;
+    // The /tmp fallback lives in a world-writable dir: refuse a lock file
+    // owned by another uid, or a squatter pre-holding the flock would make
+    // every launch exit "already running" (success-coded, fully silent).
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = file.metadata()?;
+        let me = unsafe { libc::getuid() };
+        if md.uid() != me {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "lock file {} is owned by uid {} (not us, uid {}) — remove it or set XDG_RUNTIME_DIR",
+                    path.display(),
+                    md.uid(),
+                    me
+                ),
+            ));
+        }
+    }
     // LOCK_NB: fail fast instead of blocking behind the running instance.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {

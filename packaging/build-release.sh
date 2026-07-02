@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Build all hushmic v0.1.2 release artifacts into dist/:
-#   * hushmic-0.1.2-x86_64.tar.gz   (portable tarball + install.sh)
-#   * hushmic_0.1.2-1_amd64.deb     (Debian/Ubuntu package)
+# Build all hushmic release artifacts into dist/ (version from Cargo.toml):
+#   * hushmic-<ver>-x86_64.tar.gz   (portable tarball + install.sh)
+#   * hushmic_<ver>-1_amd64.deb     (Debian/Ubuntu package)
 #   * hushmic-x86_64.AppImage       (self-contained AppImage)
 #   * sha256sums.txt                (checksums over the above)
 #
 # Runnable locally and by CI. Requires: rust/cargo, cargo-deb, python3 (optional),
-# curl/wget, fuse-less appimagetool (auto-downloaded). No FUSE needed.
+# curl/wget, fuse-less appimagetool (auto-downloaded + sha256-pinned). No FUSE.
+#
+# NOTE (glibc floor): artifacts inherit the BUILD HOST's glibc requirement —
+# release builds must run on/in the oldest supported base (ubuntu:22.04,
+# glibc 2.35); release.yml enforces this with an objdump check.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,20 +53,29 @@ mkdir -p "$DIST"
 log "Assembling tarball"
 STAGE="$DIST/.stage/$NAME"
 rm -rf "$DIST/.stage"
-mkdir -p "$STAGE/bin" "$STAGE/lib/ladspa" "$STAGE/lib/hushmic" \
+# install -d -m 755 (not mkdir -p): directory modes land in the tarball too,
+# and a hardened build-host umask would otherwise record 700/750 dirs that a
+# root `tar -xzp` faithfully reproduces — unreadable-asset bug, dir edition.
+install -d -m 755 "$STAGE/bin" "$STAGE/lib/ladspa" "$STAGE/lib/hushmic" \
          "$STAGE/share/hushmic/models" "$STAGE/share/applications" \
          "$STAGE/share/icons/hicolor/256x256/apps"
-cp "$BIN" "$STAGE/bin/hushmic"
-cp "$PLUGIN" "$STAGE/lib/ladspa/libdpdfnet_ladspa.so"
+# install -m / explicit chmod everywhere: plain cp preserves source modes, and
+# the models arrive 0600 from dpdfnet's download cache — shipped that way, a
+# root-extracted tarball (tar -p as root) reproduces the unreadable-asset bug
+# the installer's umask fix closed.
+install -m 755 "$BIN" "$STAGE/bin/hushmic"
+install -m 644 "$PLUGIN" "$STAGE/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$STAGE/lib/hushmic/"
-cp "$REPO_ROOT"/assets/models/*.onnx "$STAGE/share/hushmic/models/"
-cp "$REPO_ROOT/packaging/hushmic.desktop" "$STAGE/share/applications/hushmic.desktop"
-cp "$REPO_ROOT/packaging/hushmic-256.png" "$STAGE/share/icons/hicolor/256x256/apps/hushmic.png"
-cp "$REPO_ROOT/LICENSE-MIT" "$STAGE/LICENSE-MIT"
-cp "$REPO_ROOT/LICENSE-APACHE" "$STAGE/LICENSE-APACHE"
-cp "$REPO_ROOT/scripts/install.sh" "$STAGE/install.sh"
-chmod +x "$STAGE/install.sh" "$STAGE/bin/hushmic"
-tar -C "$DIST/.stage" -czf "$DIST/${NAME}.tar.gz" "$NAME"
+chmod 755 "$STAGE/lib/hushmic/"libonnxruntime.so*
+install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$STAGE/share/hushmic/models/"
+install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$STAGE/share/applications/hushmic.desktop"
+install -m 644 "$REPO_ROOT/packaging/hushmic-256.png" "$STAGE/share/icons/hicolor/256x256/apps/hushmic.png"
+install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE/LICENSE-MIT"
+install -m 644 "$REPO_ROOT/LICENSE-APACHE" "$STAGE/LICENSE-APACHE"
+install -m 755 "$REPO_ROOT/scripts/install.sh" "$STAGE/install.sh"
+# root-owned entries: extracting as root must not create files owned by uid 1000
+tar -C "$DIST/.stage" --owner=0 --group=0 --numeric-owner \
+    -czf "$DIST/${NAME}.tar.gz" "$NAME"
 rm -rf "$DIST/.stage"
 echo "  -> dist/${NAME}.tar.gz"
 
@@ -86,14 +99,15 @@ echo "  -> dist/$(basename "$DEB")"
 log "Building AppImage"
 APPDIR="$DIST/.AppDir"
 rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/ladspa" "$APPDIR/usr/lib" \
+install -d -m 755 "$APPDIR/usr/bin" "$APPDIR/usr/lib/ladspa" "$APPDIR/usr/lib" \
          "$APPDIR/usr/share/hushmic/models"
-cp "$BIN" "$APPDIR/usr/bin/hushmic"
-cp "$PLUGIN" "$APPDIR/usr/lib/ladspa/libdpdfnet_ladspa.so"
+install -m 755 "$BIN" "$APPDIR/usr/bin/hushmic"
+install -m 644 "$PLUGIN" "$APPDIR/usr/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$APPDIR/usr/lib/"
-cp "$REPO_ROOT"/assets/models/*.onnx "$APPDIR/usr/share/hushmic/models/"
+chmod 755 "$APPDIR/usr/lib/"libonnxruntime.so*
+install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$APPDIR/usr/share/hushmic/models/"
 install -m755 "$REPO_ROOT/packaging/AppRun" "$APPDIR/AppRun"
-cp "$REPO_ROOT/packaging/hushmic.desktop" "$APPDIR/hushmic.desktop"
+install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$APPDIR/hushmic.desktop"
 
 # Icon: use the repo icon if present, else decode the embedded placeholder.
 if [ -f "$REPO_ROOT/packaging/hushmic.png" ]; then
@@ -105,7 +119,13 @@ iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAFEUlEQVR4nO3dwXETWxBAUfsXQbDwmkAc
 ICON_B64
 fi
 
-# Resolve appimagetool: $APPIMAGETOOL env, PATH, or auto-download (FUSE-less).
+# Resolve appimagetool: $APPIMAGETOOL env, PATH, or auto-download. Downloads
+# are PINNED to a tagged release + sha256 (the old 'continuous' tag is mutable:
+# a compromised asset there would silently backdoor the shipped AppImage), and
+# a cached copy is re-verified on every run.
+AIT_VERSION="1.9.1"
+AIT_URL="https://github.com/AppImage/appimagetool/releases/download/${AIT_VERSION}/appimagetool-x86_64.AppImage"
+AIT_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 APPIMAGETOOL="${APPIMAGETOOL:-}"
 if [ -z "$APPIMAGETOOL" ]; then
   if command -v appimagetool >/dev/null 2>&1; then
@@ -113,13 +133,16 @@ if [ -z "$APPIMAGETOOL" ]; then
   else
     mkdir -p "$TOOLS"
     APPIMAGETOOL="$TOOLS/appimagetool-x86_64.AppImage"
-    if [ ! -x "$APPIMAGETOOL" ]; then
-      echo "  downloading appimagetool"
-      ait_url="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+    if ! echo "$AIT_SHA256  $APPIMAGETOOL" | sha256sum -c - >/dev/null 2>&1; then
+      echo "  downloading appimagetool ${AIT_VERSION}"
       if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$ait_url" -o "$APPIMAGETOOL"
+        curl -fsSL "$AIT_URL" -o "$APPIMAGETOOL"
       else
-        wget -qO "$APPIMAGETOOL" "$ait_url"
+        wget -qO "$APPIMAGETOOL" "$AIT_URL"
+      fi
+      if ! echo "$AIT_SHA256  $APPIMAGETOOL" | sha256sum -c - >/dev/null 2>&1; then
+        echo "error: appimagetool download does not match its pinned sha256; aborting." >&2
+        exit 1
       fi
       chmod +x "$APPIMAGETOOL"
     fi
