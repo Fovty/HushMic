@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 /// Filesystem locations the controller needs to spawn the filter-chain host.
 ///
-/// `plugin_so` is the v0.1 LADSPA `.so`, `model_dir` holds the `<model>.onnx`
+/// `plugin_so` is the LADSPA `.so`, `model_dir` holds the `<model>.onnx`
 /// files, and `dylib` is the ONNX Runtime shared object that the plugin
 /// `dlopen`s via the `ORT_DYLIB_PATH` env var.
 pub struct Paths {
@@ -168,8 +168,8 @@ fn spa_escape(s: &str) -> String {
 
 /// Render a SELF-CONTAINED PipeWire config for `pipewire -c <conf>`.
 ///
-/// v0.1 Task 7 proved that a bare filter-chain *fragment*
-/// (`context.modules = [ filter-chain ]`) fails to load standalone with
+/// A bare filter-chain *fragment* (`context.modules = [ filter-chain ]`)
+/// fails to load standalone with
 /// `can't find protocol 'PipeWire:Protocol:Native'` because it carries none of
 /// the core modules. Since the controller spawns exactly `pipewire -c <conf>`,
 /// this emits the base preamble (`context.properties`, `context.spa-libs`, and
@@ -197,7 +197,7 @@ pub fn render_conf(cfg: &Config, paths: &Paths) -> String {
         r#"# hushmic self-contained PipeWire filter-chain host (generated; do not edit).
 # Base modules mirror /usr/share/pipewire/filter-chain.conf so a bare
 # `pipewire -c <this>` has the core protocol + node infrastructure; the hushmic
-# filter-chain module is then appended. See run-filter-chain.md (v0.1 Task 7).
+# filter-chain module is then appended. See crates/dpdfnet-ladspa/examples/run-filter-chain.md.
 context.properties = {{
     log.level = 2
 }}
@@ -445,8 +445,7 @@ impl Controller {
         // Only undo the default if *this* run set it. Restore the prior default
         // when there was one; otherwise delete the key so it doesn't dangle on
         // the soon-to-be-dead `hushmic_source`. Done BEFORE killing the child so
-        // clients never briefly land on a dead source. `.take()` keeps this
-        // idempotent across the explicit disable + Drop path.
+        // clients never briefly land on a dead source.
         if self.set_default_active {
             // Only forget the prior default once it is actually restored: this
             // runs precisely when PipeWire is most likely flapping (watchdog

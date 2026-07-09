@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Fail if a built binary requires a glibc newer than the floor (default 2.35 =
-# ubuntu:22.04). Artifacts inherit the BUILD host's glibc requirement: v0.1.2
-# was built on ubuntu-24.04 (glibc 2.39) and every artifact — tarball, .deb,
-# even the "self-contained" AppImage — refused to run on Ubuntu 22.04 /
-# Debian 12 / RHEL 9. Both workflows run this after building.
+# ubuntu:22.04). Artifacts inherit the BUILD host's glibc requirement: built on
+# a newer base, every artifact — tarball, .deb, even the "self-contained"
+# AppImage — refuses to run on Ubuntu 22.04 / Debian 12 / RHEL 9. Both
+# workflows run this after building.
 set -euo pipefail
 
 FLOOR="${1:-2.35}"

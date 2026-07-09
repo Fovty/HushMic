@@ -38,6 +38,61 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
     (num / (da.sqrt() * db.sqrt())) as f32
 }
 
+fn read_flac_mono_f32(p: &std::path::Path) -> Vec<f32> {
+    let mut r = claxon::FlacReader::open(p).expect("open flac");
+    let info = r.streaminfo();
+    assert_eq!(info.sample_rate, 48_000, "fixture must be 48 kHz");
+    assert_eq!(info.channels, 1, "fixture must be mono");
+    assert_eq!(info.bits_per_sample, 16, "fixture must be int16");
+    r.samples()
+        .map(|s| s.expect("flac sample") as f32 / 32768.0)
+        .collect()
+}
+
+/// End-to-end audio-path pin that runs EVERYWHERE, including CI: the fixtures
+/// are small int16 FLACs committed to the repo, built from public sources
+/// (LibriVox voice + Commons fan noise) by scripts/gen-parity-fixtures.py, and
+/// the golden is the validated engine's own streaming output over them. Both
+/// streams share the engine's inherent latency, so they align 1:1 (unlike the
+/// offline golden below, which needs a one-hop shift). A passthrough or
+/// state-desync bug scores <= ~0.1 here (the fan bed dominates the noisy
+/// input at any alignment), so 0.99 has huge margin while still tolerating
+/// cross-CPU float differences in ORT.
+#[test]
+fn matches_committed_public_golden() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let model = root.join("assets/models/dpdfnet8_48khz_hr.onnx");
+    if !model.exists() {
+        // bare checkout without scripts/setup-assets.sh; CI always provisions
+        eprintln!("skipping matches_committed_public_golden: model not provisioned");
+        return;
+    }
+    let noisy = read_flac_mono_f32(&root.join("tests/fixtures/noisy_public_48k.flac"));
+    let golden = read_flac_mono_f32(&root.join("tests/fixtures/golden_public_dpdfnet8.flac"));
+
+    let mut eng = Engine::new(&model).expect("engine");
+    let mut out = Vec::with_capacity(noisy.len());
+    let mut hop_in = [0f32; HOP];
+    let mut hop_out = [0f32; HOP];
+    for h in 0..noisy.len() / HOP {
+        hop_in.copy_from_slice(&noisy[h * HOP..(h + 1) * HOP]);
+        eng.process_hop(&hop_in, &mut hop_out).expect("process");
+        out.extend_from_slice(&hop_out);
+    }
+    let skip = 4 * HOP; // STFT/OLA + model-state warm-up
+    let corr = pearson(&out[skip..], &golden[skip..]);
+    eprintln!("public parity correlation vs committed golden: {corr}");
+    assert!(
+        corr > 0.99,
+        "engine output correlation vs committed golden too low: {corr}"
+    );
+}
+
 #[test]
 fn matches_golden_reference() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

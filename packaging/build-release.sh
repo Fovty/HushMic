@@ -55,14 +55,14 @@ STAGE="$DIST/.stage/$NAME"
 rm -rf "$DIST/.stage"
 # install -d -m 755 (not mkdir -p): directory modes land in the tarball too,
 # and a hardened build-host umask would otherwise record 700/750 dirs that a
-# root `tar -xzp` faithfully reproduces — unreadable-asset bug, dir edition.
+# root `tar -xzp` faithfully reproduces as unreadable-to-users directories.
 install -d -m 755 "$STAGE/bin" "$STAGE/lib/ladspa" "$STAGE/lib/hushmic" \
          "$STAGE/share/hushmic/models" "$STAGE/share/applications" \
          "$STAGE/share/icons/hicolor/256x256/apps"
 # install -m / explicit chmod everywhere: plain cp preserves source modes, and
 # the models arrive 0600 from dpdfnet's download cache — shipped that way, a
-# root-extracted tarball (tar -p as root) reproduces the unreadable-asset bug
-# the installer's umask fix closed.
+# root extraction (tar -p is the default for root) leaves them unreadable to
+# the user-session PipeWire that must load them.
 install -m 755 "$BIN" "$STAGE/bin/hushmic"
 install -m 644 "$PLUGIN" "$STAGE/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$STAGE/lib/hushmic/"

@@ -309,8 +309,8 @@ fn main() {
             }
             Event::Tick => {
                 // One pw-dump snapshot per tick serves the liveness check, the
-                // tray status, AND a hotplug refresh of the mic list (which
-                // previously only updated when the user clicked a command).
+                // tray status, AND a hotplug refresh of the mic list (menu
+                // clicks are far too rare to be the only refresh trigger).
                 let nodes = pipewire::sources_snapshot();
                 let node_present = nodes
                     .as_ref()

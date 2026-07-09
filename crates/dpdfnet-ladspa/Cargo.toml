@@ -14,3 +14,4 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 
 [dev-dependencies]
 hound = "3.5"
+claxon = "0.4" # FLAC decode for the committed public parity fixtures

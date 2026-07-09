@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     # Build inside the OLDEST supported base: artifacts inherit the build
     # host's glibc requirement, and building straight on ubuntu-latest
-    # (24.04, glibc 2.39) shipped binaries that refused to run on
+    # (24.04, glibc 2.39) produces binaries that refuse to run on
     # Ubuntu 22.04 / Debian 12 / RHEL 9. ubuntu:22.04 = glibc 2.35.
     container: ubuntu:22.04
     steps:

@@ -3,26 +3,32 @@
 All assets below are **CC0, public domain, or permissive commercial-OK** (CC-BY).
 No `-NC` or `-ND` assets were used. CC-BY assets are attributed here as required.
 
-| Role | Local file | License | Commercial OK? | Attribution required? |
-|------|-----------|---------|----------------|-----------------------|
-| Voice | `assets/voice_c1.mp3` | Public Domain (LibriVox / PD Mark 1.0) | Yes | No (credited anyway) |
-| Keyboard noise | `assets/keyboard_src.wav` | CC BY 4.0 | Yes | Yes — credited |
-| Fan noise | `assets/fan_ac_src.wav` | CC BY 4.0 | Yes | Yes — credited |
-| Café/office chatter | `assets/cafe_src.ogg` | Public Domain | Yes | No (credited anyway) |
+The rendered demo videos are NOT stored in the repo — they are attached to the
+README as GitHub user-attachments at publish time. Rebuild them any time with
+[`make-demos.py`](make-demos.py) (downloads the sources below, mixes at the
+documented levels, runs the real HushMic enhancer, renders the videos).
 
+| Role | Source | License | Commercial OK? | Attribution required? |
+|------|--------|---------|----------------|-----------------------|
+| Voice | LibriVox SPC 266, "After Love" | Public Domain (LibriVox / PD Mark 1.0) | Yes | No (credited anyway) |
+| Keyboard noise | Wikimedia Commons WAV | CC BY 4.0 | Yes | Yes — credited |
+| Fan noise | Wikimedia Commons WAV | CC BY 4.0 | Yes | Yes — credited |
+| Café/office chatter | Wikimedia Commons OGG | Public Domain | Yes | No (credited anyway) |
 
 ---
 
 ## 1. Voice (clean speech)
-- **Title:** Short Poetry Collection 266 — track 06, "Art and Heart" (public-domain poem)
+- **Title:** Short Poetry Collection 266 — track 02, "After Love" by **Sara Teasdale** (public-domain poem)
 - **Source item:** https://archive.org/details/spc266_2508_librivox
-- **Direct file:** https://archive.org/download/spc266_2508_librivox/spc266_artheart_td_128kb.mp3
-- **Author/credit:** Read by a LibriVox volunteer (catalog reader id `td`); text is a public-domain poem.
+- **Direct file:** https://archive.org/download/spc266_2508_librivox/spc266_afterlove_pac_128kb.mp3
+- **Author/credit:** Poem by Sara Teasdale (d. 1933, public domain); read by a LibriVox
+  volunteer (catalog reader id `pac`).
 - **License:** Public Domain — LibriVox recordings are released into the public domain
   (item `licenseurl` = http://creativecommons.org/publicdomain/mark/1.0/).
-- **Format used:** 44.1 kHz mono MP3 (128 kbps); a clean ~10 s passage from the poem body
-  (offset 16.85 s, after the spoken LibriVox intro) was extracted, resampled to 48 kHz mono,
-  and loudness-normalized to −20 dBFS RMS.
+- **Format used:** 44.1 kHz mono MP3 (128 kbps); a 10.75 s passage from the poem body
+  (offset 17.55–28.30 s: three phrases with two natural speech pauses, chosen so the
+  noise-only gaps make the suppression audible) was extracted, resampled to 48 kHz
+  mono, and loudness-normalized to −20 dBFS RMS.
 
 ## 2. Keyboard noise (mechanical typing)
 - **Title:** File:Typing on Keychron V1 Ultra (Red Linear Switch).wav
@@ -52,15 +58,18 @@ No `-NC` or `-ND` assets were used. CC-BY assets are attributed here as required
 
 ---
 
-## Processing summary (how `before_*`/`after_*` were made)
-1. Voice resampled to 48 kHz mono, normalized to −20 dBFS RMS.
-2. Each noise trimmed to 10 s, resampled to 48 kHz mono, normalized to −23 dBFS RMS (→ **SNR ≈ +3 dB**).
-3. `before_<noise>.wav` = voice + noise summed in float, then flat-gain peak-normalized to −1 dBFS
-   (flat gain preserves the +3 dB SNR; verified no clipping).
+## Processing summary (what `make-demos.py` does)
+1. Voice passage (17.55–28.30 s) resampled to 48 kHz mono, normalized to −20 dBFS RMS.
+2. Each noise trimmed to 10.75 s, resampled to 48 kHz mono, normalized to −23 dBFS RMS
+   (→ **SNR ≈ +3 dB**).
+3. `before_<noise>.wav` = voice + noise summed in float, then flat-gain peak-normalized
+   to −1 dBFS (flat gain preserves the +3 dB SNR; no clipping).
 4. `after_<noise>.wav` = `before` run through hushmic's offline enhancer
    (`crates/dpdfnet-ladspa/examples/enhance.rs`, DPDFNet-8 ONNX model).
+5. Videos: 1280×420 H.264 + AAC, ~21.5 s each — the BEFORE waveform with a moving
+   playhead, then the same passage AFTER enhancement.
 
-Measured effect (gap = speech pause where only noise sits):
-- Fan:  gap −23.4 → **−51.3 dBFS** (~28 dB suppressed); speech −15.1 → −16.0 dB (preserved).
-- Café: gap −20.9 → **−48.0 dBFS** (~27 dB suppressed).
-- Keyboard: keystroke transients removed; overall mean −22.2 → −24.0 dB.
+Measured effect (gap = speech pause where only noise sits; 2026-07-09 build):
+- Keyboard: gaps −31 → **−58 / −56 dBFS** (~25–27 dB suppressed); speech −1.9 dB.
+- Fan: gaps −23 → **−53 / −48 dBFS** (~25–30 dB suppressed); speech −1.9 dB.
+- Café: gaps −21/−28 → **−59 / −49 dBFS** (~21–37 dB suppressed); speech −2.4 dB.

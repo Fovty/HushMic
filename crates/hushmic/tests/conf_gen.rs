@@ -35,7 +35,7 @@ fn conf_contains_required_fields() {
     assert!(c.contains("audio.rate     = 48000"));
     assert!(c.contains("node.name        = \"hushmic_source\""));
 
-    // CRITICAL (v0.1 finding): `pipewire -c <conf>` needs the core base modules,
+    // CRITICAL: `pipewire -c <conf>` needs the core base modules,
     // otherwise it fails with "can't find protocol 'PipeWire:Protocol:Native'".
     // render_conf MUST emit a SELF-CONTAINED config, not a bare filter-chain
     // fragment. Assert the load-bearing base module is present.

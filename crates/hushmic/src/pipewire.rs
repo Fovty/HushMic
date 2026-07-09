@@ -14,8 +14,8 @@ pub struct Source {
 /// `pipewire`/`pipewire-bin` package set the project already depends on. They do
 /// NOT use PulseAudio's `pactl`, which lives in the separate `pulseaudio-utils`
 /// package that is absent on minimal installs and the Ubuntu live image; relying
-/// on it made `hushmic_source_present()` silently return false there, so the
-/// watchdog never saw the (correctly created) node and re-instantiated forever.
+/// on it would make `hushmic_source_present()` silently return false there, and
+/// the watchdog would re-instantiate a perfectly healthy node forever.
 ///
 /// Returns EVERY Audio/Source node (including monitors and our own
 /// `hushmic_source`); callers filter as needed. Pure function — no I/O.

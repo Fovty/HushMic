@@ -1,4 +1,4 @@
-//! hushmic DPDFNet LADSPA plugin (v0.1).
+//! hushmic DPDFNet LADSPA plugin.
 pub mod attn;
 pub mod engine;
 pub mod model;

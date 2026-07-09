@@ -21,20 +21,7 @@ HushMic creates a virtual microphone that strips out keyboard clatter, fans, and
 
 Each clip plays the **noisy input**, then the same audio **cleaned by HushMic** — a neutral public-domain voice over real background noise.
 
-<table>
-<tr>
-<td align="center"><b>Keyboard</b></td>
-<td align="center"><b>Fan / AC hum</b></td>
-<td align="center"><b>Café chatter</b></td>
-</tr>
-<tr>
-<td><video src="https://github.com/user-attachments/assets/d50be6f1-2f1d-41c3-b92c-9640174c2db5" controls width="280"></video></td>
-<td><video src="https://github.com/user-attachments/assets/645d4378-61e8-454d-8af3-8b394264fe66" controls width="280"></video></td>
-<td><video src="https://github.com/user-attachments/assets/1c644272-d8a0-41fd-be4e-68e8208e6faf" controls width="280"></video></td>
-</tr>
-</table>
-
-Background noise drops ~27–28 dB while the voice is preserved; demo-audio credits are in [Credits](#credits).
+Background noise drops ~25–30 dB in the speech pauses while the voice is preserved; demo-audio credits are in [Credits](#credits).
 
 ## Why
 
@@ -184,4 +171,4 @@ Dual-licensed under either **MIT** ([LICENSE-MIT](LICENSE-MIT)) or **Apache-2.0*
 - **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** — the LADSPA real-time-inference architecture this plugin mirrors.
 - Built with [PipeWire](https://pipewire.org), [ort](https://github.com/pykeio/ort), [rustfft](https://github.com/ejmahler/RustFFT), and [ksni](https://github.com/iovxw/ksni).
 
-**Demo audio:** voice — _Short Poetry Collection 266_ via [LibriVox](https://archive.org/details/spc266_2508_librivox) (public domain); keyboard — [_Typing on Keychron V1 Ultra_](<https://commons.wikimedia.org/wiki/File:Typing_on_Keychron_V1_Ultra_(Red_Linear_Switch).wav>) by C40115 (CC BY 4.0); fan/AC hum — [_Air conditioner hum_](<https://commons.wikimedia.org/wiki/File:Air_conditioner_hum_(Gravity_Sound).wav>) by [Gravity Sound](https://www.gravitysound.studio/) (CC BY 4.0); café — [_Restaurant ambience_](https://commons.wikimedia.org/wiki/File:Restaurant_ambience.ogg) (public domain). Full provenance: [docs/demo/ASSETS.md](docs/demo/ASSETS.md).
+**Demo audio:** voice — _"After Love"_ by Sara Teasdale, read by a LibriVox volunteer (_Short Poetry Collection 266_ via [LibriVox](https://archive.org/details/spc266_2508_librivox), public domain); keyboard — [_Typing on Keychron V1 Ultra_](<https://commons.wikimedia.org/wiki/File:Typing_on_Keychron_V1_Ultra_(Red_Linear_Switch).wav>) by C40115 (CC BY 4.0); fan/AC hum — [_Air conditioner hum_](<https://commons.wikimedia.org/wiki/File:Air_conditioner_hum_(Gravity_Sound).wav>) by [Gravity Sound](https://www.gravitysound.studio/) (CC BY 4.0); café — [_Restaurant ambience_](https://commons.wikimedia.org/wiki/File:Restaurant_ambience.ogg) (public domain). Full provenance: [docs/demo/ASSETS.md](docs/demo/ASSETS.md).

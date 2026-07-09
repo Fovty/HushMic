@@ -16,3 +16,7 @@
 *.swp
 *~
 .DS_Store
+
+# demo clips are rebuilt by docs/demo/make-demos.py and attached at publish time
+/docs/demo/build/
+/docs/demo/*.mp4

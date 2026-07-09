@@ -1,8 +1,8 @@
 use crate::stft::SPEC_LEN;
 use std::collections::VecDeque;
 
-// DPDFNet's attenuation-limit is OFFLINE-ONLY upstream (spike §3.5); hushmic
-// deliberately ports it to the streaming path. The 4-frame noisy delay aligns
+// DPDFNet's attenuation-limit is OFFLINE-ONLY upstream; hushmic deliberately
+// ports it to the streaming path. The 4-frame noisy delay aligns
 // the retained noisy floor with the model's group delay — validated by
 // `delay_alignment_blends_correct_frame`.
 pub const NOISY_FRAME_OFFSET: usize = 4;
