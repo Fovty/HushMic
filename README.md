@@ -21,6 +21,19 @@ HushMic creates a virtual microphone that strips out keyboard clatter, fans, and
 
 Each clip plays the **noisy input**, then the same audio **cleaned by HushMic** — a neutral public-domain voice over real background noise.
 
+<table>
+<tr>
+<td align="center"><b>Keyboard</b></td>
+<td align="center"><b>Fan / AC hum</b></td>
+<td align="center"><b>Café chatter</b></td>
+</tr>
+<tr>
+<td><video src="https://github.com/user-attachments/assets/9cc7abe4-26fc-440f-88da-b86ef33df142" controls width="280"></video></td>
+<td><video src="https://github.com/user-attachments/assets/d4b396a7-d980-4e0d-bac2-2a119debd768" controls width="280"></video></td>
+<td><video src="https://github.com/user-attachments/assets/f4cd4504-d49a-4a46-95c2-01e56cd2d268" controls width="280"></video></td>
+</tr>
+</table>
+
 Background noise drops ~25–30 dB in the speech pauses while the voice is preserved; demo-audio credits are in [Credits](#credits).
 
 ## Why
