@@ -81,8 +81,8 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.1.3-1_amd64.deb
-sudo apt install ./hushmic_0.1.3-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.1.4-1_amd64.deb
+sudo apt install ./hushmic_0.1.4-1_amd64.deb
 ```
 
 **AppImage** (any distro, no install):

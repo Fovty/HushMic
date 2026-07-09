@@ -1,6 +1,6 @@
 # Maintainer: Fovty <38868829+Fovty@users.noreply.github.com>
 pkgname=hushmic
-pkgver=0.1.3
+pkgver=0.1.4
 pkgrel=1
 pkgdesc="Real-time microphone noise suppression as a virtual mic (DPDFNet via PipeWire)"
 arch=('x86_64')

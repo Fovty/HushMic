@@ -89,6 +89,48 @@ fn conf_omits_target_when_no_mic() {
 }
 
 #[test]
+fn pin_decision_respects_existing_restrictions() {
+    use hushmic::controller::pin_intersection;
+    let all24: Vec<usize> = (0..24).collect();
+    let p16: Vec<usize> = (0..16).collect();
+
+    // 13700KF, unrestricted session: pin to the 16 P-threads.
+    assert_eq!(pin_intersection(&p16, &all24), Some(p16.clone()));
+
+    // User deliberately taskset hushmic onto the E-cores (allowed = 16-23):
+    // the intersection is empty — their placement wins, no pin.
+    let ecores: Vec<usize> = (16..24).collect();
+    assert_eq!(pin_intersection(&p16, &ecores), None);
+
+    // Straddling cgroup cpuset leaves only ONE P-core allowed (Arrow Lake
+    // 265K, AllowedCPUs=0,8-19): pinning the whole host to a single shared
+    // cpu is worse than not pinning — degenerate sets are refused.
+    let straddle: Vec<usize> = std::iter::once(0).chain(8..20).collect();
+    let p8: Vec<usize> = (0..8).collect();
+    assert_eq!(pin_intersection(&p8, &straddle), None);
+
+    // Session confined to exactly the P-cores already: nothing to narrow.
+    assert_eq!(pin_intersection(&p16, &p16), None);
+
+    // Meteor Lake-U (4 P-threads of 14 cpus): small but non-degenerate.
+    let p4: Vec<usize> = (0..4).collect();
+    let all14: Vec<usize> = (0..14).collect();
+    assert_eq!(pin_intersection(&p4, &all14), Some(p4.clone()));
+}
+
+#[test]
+fn kernel_cpu_lists_parse() {
+    use hushmic::controller::parse_cpu_list;
+    assert_eq!(parse_cpu_list("0-15"), (0..=15).collect::<Vec<_>>());
+    assert_eq!(parse_cpu_list("0-3,8-11"), vec![0, 1, 2, 3, 8, 9, 10, 11]);
+    assert_eq!(parse_cpu_list("7"), vec![7]);
+    assert_eq!(parse_cpu_list("0-1, 4"), vec![0, 1, 4]);
+    assert_eq!(parse_cpu_list(""), Vec::<usize>::new());
+    assert_eq!(parse_cpu_list("garbage"), Vec::<usize>::new());
+    assert_eq!(parse_cpu_list("5-2"), Vec::<usize>::new()); // inverted range
+}
+
+#[test]
 fn prefix_derivation_from_binary_location() {
     use hushmic::controller::prefix_of;
     assert_eq!(

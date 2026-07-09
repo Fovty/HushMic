@@ -70,6 +70,108 @@ impl Paths {
     }
 }
 
+/// Parse a kernel cpulist string ("0-15", "0-3,8-11", "7") into cpu ids.
+/// Pub for testability (pure parsing).
+pub fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                if a <= b && b - a < 4096 {
+                    out.extend(a..=b);
+                }
+            }
+        } else if let Ok(v) = part.parse::<usize>() {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Never pin down to a degenerate set: when a cgroup cpuset leaves only a
+/// sliver of the P-cores allowed, confining the whole host to 1-3 shared
+/// cpus is worse than letting the scheduler use the full allowed set.
+const MIN_PIN_CPUS: usize = 4;
+
+/// The cpu ids in this process's CURRENT affinity mask — cgroup cpusets and
+/// any deliberate taskset/CPUAffinity= restriction included. None if
+/// unreadable. Sorted ascending by construction.
+fn current_affinity() -> Option<Vec<usize>> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let rc =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if rc != 0 {
+        return None;
+    }
+    Some(
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
+            .collect(),
+    )
+}
+
+/// The pin decision given the machine's P-cores and the cpus this process
+/// may use: the intersection, but only when it truly narrows placement
+/// (non-empty, strictly smaller than `allowed`) and is not degenerate.
+/// An empty intersection means the P-cores are off-limits (cgroup cpuset,
+/// or the user deliberately taskset us elsewhere) — that choice wins.
+/// Pub for testability (pure set logic).
+pub fn pin_intersection(pcores: &[usize], allowed: &[usize]) -> Option<Vec<usize>> {
+    let target: Vec<usize> = pcores
+        .iter()
+        .copied()
+        .filter(|c| allowed.contains(c))
+        .collect();
+    if target.len() < MIN_PIN_CPUS || target.len() >= allowed.len() {
+        return None;
+    }
+    Some(target)
+}
+
+/// The cpus to confine the filter-chain host to, or None when pinning is
+/// disabled, pointless, or would fight an existing restriction.
+///
+/// Why pin at all: the host's realtime DSP thread lands on an arbitrary
+/// core at spawn. On Intel hybrid CPUs an E-core roughly DOUBLES the
+/// model's per-quantum inference time (measured 13.6 ms vs ~6 ms of a 21 ms
+/// budget on a 13700KF) — enough margin on an idle desktop, but any
+/// cache-/bandwidth-heavy neighbor (a video call's audio engine) pushes it
+/// over the deadline and the resulting xrun storm starves hushmic_source
+/// for every consumer at once, which sounds like stuttering garbage.
+///
+/// The P-core list comes from /sys/devices/cpu_core/cpus (present only on
+/// hybrid Intel, kernel 5.13+) and is intersected with our own affinity
+/// mask so a cgroup cpuset or deliberate taskset is respected, never
+/// widened past, and never silently shrunk into by the kernel's own
+/// mask-ANDing. HUSHMIC_NO_CPU_PIN=1 disables the whole mechanism.
+fn pin_target() -> Option<Vec<usize>> {
+    if std::env::var_os("HUSHMIC_NO_CPU_PIN").is_some() {
+        return None;
+    }
+    let s = std::fs::read_to_string("/sys/devices/cpu_core/cpus").ok()?;
+    let pcores = parse_cpu_list(s.trim());
+    if pcores.is_empty() {
+        return None;
+    }
+    let allowed = current_affinity()?;
+    let target = pin_intersection(&pcores, &allowed);
+    if target.is_none() {
+        // Hybrid CPU but no (sane) pin possible: say why once per spawn, or
+        // "the fix didn't engage" reports are undiagnosable.
+        eprintln!(
+            "[hushmic] hybrid CPU detected but not pinning the filter-chain host \
+             (allowed cpus: {}, performance cores among them: {})",
+            allowed.len(),
+            pcores.iter().filter(|c| allowed.contains(c)).count()
+        );
+    }
+    target
+}
+
 fn conf_path() -> PathBuf {
     ProjectDirs::from("io", "hushmic", "hushmic")
         .expect("home")
@@ -367,10 +469,34 @@ impl Controller {
         // because `enable()` is always called from the main thread (see the
         // `enable()` doc comment); were it called from a transient worker thread,
         // the child would be reaped when that worker exits, not on process exit.
+        //
+        // On Intel hybrid CPUs the whole host is additionally pinned to the
+        // performance cores (see `pin_target` for the failure mode a random
+        // E-core placement causes). Best-effort: a failed pin must not
+        // break the mic. Both prctl and sched_setaffinity are plain
+        // syscalls, safe in the fork/exec window.
+        let pcores = pin_target();
+        if let Some(cores) = &pcores {
+            eprintln!(
+                "[hushmic] pinning the filter-chain host to {} performance cores",
+                cores.len()
+            );
+        }
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) == -1 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if let Some(cores) = &pcores {
+                    let mut set: libc::cpu_set_t = std::mem::zeroed();
+                    libc::CPU_ZERO(&mut set);
+                    for &c in cores {
+                        if c < libc::CPU_SETSIZE as usize {
+                            libc::CPU_SET(c, &mut set);
+                        }
+                    }
+                    let _ =
+                        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
                 }
                 Ok(())
             });

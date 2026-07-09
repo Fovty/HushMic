@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "dpdfnet-ladspa"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "claxon",
  "hound",
@@ -292,7 +292,7 @@ checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "hushmic"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "directories",
  "ksni",
