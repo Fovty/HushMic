@@ -44,17 +44,19 @@ So I benchmarked the realistic contenders on my own recordings, picked the one t
 
 ### How it compares
 
-A small bake-off on my own recordings — 7 noise scenarios (keyboard, fan, AC, chatter, …), scored with **DNSMOS P.835** (a reference-free MOS estimator). These are indicative numbers from one person's setup, not a formal benchmark, but they're why HushMic uses DPDFNet:
+The three demo clips above, run through each model and scored with **DNSMOS P.835** (a reference-free 1–5 MOS estimator). Indicative, not a formal benchmark — but the source audio is public ([Credits](#credits)), so it's easy to reproduce, and it's why HushMic uses DPDFNet:
 
-| Model                           | Overall (OVRL) | Background (BAK) | Speech (SIG) |
-| ------------------------------- | :------------: | :--------------: | :----------: |
-| **DPDFNet** — _HushMic's model_ |    **3.04**    |     **4.11**     |   **3.32**   |
-| DeepFilterNet 3                 |      3.01      |       4.07       |     3.30     |
-| GTCRN                           |      2.73      |       3.93       |     3.08     |
-| Krisp _(v9.9.3)_                |      2.71      |       4.01       |     3.00     |
-| khip _(older Krisp model port)_ |      2.60      |       3.97       |     2.87     |
+| Model                             | Overall (OVRL) | Background (BAK) | Speech (SIG) |
+| --------------------------------- | :------------: | :--------------: | :----------: |
+| **DPDFNet** — _HushMic's model_   |    **3.20**    |     **4.15**     |   **3.43**   |
+| DeepFilterNet 3                   |      2.97      |       3.98       |     3.26     |
+| Krisp _(v9.9.3)_                  |      2.57      |       3.96       |     2.81     |
+| khip _(older Krisp model port)_   |      2.43      |       3.78       |     2.71     |
+| GTCRN                             |      2.42      |       3.71       |     2.76     |
+| RNNoise _(EasyEffects's default)_ |      2.01      |       3.93       |     2.60     |
+| _Raw (unprocessed input)_         |    _1.49_      |     _1.48_       |    _2.01_    |
 
-_(Averaged over the 7 scenarios; higher is better, 1–5.)_ DPDFNet came out on top on every axis — overall, background-noise removal, and voice preservation — narrowly ahead of DeepFilterNet 3 and more clearly ahead of the rest, and a blind listen on my own clips agreed. ([DPDFNet](https://github.com/ceva-ip/DPDFNet) is a DeepFilterNet-lineage model from Ceva; [arXiv:2512.16420](https://arxiv.org/abs/2512.16420).)
+_(Averaged over the three clips; higher is better, 1–5.)_ DPDFNet comes out on top on every axis — overall, background-noise removal, and voice preservation — clearly ahead of the field, and it's the only model that holds up across all three clips where the others fall off on the noisier café mix. ([DPDFNet](https://github.com/ceva-ip/DPDFNet) is a DeepFilterNet-lineage model from Ceva; [arXiv:2512.16420](https://arxiv.org/abs/2512.16420).)
 
 ## Features
 
