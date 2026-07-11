@@ -1,7 +1,13 @@
+pub mod about;
+pub mod abtest;
 pub mod autostart;
+pub mod branding;
 pub mod config;
 pub mod controller;
+pub mod fsutil;
 pub mod lock;
+pub mod mictest;
+pub mod notify;
 pub mod pipewire;
 pub mod tray;
 pub mod watchdog;

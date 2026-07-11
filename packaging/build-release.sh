@@ -24,6 +24,12 @@ NAME="hushmic-${VERSION}-${ARCH}"
 DIST="$REPO_ROOT/dist"
 TOOLS="$REPO_ROOT/.build-tools"
 
+# Tray status-icon ladder (three SNI names x eight sizes) shipped alongside the
+# app icon in every artifact; must stay in lockstep with packaging/tray/hicolor/
+# and the names the tray requests over SNI.
+TRAY_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256"
+TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-error"
+
 # Install-layout paths to bake into the plugin for system builds.
 export HUSHMIC_BUILD_MODEL="/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx"
 export HUSHMIC_BUILD_DYLIB="/usr/lib/hushmic/libonnxruntime.so"
@@ -70,6 +76,15 @@ chmod 755 "$STAGE/lib/hushmic/"libonnxruntime.so*
 install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$STAGE/share/hushmic/models/"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$STAGE/share/applications/hushmic.desktop"
 install -m 644 "$REPO_ROOT/packaging/hushmic-256.png" "$STAGE/share/icons/hicolor/256x256/apps/hushmic.png"
+# Tray status icons: explicit per-name installs (not a glob) so a missing size
+# or state fails the build instead of silently shipping an incomplete ladder.
+for size in $TRAY_SIZES; do
+  install -d -m 755 "$STAGE/share/icons/hicolor/$size/status"
+  for icon in $TRAY_NAMES; do
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon.png" \
+             "$STAGE/share/icons/hicolor/$size/status/$icon.png"
+  done
+done
 install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE/LICENSE-MIT"
 install -m 644 "$REPO_ROOT/LICENSE-APACHE" "$STAGE/LICENSE-APACHE"
 install -m 755 "$REPO_ROOT/scripts/install.sh" "$STAGE/install.sh"
@@ -106,6 +121,15 @@ install -m 644 "$PLUGIN" "$APPDIR/usr/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$APPDIR/usr/lib/"
 chmod 755 "$APPDIR/usr/lib/"libonnxruntime.so*
 install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$APPDIR/usr/share/hushmic/models/"
+# Tray status icons: AppRun points HUSHMIC_TRAY_THEME_DIR at this tree so SNI
+# hosts can resolve the names outside the system hicolor theme.
+for size in $TRAY_SIZES; do
+  install -d -m 755 "$APPDIR/usr/share/icons/hicolor/$size/status"
+  for icon in $TRAY_NAMES; do
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon.png" \
+             "$APPDIR/usr/share/icons/hicolor/$size/status/$icon.png"
+  done
+done
 install -m755 "$REPO_ROOT/packaging/AppRun" "$APPDIR/AppRun"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$APPDIR/hushmic.desktop"
 
@@ -149,10 +173,33 @@ if [ -z "$APPIMAGETOOL" ]; then
   fi
 fi
 
+# The type2 runtime gets EMBEDDED into the shipped AppImage and executes on
+# every user's machine; appimagetool's default fetches it from the mutable
+# 'continuous' tag. Pin it like appimagetool itself: tagged release + sha256,
+# cached copy re-verified on every run.
+RT_VERSION="20251108"
+RT_URL="https://github.com/AppImage/type2-runtime/releases/download/${RT_VERSION}/runtime-${ARCH}"
+RT_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"  # x86_64
+RUNTIME_FILE="$TOOLS/runtime-${ARCH}-${RT_VERSION}"
+mkdir -p "$TOOLS"
+if ! echo "$RT_SHA256  $RUNTIME_FILE" | sha256sum -c - >/dev/null 2>&1; then
+  echo "  downloading type2 runtime ${RT_VERSION}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$RT_URL" -o "$RUNTIME_FILE"
+  else
+    wget -qO "$RUNTIME_FILE" "$RT_URL"
+  fi
+  if ! echo "$RT_SHA256  $RUNTIME_FILE" | sha256sum -c - >/dev/null 2>&1; then
+    echo "error: type2 runtime download does not match its pinned sha256; aborting." >&2
+    exit 1
+  fi
+fi
+
 # --appimage-extract-and-run avoids needing FUSE in CI/sandboxes.
 # appimagetool reads the target arch from $ARCH.
 export ARCH
 "$APPIMAGETOOL" --appimage-extract-and-run \
+  --runtime-file "$RUNTIME_FILE" \
   --no-appstream "$APPDIR" "$DIST/hushmic-${ARCH}.AppImage"
 chmod +x "$DIST/hushmic-${ARCH}.AppImage"
 rm -rf "$APPDIR"

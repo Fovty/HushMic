@@ -71,13 +71,9 @@ impl Config {
         self.attn_limit = self.attn_limit.clamp(0.0, 100.0);
     }
     pub fn save(&self) -> std::io::Result<()> {
-        let p = Self::path();
-        if let Some(d) = p.parent() {
-            fs::create_dir_all(d)?;
-        }
+        // atomic_write adds the fsync the old temp+rename here lacked:
+        // without it the rename can outlive a crash that the data doesn't.
         let s = toml::to_string_pretty(self).expect("serialize config");
-        let tmp = p.with_extension("toml.tmp");
-        fs::write(&tmp, s)?;
-        fs::rename(tmp, p)
+        crate::fsutil::atomic_write(&Self::path(), s.as_bytes())
     }
 }

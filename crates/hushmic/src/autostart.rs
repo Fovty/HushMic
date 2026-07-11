@@ -1,5 +1,5 @@
 use directories::BaseDirs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Quote one Exec= argument per the Desktop Entry spec, applying BOTH layers:
 /// the Exec quoting rule (whole-argument double quotes; `"`, `` ` ``, `$`, `\`
@@ -112,13 +112,37 @@ pub fn is_autostart_enabled() -> bool {
     desktop_path().exists()
 }
 
+/// Make the on-disk entry agree with the config: absent when disabled,
+/// present AND current when enabled. Compares content, not existence — a
+/// crash-truncated 0-byte .desktop still "exists" but autostarts nothing
+/// (existence-based reconciliation left it broken on every boot), and a
+/// relocated AppImage leaves a stale Exec pointing at the old path. Both
+/// heal on the next tray start.
+pub fn reconcile(enabled: bool) -> std::io::Result<()> {
+    reconcile_at(&desktop_path(), enabled, &desktop_contents())
+}
+
+fn reconcile_at(p: &Path, enabled: bool, want: &str) -> std::io::Result<()> {
+    if !enabled {
+        return match std::fs::remove_file(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        };
+    }
+    if std::fs::read_to_string(p).is_ok_and(|have| have == want) {
+        return Ok(());
+    }
+    crate::fsutil::atomic_write(p, want.as_bytes())
+}
+
 pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
     let p = desktop_path();
     if enabled {
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(p, desktop_contents())
+        // Atomic + fsynced: this file is often written seconds before a
+        // shutdown/crash (toggle, then close the laptop), and a truncated
+        // entry silently disables autostart (seen as a 0-byte .desktop
+        // after a hard VM reset on btrfs).
+        crate::fsutil::atomic_write(&p, desktop_contents().as_bytes())
     } else if p.exists() {
         std::fs::remove_file(p)
     } else {
@@ -129,6 +153,35 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_heals_truncated_and_stale_entries() {
+        let dir = std::env::temp_dir().join(format!("hushmic-autostart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("hushmic.desktop");
+        let want = "[Desktop Entry]\nExec=hushmic --tray\n";
+
+        // Enabled + missing file: created.
+        reconcile_at(&p, true, want).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), want);
+
+        // Enabled + crash-truncated 0-byte file (it EXISTS): rewritten.
+        std::fs::write(&p, "").unwrap();
+        reconcile_at(&p, true, want).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), want);
+
+        // Enabled + stale Exec (binary moved): rewritten.
+        std::fs::write(&p, "[Desktop Entry]\nExec=/old/path --tray\n").unwrap();
+        reconcile_at(&p, true, want).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), want);
+
+        // Disabled: removed; disabled again on the missing file: still Ok.
+        reconcile_at(&p, false, want).unwrap();
+        assert!(!p.exists());
+        reconcile_at(&p, false, want).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn desktop_path_is_in_autostart() {

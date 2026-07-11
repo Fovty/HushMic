@@ -75,7 +75,10 @@ pub fn parse_metadata_value(stdout: &str) -> Option<String> {
 /// unreachable, non-zero exit) — callers must treat that as "unknown", never
 /// as "no nodes": tearing down a healthy child on a failed probe is exactly
 /// the watchdog misfire this distinction prevents.
-fn pw_dump() -> Option<String> {
+///
+/// Pub (raw JSON) because the mic test also traces the *link graph*, which
+/// `parse_pwdump_nodes` drops.
+pub fn pw_dump() -> Option<String> {
     let o = Command::new("pw-dump").output().ok()?;
     if !o.status.success() {
         return None;

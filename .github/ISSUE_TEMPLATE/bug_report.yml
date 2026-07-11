@@ -1,0 +1,71 @@
+name: Bug report
+description: Something isn't working — no mic, no tray icon, a crash, or bad audio.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. A few details make the fix
+        much faster. Please skim the [open issues](https://github.com/Fovty/hushmic/issues)
+        first in case it's already known.
+  - type: input
+    id: version
+    attributes:
+      label: HushMic version
+      description: Output of `hushmic --version` (or the AppImage / .deb filename).
+      placeholder: "hushmic 0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Install script (curl … | sudo sh)
+        - .deb package
+        - AppImage
+        - Built from source
+        - AUR / other
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution & version
+      placeholder: "Ubuntu 24.04 / Bazzite 41 / Arch / Debian 12 …"
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop environment
+      description: >
+        And whether it has a system tray. GNOME needs the
+        "AppIndicator and KStatusNotifierItem Support" extension.
+      placeholder: "KDE Plasma 6 / GNOME 46 + AppIndicator / Cinnamon …"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+        3. …
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: >
+        Run `hushmic --tray` from a terminal and paste anything it prints. For
+        audio problems, `pw-dump | grep hushmic` and your PipeWire version
+        (`pipewire --version`) are very helpful.
+      render: shell

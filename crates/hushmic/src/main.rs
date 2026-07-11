@@ -1,22 +1,36 @@
 use hushmic::config::Config;
 use hushmic::controller::{self, Controller, Paths};
+use hushmic::notify::{self, FailureGate, Slot};
 use hushmic::pipewire;
 use hushmic::tray::{HushMicTray, TrayCmd, TrayStatus};
-use hushmic::{autostart, lock, watchdog};
+use hushmic::{autostart, lock, mictest, watchdog};
 use ksni::blocking::TrayMethods;
 use std::io::Read;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// Unifies the event sources (tray commands, watchdog ticks, termination
-/// signals) into one channel so the main loop is single-threaded and owns the
-/// `Controller`.
+/// Unifies the event sources (tray commands, watchdog ticks, mic-test
+/// completion, termination signals) into one channel so the main loop is
+/// single-threaded and owns the `Controller`.
 enum Event {
     Cmd(TrayCmd),
     Tick,
+    MicTestDone(Result<(), String>),
     Shutdown,
 }
+
+/// Notification text for enable/watchdog failures (the body carries the
+/// actionable enable() error).
+const FAIL_SUMMARY: &str = "HushMic could not start the virtual microphone";
+const STUCK_SUMMARY: &str = "HushMic keeps losing the virtual microphone";
+const STUCK_BODY: &str = "Re-creating it keeps failing — is PipeWire running? \
+                          Run `hushmic --tray` from a terminal for details.";
+const FLAP_SUMMARY: &str = "HushMic keeps restarting the virtual microphone";
+const FLAP_BODY: &str = "It went down and was re-created several times in the last few \
+                         minutes — the audio setup may be unstable. Run `hushmic --tray` \
+                         from a terminal for details.";
 
 /// How long a freshly spawned filter-chain host gets to register its node
 /// before an absent `hushmic_source` counts as "down". Registration normally
@@ -124,15 +138,166 @@ fn wait_for_shutdown(pipe: Option<std::fs::File>) {
     }
 }
 
+/// Resolve the (raw mic, hushmic_source) node pair for the A/B window: the
+/// live link-graph trace wins, the configured mic is the fallback. An empty
+/// raw node just means the window opens with the no-device overlay.
+fn resolve_ab_nodes() -> (String, String) {
+    let cfg = Config::load();
+    let traced = pipewire::pw_dump()
+        .as_deref()
+        .and_then(|d| mictest::find_feeding_node(d, "hushmic_input"));
+    let raw = mictest::raw_target(traced, cfg.mic.as_deref()).unwrap_or_default();
+    (raw, "hushmic_source".to_string())
+}
+
+/// Spawn a companion window as a child of the tray (same binary, given mode
+/// flag: --test-window or --about). PDEATHSIG binds it to the tray: without
+/// the tray there is no virtual mic, so an orphaned A/B window would only
+/// show a dead device, and an About window has nothing to be about.
+/// MUST be called from the main thread (PR_SET_PDEATHSIG is thread-scoped).
+fn spawn_child_window(mode_flag: &str) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    let mut c = std::process::Command::new(exe);
+    c.arg(mode_flag);
+    unsafe {
+        c.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    c.spawn()
+}
+
+/// The notification-driven mic test (record 10 s, play both takes): the
+/// fallback when the A/B window cannot run, and self-announcing via
+/// notifications so an unexpected fallback is not confusing.
+fn start_fallback_mictest(
+    cfg: &Config,
+    testing: &mut bool,
+    mictest_cancel: &mut Option<Arc<AtomicBool>>,
+    tx: &mpsc::Sender<Event>,
+) {
+    let dump = pipewire::pw_dump();
+    let node_present = dump.as_deref().map(|d| {
+        pipewire::parse_pwdump_nodes(d)
+            .iter()
+            .any(|s| s.name == "hushmic_source")
+    });
+    let start = mictest::precondition(cfg.enabled, node_present, *testing)
+        .map_err(String::from)
+        .and_then(|()| {
+            let traced = dump
+                .as_deref()
+                .and_then(|d| mictest::find_feeding_node(d, "hushmic_input"));
+            mictest::raw_target(traced, cfg.mic.as_deref())
+                .ok_or_else(|| "Could not find the microphone feeding HushMic.".to_string())
+        });
+    match start {
+        Err(msg) => notify::send(Slot::MicTest, "audio-input-microphone", "Mic test", &msg),
+        Ok(raw) => {
+            *testing = true;
+            let flag = Arc::new(AtomicBool::new(false));
+            *mictest_cancel = Some(flag.clone());
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                // A worker that dies without reporting would leave `testing`
+                // stuck forever — even a panic must become MicTestDone.
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    mictest::run(&raw, &flag)
+                }))
+                .unwrap_or_else(|_| Err("the mic test crashed unexpectedly".to_string()));
+                let _ = tx.send(Event::MicTestDone(res));
+            });
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let tray_mode = args.iter().any(|a| a == "--tray");
     let enable_once = args.iter().any(|a| a == "--enable-once");
-    let unrecognized = args.iter().any(|a| a != "--tray" && a != "--enable-once");
-    if unrecognized || (tray_mode && enable_once) || (!tray_mode && !enable_once) {
+    let test_window = args.iter().any(|a| a == "--test-window");
+    let about = args.iter().any(|a| a == "--about");
+    let version = args.iter().any(|a| a == "--version");
+    const KNOWN_FLAGS: [&str; 5] = [
+        "--tray",
+        "--enable-once",
+        "--test-window",
+        "--about",
+        "--version",
+    ];
+    let unrecognized = args.iter().any(|a| !KNOWN_FLAGS.contains(&a.as_str()));
+    let modes = [tray_mode, enable_once, test_window, about, version]
+        .iter()
+        .filter(|m| **m)
+        .count();
+    if unrecognized || modes != 1 {
         eprintln!("usage: hushmic --tray          run the system-tray app");
         eprintln!("       hushmic --enable-once   headless: enable the mic until terminated");
+        eprintln!("       hushmic --test-window   open the live A/B mic-test window");
+        eprintln!("       hushmic --about         open the About window");
+        eprintln!("       hushmic --version       print the version and install paths");
         std::process::exit(2);
+    }
+
+    if version {
+        // Best-effort install facts: Paths::resolve() is the same cheap
+        // env/prefix probe enable() uses, so what prints here is exactly
+        // what the app would load.
+        //
+        // Written via write! instead of println!: the Rust runtime ignores
+        // SIGPIPE, so `hushmic --version | head -1` surfaces the closed pipe
+        // as an EPIPE error that println! turns into a panic. A quiet exit is
+        // the correct CLI behavior. Deliberately NOT fixed by resetting
+        // SIGPIPE to SIG_DFL process-wide: the tray is long-running, and a
+        // journald restart closing its stdout must not kill it.
+        use std::io::Write;
+        let paths = Paths::resolve();
+        let out = format!(
+            "hushmic {}\nconfig: {}\nplugin: {}\nmodels: {}\n",
+            env!("CARGO_PKG_VERSION"),
+            Config::path().display(),
+            paths.plugin_so.display(),
+            paths.model_dir.display()
+        );
+        if let Err(e) = std::io::stdout().write_all(out.as_bytes()) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                eprintln!("hushmic: cannot write to stdout: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if about {
+        // Companion window to the tray (or standalone): like --test-window,
+        // no single-instance lock and no signal plumbing — closing the
+        // window is the teardown.
+        if let Err(e) = hushmic::about::run() {
+            eprintln!("hushmic: about window failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if test_window {
+        // Companion window to a RUNNING tray instance: no single-instance
+        // lock (it owns no mic), no signal plumbing (closing the window is
+        // the teardown; children die via PDEATHSIG on abnormal exit).
+        let (raw, filtered) = resolve_ab_nodes();
+        let result = hushmic::abtest::run_window(raw, filtered);
+        // The backend thread's own on-close WAV deletion is detached and
+        // races process exit (it loses whenever a sample is playing):
+        // sweep synchronously before returning — idempotent with it.
+        hushmic::mictest::remove_recordings();
+        if let Err(e) = result {
+            eprintln!("hushmic: test window failed: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let _lock = acquire_single_instance();
@@ -150,6 +315,20 @@ fn main() {
             eprintln!("hushmic: enable failed: {e}");
             std::process::exit(1);
         }
+        // enable() succeeding only means the child SPAWNED. Headless there is
+        // no watchdog or notification to catch a node that never registers
+        // (e.g. PipeWire not running), so verify before claiming success —
+        // otherwise scripts hang on a mic that will never exist. The wait
+        // returns as soon as the node shows up; 5 s is only the failure path.
+        if !pipewire::wait_for_hushmic_source(std::time::Duration::from_secs(5)) {
+            eprintln!(
+                "hushmic: enable failed: hushmic_source never appeared (is PipeWire running?)"
+            );
+            // Explicit drop, not bare exit: Drop reaps the child and
+            // restores/clears the default source we may have taken.
+            drop(c);
+            std::process::exit(1);
+        }
         eprintln!("hushmic: enabled; send SIGTERM or press Ctrl+C to stop.");
         wait_for_shutdown(shutdown_pipe);
         drop(c);
@@ -159,26 +338,65 @@ fn main() {
     let mut cfg = Config::load();
     let mut controller = Controller::new(Paths::resolve());
 
+    // A previous run that died mid-mic-test never got to delete its
+    // recordings — the user's voice must not linger on disk.
+    mictest::remove_recordings();
+
     let (tx, rx) = mpsc::channel::<Event>();
 
     // Tray -> commands
     let (ctx, crx) = mpsc::channel::<TrayCmd>();
     let mut known_mics = pipewire::list_real_sources();
-    let tray = HushMicTray {
-        cfg: cfg.clone(),
-        mics: known_mics.clone(),
-        cmd_tx: ctx,
-        status: TrayStatus::Off,
-    };
-    let handle = match tray.spawn() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "hushmic: could not register a system tray icon ({e}). On GNOME, install the \
-                 'AppIndicator and KStatusNotifierItem Support' extension; KDE and most other \
-                 desktops provide it out of the box."
-            );
-            std::process::exit(1);
+    // At login we can outrun the desktop's StatusNotifierWatcher: Cinnamon's
+    // xapp-sn-watcher only registers once the applets load and is not
+    // DBus-activatable, so an autostarted instance raced it, failed to
+    // register, and exited — indistinguishable from "autostart is broken"
+    // (reproduced 3x on Mint 22.1). The watcher follows within seconds on
+    // every desktop we bench, so retry over a bounded window before
+    // declaring the environment tray-less.
+    const TRAY_WAIT_SECS: u64 = 60;
+    let spawn_deadline = std::time::Instant::now() + Duration::from_secs(TRAY_WAIT_SECS);
+    let mut reported_wait = false;
+    let handle = loop {
+        let tray = HushMicTray {
+            cfg: cfg.clone(),
+            mics: known_mics.clone(),
+            cmd_tx: ctx.clone(),
+            status: TrayStatus::Off,
+            testing: false,
+        };
+        match tray.spawn() {
+            Ok(h) => break h,
+            Err(e) if std::time::Instant::now() < spawn_deadline => {
+                if !reported_wait {
+                    eprintln!(
+                        "hushmic: no system tray yet ({e}); waiting up to {TRAY_WAIT_SECS}s \
+                         for one to appear…"
+                    );
+                    reported_wait = true;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Could not register a system tray icon ({e}). On GNOME, install the \
+                     'AppIndicator and KStatusNotifierItem Support' extension; KDE and most other \
+                     desktops provide it out of the box."
+                );
+                eprintln!("hushmic: {msg}");
+                // The one failure a tray app cannot show in the tray — and, on
+                // stock GNOME, exactly the case where notifications still work.
+                // Bounded wait: the process exits right after, and a detached
+                // send thread would be killed mid-call.
+                notify::send_and_wait(
+                    Slot::Status,
+                    "dialog-error",
+                    "HushMic could not start",
+                    &msg,
+                    Duration::from_secs(2),
+                );
+                std::process::exit(1);
+            }
         }
     };
 
@@ -216,13 +434,20 @@ fn main() {
         });
     }
 
+    // Gate for failure/recovery notifications: dedups the watchdog's
+    // backoff-gated retries so the same error does not re-pop forever.
+    let mut gate = FailureGate::new();
+
     // apply persisted state on launch
-    if cfg.autostart != autostart::is_autostart_enabled() {
-        let _ = autostart::set_autostart(cfg.autostart);
-    }
+    let _ = autostart::reconcile(cfg.autostart);
     if cfg.enabled {
         if let Err(e) = controller.enable(&cfg) {
             eprintln!("hushmic: enable failed: {e}");
+            // A launch failure is invisible on stderr for .desktop/autostart
+            // starts — surface it (launch counts as user-initiated).
+            if gate.on_enable_error(&e.to_string(), true) {
+                notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, &e.to_string());
+            }
         }
     }
     // Reflect the launch-time state immediately: the tray was registered as Off
@@ -234,60 +459,173 @@ fn main() {
         });
     }
 
-    let apply = |controller: &mut Controller, cfg: &Config| {
+    // Errors bubble up as the enable() message so the caller can notify;
+    // disable() practically cannot fail and is not notification-worthy.
+    let apply = |controller: &mut Controller, cfg: &Config| -> Result<(), String> {
         if cfg.enabled {
-            if let Err(e) = controller.enable(cfg) {
-                eprintln!("hushmic: enable failed: {e}");
+            controller.enable(cfg).map_err(|e| e.to_string())
+        } else {
+            if let Err(e) = controller.disable() {
+                eprintln!("hushmic: disable failed: {e}");
             }
-        } else if let Err(e) = controller.disable() {
-            eprintln!("hushmic: disable failed: {e}");
+            Ok(())
         }
     };
 
     // watchdog respawn backoff + throttled "node down" logging (state-change only)
     let mut backoff = hushmic::watchdog::Backoff::new();
     let mut logged_down = false;
+    // A mic test is running (worker thread active). Owned by the main loop:
+    // set on TrayCmd::TestMic, cleared on Event::MicTestDone. The flag lets
+    // the loop cancel the test when the filter-chain is mutated under it.
+    let mut testing = false;
+    let mut mictest_cancel: Option<Arc<AtomicBool>> = None;
+    // The spawned A/B test window child (PDEATHSIG-bound to this process).
+    let mut ab_window: Option<(std::process::Child, Instant)> = None;
+    // Spawned About window children. Multiple are acceptable (each click just
+    // opens another), but every one must be reaped on Tick or it lingers as a
+    // zombie after close.
+    let mut about_windows: Vec<std::process::Child> = Vec::new();
 
     for ev in rx {
         match ev {
             Event::Cmd(cmd) => {
+                // Any command that will re-render/restart the chain (or tear
+                // it down) invalidates a running mic test's cleaned leg —
+                // cancel it rather than let it record a dead node.
+                let mutates_chain = matches!(cmd, TrayCmd::SetEnabled(_))
+                    || (cfg.enabled
+                        && matches!(
+                            cmd,
+                            TrayCmd::SelectMic(_)
+                                | TrayCmd::SelectModel(_)
+                                | TrayCmd::SetAttn(_)
+                                | TrayCmd::SetDefaultToggle(_)
+                        ));
+                if testing && mutates_chain {
+                    if let Some(c) = &mictest_cancel {
+                        c.store(true, Ordering::Relaxed);
+                    }
+                }
+                // The A/B window resolves its raw node once at spawn: after
+                // a chain mutation it would silently compare the OLD mic
+                // against the NEW output (and "already open" would steer
+                // the user back to it). Close it — reopening gets a fresh
+                // trace. Its pw children die via PDEATHSIG; the recordings
+                // sweep below covers the transient WAVs its detached
+                // backend may not get to delete.
+                if mutates_chain {
+                    if let Some((child, _)) = ab_window.as_mut() {
+                        if matches!(child.try_wait(), Ok(None)) {
+                            unsafe {
+                                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                            }
+                            let _ = child.wait();
+                            hushmic::mictest::remove_recordings();
+                        }
+                        ab_window = None;
+                    }
+                }
+                let mut applied: Result<(), String> = Ok(());
                 match cmd {
                     TrayCmd::SetEnabled(v) => {
                         cfg.enabled = v;
-                        apply(&mut controller, &cfg);
+                        applied = apply(&mut controller, &cfg);
                     }
                     TrayCmd::SelectMic(m) => {
                         cfg.mic = m;
                         if cfg.enabled {
-                            apply(&mut controller, &cfg);
+                            applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SelectModel(m) => {
                         cfg.model = m;
                         if cfg.enabled {
-                            apply(&mut controller, &cfg);
+                            applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SetAttn(v) => {
                         cfg.attn_limit = v;
                         if cfg.enabled {
-                            apply(&mut controller, &cfg);
+                            applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SetDefaultToggle(v) => {
                         cfg.set_default = v;
                         if cfg.enabled {
-                            apply(&mut controller, &cfg);
+                            applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SetAutostart(v) => {
                         cfg.autostart = v;
                         let _ = autostart::set_autostart(v);
                     }
+                    TrayCmd::TestMic => {
+                        let window_alive = ab_window
+                            .as_mut()
+                            .is_some_and(|(c, _)| matches!(c.try_wait(), Ok(None)));
+                        // Same gate as the audio-only flow: an intentionally
+                        // disabled suppression or a missing chain must get
+                        // the actionable message, not a window whose device
+                        // overlay misdiagnoses it as a missing microphone.
+                        let node_present = pipewire::pw_dump().as_deref().map(|d| {
+                            pipewire::parse_pwdump_nodes(d)
+                                .iter()
+                                .any(|s| s.name == "hushmic_source")
+                        });
+                        if window_alive {
+                            notify::send(
+                                Slot::MicTest,
+                                "audio-input-microphone",
+                                "Mic test",
+                                "The A/B test window is already open.",
+                            );
+                        } else if let Err(msg) =
+                            mictest::precondition(cfg.enabled, node_present, testing)
+                        {
+                            notify::send(Slot::MicTest, "audio-input-microphone", "Mic test", msg);
+                        } else {
+                            match spawn_child_window("--test-window") {
+                                Ok(child) => ab_window = Some((child, Instant::now())),
+                                Err(e) => {
+                                    // No window (headless, exec failure):
+                                    // the audio-only flow still works.
+                                    eprintln!("hushmic: could not open the test window: {e}");
+                                    start_fallback_mictest(
+                                        &cfg,
+                                        &mut testing,
+                                        &mut mictest_cancel,
+                                        &tx,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    TrayCmd::About => {
+                        // Same PDEATHSIG child pattern as the A/B window; a
+                        // failure to open is log-only (nothing to fall back
+                        // to, and --about prints its own error on exit).
+                        match spawn_child_window("--about") {
+                            Ok(child) => about_windows.push(child),
+                            Err(e) => {
+                                eprintln!("hushmic: could not open the About window: {e}")
+                            }
+                        }
+                    }
                     TrayCmd::Quit => {
                         let _ = controller.disable();
                         break;
                     }
+                }
+                if let Err(e) = applied {
+                    eprintln!("hushmic: enable failed: {e}");
+                    if gate.on_enable_error(&e, true) {
+                        notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, &e);
+                    }
+                } else if !cfg.enabled {
+                    // user turned it off: stale failure state must not
+                    // produce a "running again" notice later
+                    gate.reset();
                 }
                 let _ = cfg.save();
                 // reflect updated state + refreshed mic list + status in the tray
@@ -301,13 +639,73 @@ fn main() {
                 let status = compute_status(&cfg, &mut controller, node_present);
                 let new_mics = known_mics.clone();
                 let snapshot = cfg.clone();
+                let testing_now = testing;
                 let _ = handle.update(move |t: &mut HushMicTray| {
                     t.cfg = snapshot;
                     t.mics = new_mics;
                     t.status = status;
+                    t.testing = testing_now;
+                });
+            }
+            Event::MicTestDone(res) => {
+                testing = false;
+                mictest_cancel = None;
+                match res {
+                    Ok(()) => {}
+                    // Deliberate cancellation (settings changed mid-test)
+                    // is information, not an error.
+                    Err(e) if e == mictest::CANCELLED_MSG => {
+                        notify::send_transient(
+                            Slot::MicTest,
+                            "audio-input-microphone",
+                            "Mic test",
+                            &e,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("hushmic: mic test failed: {e}");
+                        notify::send(Slot::MicTest, "dialog-error", "Mic test failed", &e);
+                    }
+                }
+                let _ = handle.update(move |t: &mut HushMicTray| {
+                    t.testing = false;
                 });
             }
             Event::Tick => {
+                // Reap finished About windows (exit status is irrelevant:
+                // they are informational, closing one is not a failure to
+                // react to). Still-running children are kept for next Tick.
+                about_windows.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+                // Reap the A/B window child. A fast non-zero exit means the
+                // window could not start at all (no display / GL) — run the
+                // audio-only mic test instead so the click still does
+                // something.
+                let mut window_quick_fail = None;
+                if let Some((child, spawned)) = ab_window.as_mut() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        // Exit code 1 is --test-window's own "could not
+                        // start" path; signals (WM kill) and user closes
+                        // (0) must not trigger a surprise audio-only test.
+                        // The reap window is generous: Tick is 5 s, so the
+                        // observed elapsed includes up to a tick of lag.
+                        window_quick_fail = Some(
+                            status.code() == Some(1) && spawned.elapsed() < Duration::from_secs(15),
+                        );
+                    }
+                }
+                if let Some(quick_fail) = window_quick_fail {
+                    ab_window = None;
+                    if quick_fail {
+                        notify::send(
+                            Slot::MicTest,
+                            "audio-input-microphone",
+                            "Mic test",
+                            "The test window could not start — running the audio-only \
+                             mic test instead.",
+                        );
+                        start_fallback_mictest(&cfg, &mut testing, &mut mictest_cancel, &tx);
+                    }
+                }
                 // One pw-dump snapshot per tick serves the liveness check, the
                 // tray status, AND a hotplug refresh of the mic list (menu
                 // clicks are far too rare to be the only refresh trigger).
@@ -353,23 +751,59 @@ fn main() {
                         logged_down = true;
                     }
                     if backoff.should_attempt() {
+                        // The respawn restarts the chain: a mic test recording
+                        // it would capture a dead node — cancel it first.
+                        if testing {
+                            if let Some(c) = &mictest_cancel {
+                                c.store(true, Ordering::Relaxed);
+                            }
+                        }
                         // "Success" must match the liveness model (node present),
                         // polled with a bounded settle window: sampling at t=0
                         // after the spawn records a false failure and escalates
                         // the backoff even though the respawn worked.
                         let ok = match controller.enable(&cfg) {
                             Ok(()) => {
-                                controller.is_running()
-                                    && pipewire::wait_for_hushmic_source(Duration::from_secs(2))
+                                let up = controller.is_running()
+                                    && pipewire::wait_for_hushmic_source(Duration::from_secs(2));
+                                // enable() succeeded yet the node never came:
+                                // nothing ever reaches stderr on this path, so
+                                // a stuck loop must be surfaced explicitly.
+                                if !up && gate.on_silent_failure() {
+                                    notify::send(
+                                        Slot::Status,
+                                        "dialog-error",
+                                        STUCK_SUMMARY,
+                                        STUCK_BODY,
+                                    );
+                                }
+                                up
                             }
                             Err(e) => {
                                 eprintln!("hushmic: enable failed: {e}");
+                                if gate.on_enable_error(&e.to_string(), false) {
+                                    notify::send(
+                                        Slot::Status,
+                                        "dialog-error",
+                                        FAIL_SUMMARY,
+                                        &e.to_string(),
+                                    );
+                                }
                                 false
                             }
                         };
                         backoff.record(ok);
                         if ok {
                             logged_down = false;
+                            // No recovery notice here: right after a respawn
+                            // the node is not yet proven STABLE (a flapping
+                            // child may die again in seconds). The healthy
+                            // branch below emits it once stability holds.
+                            // What quick respawn cycles DO prove is
+                            // instability — surface that pattern.
+                            if gate.on_respawn() {
+                                notify::send(Slot::Status, "dialog-error", FLAP_SUMMARY, FLAP_BODY);
+                            }
                         }
                     }
                 } else if !cfg.enabled || node_present == Some(true) {
@@ -379,6 +813,16 @@ fn main() {
                     // (node registered late): no-op unless wanted and pending.
                     if cfg.enabled && node_present == Some(true) {
                         controller.ensure_default_takeover(&cfg, true);
+                        if gate.on_healthy() {
+                            notify::send(
+                                Slot::Status,
+                                "audio-input-microphone",
+                                "HushMic is running again",
+                                "The virtual microphone is back up.",
+                            );
+                        }
+                    } else if !cfg.enabled {
+                        gate.reset();
                     }
                 }
                 // node_present == None with a live child is "unknown", not
@@ -387,8 +831,10 @@ fn main() {
                 // to zero and re-log/attempt nearly every tick.
                 // reflect liveness in the tray status (icon + title) every tick
                 let status = compute_status(&cfg, &mut controller, node_present);
+                let testing_now = testing;
                 let _ = handle.update(move |t: &mut HushMicTray| {
                     t.status = status;
+                    t.testing = testing_now;
                 });
             }
             Event::Shutdown => {
@@ -399,4 +845,9 @@ fn main() {
             }
         }
     }
+    // Quit/Shutdown may interrupt a running mic test: its worker dies with
+    // the process (recorders via PDEATHSIG) before its own cleanup runs —
+    // the voice recordings must not outlive the app. (Unlinking files the
+    // recorders still hold open is fine: the data dies with their fds.)
+    mictest::remove_recordings();
 }

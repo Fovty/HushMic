@@ -5,4 +5,9 @@ members = ["crates/dpdfnet-ladspa", "crates/hushmic"]
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.1.4"
+version = "0.2.0"
+
+[profile.release]
+# Symbols are ~27% of the binary and ship no user value; panics keep the
+# message, backtraces come from debug builds.
+strip = true

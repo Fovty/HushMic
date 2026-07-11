@@ -6,6 +6,10 @@ export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export ORT_DYLIB_PATH="$HERE/usr/lib/libonnxruntime.so"
 export HUSHMIC_PLUGIN_SO="$HERE/usr/lib/ladspa/libdpdfnet_ladspa.so"
 export HUSHMIC_MODEL_DIR="$HERE/usr/share/hushmic/models"
+# SNI hosts resolve tray icons BY NAME from theme dirs, and an AppImage's
+# bundled icons are invisible to the system hicolor lookup; the tray forwards
+# this dir via ksni's icon_theme_path() so hosts find them here instead.
+export HUSHMIC_TRAY_THEME_DIR="$HERE/usr/share/icons"
 # Double-clicking the AppImage passes no args; default to the tray app instead
 # of printing usage to an invisible stderr and exiting.
 [ "$#" -eq 0 ] && set -- --tray

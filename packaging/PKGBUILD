@@ -1,6 +1,6 @@
 # Maintainer: Fovty <38868829+Fovty@users.noreply.github.com>
 pkgname=hushmic
-pkgver=0.1.4
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Real-time microphone noise suppression as a virtual mic (DPDFNet via PipeWire)"
 arch=('x86_64')
@@ -51,6 +51,14 @@ package() {
   install -Dm644 assets/models/dpdfnet2_48khz_hr.onnx "$pkgdir/usr/share/hushmic/models/dpdfnet2_48khz_hr.onnx"
   install -Dm644 packaging/hushmic.desktop "$pkgdir/usr/share/applications/hushmic.desktop"
   install -Dm644 packaging/hushmic-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/hushmic.png"
+  # Tray status-icon ladder (three SNI names x eight sizes); explicit installs
+  # so a missing size or state fails packaging instead of shipping incomplete.
+  for _size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256; do
+    for _icon in hushmic-tray hushmic-tray-off hushmic-tray-error; do
+      install -Dm644 "packaging/tray/hicolor/$_size/status/$_icon.png" \
+        "$pkgdir/usr/share/icons/hicolor/$_size/status/$_icon.png"
+    done
+  done
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/hushmic/LICENSE-MIT"
   install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/hushmic/LICENSE-APACHE"
 }

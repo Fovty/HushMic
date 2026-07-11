@@ -20,3 +20,8 @@
 # demo clips are rebuilt by docs/demo/make-demos.py and attached at publish time
 /docs/demo/build/
 /docs/demo/*.mp4
+.deploy-host
+
+# Raw icon exports (bulky, metadata-laden ~1 MB each); the cleaned masters
+# and the hicolor ladder are the committed artifacts.
+/packaging/tray/tray*.png

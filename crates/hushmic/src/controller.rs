@@ -190,11 +190,10 @@ fn prior_default_path() -> PathBuf {
 }
 
 fn persist_prior_default(name: &str) {
-    let p = prior_default_path();
-    if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&p, name);
+    // Atomic: this breadcrumb exists precisely for crash recovery, so it
+    // must not itself be truncatable by the crash (the empty-file case is
+    // tolerated by the reader, but then the real prior default is lost).
+    let _ = crate::fsutil::atomic_write(&prior_default_path(), name.as_bytes());
 }
 
 /// A previous run's persisted prior default, if any (crash leftover). Never

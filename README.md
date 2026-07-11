@@ -12,10 +12,10 @@
   <a href="https://github.com/Fovty/hushmic/releases"><img src="https://img.shields.io/github/v/release/Fovty/hushmic?sort=semver" alt="Release"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
   <a href="https://github.com/Fovty/hushmic/actions/workflows/release.yml"><img src="https://github.com/Fovty/hushmic/actions/workflows/release.yml/badge.svg" alt="Build"></a>
+  <a href="https://ko-fi.com/fovty"><img src="https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=ko-fi&logoColor=white" alt="Support on Ko-fi"></a>
 </p>
 
 HushMic creates a virtual microphone that strips out keyboard clatter, fans, and background chatter in real time. Select **"HushMic"** as your input in any app — Discord, TeamSpeak, browsers, OBS, games — and that's it. No EasyEffects graphs to wire up, no terminal, no `setcap`.
-
 
 ## Demo
 
@@ -62,6 +62,8 @@ _(Averaged over the three clips; higher is better, 1–5.)_ DPDFNet comes out on
 
 - One virtual microphone, usable by any PipeWire- or PulseAudio-compatible app.
 - A tray menu for everything: on/off, which mic to clean, model (quality vs. light), suppression strength, set-as-default, start-on-login.
+- **Test my mic**: a live A/B window — your raw microphone and the cleaned output side by side as scrolling spectrograms with level meters, plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_, with honest before/after numbers. No call needed to hear (and see) the difference. On setups without a display for it, an audio-only record-and-playback test runs instead.
+- Failures show up as desktop notifications — a broken install or a virtual mic that will not come back says so on screen, not just in a terminal you never see.
 - The audio runs in a dedicated PipeWire process, so no elevated privileges (`setcap`) are needed.
 - Re-creates itself automatically after a PipeWire restart or a suspend/resume, and puts your previous default mic back when you quit (the virtual mic is tied to the app: quitting removes it cleanly).
 - ~0.3× real-time on a desktop CPU; no GPU, no network.
@@ -83,9 +85,14 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.1.4-1_amd64.deb
-sudo apt install ./hushmic_0.1.4-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.2.0-1_amd64.deb
+sudo apt install ./hushmic_0.2.0-1_amd64.deb
 ```
+
+> On stock **Ubuntu 22.04** apt refuses with a `pipewire-media-session`/`wireplumber`
+> conflict (22.04 still ships the deprecated session manager). Install with
+> `sudo apt install ./hushmic_0.2.0-1_amd64.deb wireplumber pipewire-media-session-`
+> (the trailing `-` swaps it out), then log out and back in.
 
 **AppImage** (any distro, no install):
 
@@ -103,19 +110,19 @@ Launch HushMic from your desktop's application menu, or from a terminal:
 hushmic --tray
 ```
 
-A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The same menu has the on/off toggle (**Enable noise suppression**), the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, and a start-on-login toggle.
+A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The same menu has the on/off toggle (**Enable noise suppression**), the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, a start-on-login toggle, and **About HushMic** (version, license, links; `hushmic --version` works in a terminal too). **Test my mic** opens a live A/B window: raw microphone and cleaned output side by side — spectrograms and level meters running live — plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_ with measured before/after numbers. The tray icon doubles as a status light: cyan while active, struck-through gray when suppression is off, a warning badge on errors.
 
 <p align="center">
-  <img src="docs/img/hushmic-menu-main.png" alt="Main menu" width="270">
+  <img src="docs/img/hushmic-ab-window.png" alt="Live A/B mic test — raw microphone vs. HushMic output" width="720">
 </p>
 
 <details>
 <summary><b>More screenshots</b> — microphone picker, model picker, suppression strength</summary>
 
 <p align="center">
-  <img src="docs/img/hushmic-menu-microphone.png" alt="Microphone picker" width="300">
-  <img src="docs/img/hushmic-menu-model.png" alt="Model picker" width="290">
-  <img src="docs/img/hushmic-menu-suppression.png" alt="Suppression strength" width="260">
+  <img src="docs/img/hushmic-menu-microphone.png" alt="Microphone picker" width="360">
+  <img src="docs/img/hushmic-menu-model.png" alt="Model picker" width="360">
+  <img src="docs/img/hushmic-menu-suppression.png" alt="Suppression strength" width="310">
 </p>
 
 </details>
@@ -143,7 +150,9 @@ autostart   = false                        # launch on login
 
 **The tray icon doesn't show up (GNOME).** GNOME doesn't implement the tray spec natively — install the _AppIndicator and KStatusNotifierItem Support_ extension. KDE and most other desktops work out of the box.
 
-**Does it survive sleep / a PipeWire restart?** Yes — a watchdog re-creates the virtual mic automatically.
+**Is it actually doing anything?** Click **Test my mic** in the tray: a window shows your raw microphone and the cleaned output live, side by side; record a 10-second sample and replay either take back-to-back. (Headless or no GL? An audio-only version records both and plays them back instead.)
+
+**Does it survive sleep / a PipeWire restart?** Yes — a watchdog re-creates the virtual mic automatically. If it ever can't (or an install is broken), you get a desktop notification instead of silence.
 
 **TeamSpeak / Discord don't see it?** Make sure `pipewire-pulse` is running; HushMic exposes the mic through it so PulseAudio/ALSA-compat apps can pick it.
 
@@ -175,6 +184,10 @@ Two parts:
 
 1. **`dpdfnet-ladspa`** — a LADSPA plugin (Rust) that runs DPDFNet's ONNX model in real time, hop-by-hop, at 48 kHz mono, via [`ort`](https://github.com/pykeio/ort) (ONNX Runtime).
 2. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed; the mic's lifetime is tied to the app, and quitting tears it down cleanly (restoring your previous default input).
+
+## Support
+
+HushMic is free, open source, and makes zero network calls — no ads, no telemetry, no accounts. If it saved you a Krisp subscription, a coffee on **[Ko-fi](https://ko-fi.com/fovty)** is genuinely appreciated and helps keep it maintained. Starring the repo helps too.
 
 ## License
 

@@ -1,0 +1,7 @@
+# Keep the freeform "blank issue" option (low friction for a young project),
+# and surface a couple of helpful links next to the templates.
+blank_issues_enabled: true
+contact_links:
+  - name: Support HushMic (Ko-fi)
+    url: https://ko-fi.com/fovty
+    about: HushMic is free, ad-free, and makes zero network calls — tips keep it going.

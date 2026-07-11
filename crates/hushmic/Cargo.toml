@@ -13,11 +13,34 @@ path = "src/main.rs"
 
 [dependencies]
 ksni = { version = "0.3", features = ["blocking"] }
+# Same backend ksni already pulls in (feature-matched: tokio, no async-io
+# stack), used directly for org.freedesktop.Notifications — desktop
+# notifications without requiring libnotify/notify-send on the host.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 directories = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 libc = "0.2"
+# default-features off: accesskit's AT-SPI backend uses ASYNC zbus, which
+# panics under the workspace's tokio-mode zbus pin (no ambient reactor);
+# glow is also the leaner renderer. Revisit accessibility with a future
+# DBus control interface.
+eframe = { version = "0.33.3", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+# default-features=false above drops winit/default: restore wayland dlopen +
+# client-side decorations (GNOME Wayland would otherwise lose the title bar).
+winit = { version = "0.30", default-features = false, features = ["wayland-dlopen", "wayland-csd-adwaita", "x11"] }
+hound = "3.5.1"
+rustfft = "6.4.1"
+png = "0.18.1"
+
+[dev-dependencies]
+# UI harness tests for the A/B window (Tier-A: queries + clicks only, no
+# snapshot/wgpu features). kittest queries the accesskit tree, so TEST
+# builds re-enable eframe's accesskit (release builds stay without it —
+# see the eframe dependency note).
+egui_kittest = "0.33"
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit"] }
 
 # .deb BUILD PROCEDURE (must match the AUR PKGBUILD's path-bake): the packaged
 # plugin .so bakes its compile-time default model/dylib paths from the build env,
@@ -51,6 +74,33 @@ assets = [
   ["../../assets/models/dpdfnet2_48khz_hr.onnx", "usr/share/hushmic/models/", "644"],
   ["../../packaging/hushmic.desktop", "usr/share/applications/", "644"],
   ["../../packaging/hushmic-256.png", "usr/share/icons/hicolor/256x256/apps/hushmic.png", "644"],
+  # Tray status-icon ladder (three SNI names x eight sizes): explicit per-file
+  # entries (no globs) so a missing size or state fails the packaging step
+  # instead of silently shipping an incomplete ladder.
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray.png", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-off.png", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-error.png", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray.png", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-off.png", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-error.png", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray.png", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-off.png", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-error.png", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/32x32/status/hushmic-tray.png", "usr/share/icons/hicolor/32x32/status/", "644"],
+  ["../../packaging/tray/hicolor/32x32/status/hushmic-tray-off.png", "usr/share/icons/hicolor/32x32/status/", "644"],
+  ["../../packaging/tray/hicolor/32x32/status/hushmic-tray-error.png", "usr/share/icons/hicolor/32x32/status/", "644"],
+  ["../../packaging/tray/hicolor/48x48/status/hushmic-tray.png", "usr/share/icons/hicolor/48x48/status/", "644"],
+  ["../../packaging/tray/hicolor/48x48/status/hushmic-tray-off.png", "usr/share/icons/hicolor/48x48/status/", "644"],
+  ["../../packaging/tray/hicolor/48x48/status/hushmic-tray-error.png", "usr/share/icons/hicolor/48x48/status/", "644"],
+  ["../../packaging/tray/hicolor/64x64/status/hushmic-tray.png", "usr/share/icons/hicolor/64x64/status/", "644"],
+  ["../../packaging/tray/hicolor/64x64/status/hushmic-tray-off.png", "usr/share/icons/hicolor/64x64/status/", "644"],
+  ["../../packaging/tray/hicolor/64x64/status/hushmic-tray-error.png", "usr/share/icons/hicolor/64x64/status/", "644"],
+  ["../../packaging/tray/hicolor/128x128/status/hushmic-tray.png", "usr/share/icons/hicolor/128x128/status/", "644"],
+  ["../../packaging/tray/hicolor/128x128/status/hushmic-tray-off.png", "usr/share/icons/hicolor/128x128/status/", "644"],
+  ["../../packaging/tray/hicolor/128x128/status/hushmic-tray-error.png", "usr/share/icons/hicolor/128x128/status/", "644"],
+  ["../../packaging/tray/hicolor/256x256/status/hushmic-tray.png", "usr/share/icons/hicolor/256x256/status/", "644"],
+  ["../../packaging/tray/hicolor/256x256/status/hushmic-tray-off.png", "usr/share/icons/hicolor/256x256/status/", "644"],
+  ["../../packaging/tray/hicolor/256x256/status/hushmic-tray-error.png", "usr/share/icons/hicolor/256x256/status/", "644"],
   ["../../LICENSE-MIT", "usr/share/doc/hushmic/", "644"],
   ["../../LICENSE-APACHE", "usr/share/doc/hushmic/", "644"],
 ]
