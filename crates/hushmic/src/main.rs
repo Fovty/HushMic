@@ -138,15 +138,19 @@ fn wait_for_shutdown(pipe: Option<std::fs::File>) {
     }
 }
 
-/// Resolve the (raw mic, hushmic_source) node pair for the A/B window: the
-/// live link-graph trace wins, the configured mic is the fallback. An empty
-/// raw node just means the window opens with the no-device overlay.
+/// Resolve the (raw mic, hushmic_source) node pair for the A/B window, in
+/// priority order: the live link-graph trace, the tray-configured mic, then
+/// the system default source. The default-source fallback matters when the
+/// chain is up but not linked to any mic and the tray is on "System default":
+/// without it the raw node came out empty and the window showed a misleading
+/// "no microphone detected" even though a real mic exists. An empty raw node
+/// (nothing resolves at all) still opens the no-device overlay.
 fn resolve_ab_nodes() -> (String, String) {
     let cfg = Config::load();
     let traced = pipewire::pw_dump()
         .as_deref()
         .and_then(|d| mictest::find_feeding_node(d, "hushmic_input"));
-    let raw = mictest::raw_target(traced, cfg.mic.as_deref()).unwrap_or_default();
+    let raw = mictest::resolve_raw(traced, cfg.mic.as_deref(), pipewire::get_default_source());
     (raw, "hushmic_source".to_string())
 }
 
@@ -284,6 +288,27 @@ fn main() {
     }
 
     if test_window {
+        // pw-cat before the mid-2022 rework (Ubuntu 22.04 ships 0.3.48) cannot
+        // stream a capture to a pipe — which is how the live view reads audio —
+        // so the A/B window can only sit at −∞ there. Explain and exit 1: the
+        // tray then runs the file-based recording test (pw-cat writes a real
+        // file fine on every version), reusing the same path as the no-GL
+        // fallback. Standalone `--test-window` just prints the reason and exits.
+        if !pipewire::supports_pipe_capture() {
+            let reason = "The live A/B view needs a newer PipeWire on this system.";
+            eprintln!("hushmic: {reason}");
+            // Bounded wait, not fire-and-forget: the detached send worker dies
+            // with the process on the exit below and the notification would be
+            // lost (same reason main()'s could-not-start path uses this).
+            notify::send_and_wait(
+                Slot::MicTest,
+                "audio-input-microphone",
+                "Mic test",
+                reason,
+                Duration::from_secs(2),
+            );
+            std::process::exit(1);
+        }
         // Companion window to a RUNNING tray instance: no single-instance
         // lock (it owns no mic), no signal plumbing (closing the window is
         // the teardown; children die via PDEATHSIG on abnormal exit).

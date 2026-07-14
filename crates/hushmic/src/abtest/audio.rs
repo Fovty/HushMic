@@ -445,7 +445,34 @@ fn spawn_capture_thread(
             // never produces data (thread parked in read(2)).
             pids.lock().unwrap().push(child.id());
             let mut stdout = child.stdout.take().expect("piped stdout");
-            let reader = match stream::read_header(&mut stdout) {
+            // Bound the startup. read_header does a blocking read(2); a leg that
+            // connects but never streams (a USB source cold-resuming, or a
+            // target that silently routed nowhere) would park here forever, so
+            // died() never fires and that pane stays blank with no recovery.
+            // Give it a cold-resume budget, then SIGTERM so the blocked read
+            // returns EOF -> read_header errors -> the leg reports death and the
+            // window degrades to a recoverable "Go live".
+            let resolved = Arc::new(AtomicBool::new(false));
+            {
+                let resolved = Arc::clone(&resolved);
+                let stop = Arc::clone(&stop);
+                let pid = child.id();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    if !resolved.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                    }
+                });
+            }
+            // Disarm the instant read_header RETURNS — before any stop_child
+            // reaps the pid — so the watchdog targets a child still blocked in
+            // the read. A sub-microsecond load-then-kill window remains (a leg
+            // whose header lands right at the deadline can still be SIGTERMed),
+            // but the worst case is a recoverable "Go live", not a hang or a
+            // stray signal to a healthy long-running child.
+            let header = stream::read_header(&mut stdout);
+            resolved.store(true, Ordering::Relaxed);
+            let reader = match header {
                 Ok(Header::Parsed(StreamInfo {
                     channels: 1,
                     sample_rate: SAMPLE_RATE,
@@ -560,10 +587,17 @@ fn capture_loop(
 }
 
 fn spawn_record(node: &str) -> std::io::Result<Child> {
+    // Old pw-cat (< 0.3.64, e.g. Ubuntu 22.04's 0.3.48) rejects a node NAME as
+    // `--target` ("bad target option") and exits before emitting a byte, so the
+    // A/B window strands at −∞ with a "failed to fill whole buffer" parse error.
+    // record_target resolves the name to its numeric id (pw-cat's original,
+    // universally accepted target form), falling back to the name on modern
+    // pw-cat / probe failure.
+    let target = crate::pipewire::record_target(node);
     let mut c = Proc::new("pw-record");
     c.args([
         "--target",
-        node,
+        target.as_str(),
         "--rate",
         "48000",
         "--channels",

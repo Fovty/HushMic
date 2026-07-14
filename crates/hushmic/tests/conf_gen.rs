@@ -14,7 +14,7 @@ fn conf_contains_required_fields() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let c = render_conf(&cfg, &paths);
+    let c = render_conf(&cfg, &paths, false);
     assert!(c.contains("label  = \"dpdfnet_mono\""), "label missing");
     assert!(
         c.contains("/usr/lib/ladspa/libdpdfnet_ladspa.so"),
@@ -60,7 +60,7 @@ fn conf_escapes_hostile_values() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let c = render_conf(&cfg, &paths);
+    let c = render_conf(&cfg, &paths, false);
     assert!(
         c.contains(r#"target.object  = "evil\" } inject = { x""#),
         "quotes must be escaped: {c}"
@@ -81,10 +81,37 @@ fn conf_omits_target_when_no_mic() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let c = render_conf(&cfg, &paths);
+    let c = render_conf(&cfg, &paths, false);
     assert!(
         !c.contains("target.object"),
         "target.object must be absent when no mic chosen"
+    );
+}
+
+#[test]
+fn legacy_node_target_only_on_old_pipewire() {
+    let cfg = Config {
+        mic: Some("alsa_input.realmic".into()),
+        ..Config::default()
+    };
+    let paths = Paths {
+        plugin_so: PathBuf::from("/usr/lib/ladspa/libdpdfnet_ladspa.so"),
+        model_dir: PathBuf::from("/usr/share/hushmic/models"),
+        dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
+    };
+    // Modern PipeWire: target.object only, byte-for-byte as before.
+    let modern = render_conf(&cfg, &paths, false);
+    assert!(modern.contains("target.object  = \"alsa_input.realmic\""));
+    assert!(
+        !modern.contains("node.target"),
+        "node.target must NOT appear on modern PipeWire"
+    );
+    // Old PipeWire (< 0.3.64): also emit the legacy node.target so the mic pins.
+    let legacy = render_conf(&cfg, &paths, true);
+    assert!(legacy.contains("target.object  = \"alsa_input.realmic\""));
+    assert!(
+        legacy.contains("node.target     = \"alsa_input.realmic\""),
+        "node.target must be emitted on old PipeWire: {legacy}"
     );
 }
 

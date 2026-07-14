@@ -1,6 +1,6 @@
 # Maintainer: Fovty <38868829+Fovty@users.noreply.github.com>
 pkgname=hushmic
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Real-time microphone noise suppression as a virtual mic (DPDFNet via PipeWire)"
 arch=('x86_64')
@@ -9,9 +9,7 @@ license=('MIT OR Apache-2.0')
 depends=('pipewire' 'pipewire-pulse' 'wireplumber' 'onnxruntime')
 makedepends=('rust' 'cargo' 'python' 'curl')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# TODO: replace with the real tag-tarball sha256 when publishing to AUR
-# (the CI AUR job is currently disabled).
-sha256sums=('SKIP')
+sha256sums=('3a848c5e5c9705c8a2451a527797bbbe1c5e4fd3fb1bf20d011643219eae0db3')
 # GitHub archive dirs use the CANONICAL repo name (Fovty/HushMic), so the
 # tarball extracts to HushMic-<ver>/ regardless of the URL's casing.
 _srcname="HushMic-$pkgver"
@@ -35,6 +33,10 @@ build() {
   # HUSHMIC_BUILD_DYLIB there.
   export HUSHMIC_BUILD_MODEL=/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx
   export HUSHMIC_BUILD_DYLIB=/usr/lib/libonnxruntime.so
+  # Remap the build dir out of the binary: glutin's generated GL bindings
+  # otherwise bake $srcdir into panic strings (a namcap "$srcdir reference"
+  # warning and non-reproducible output).
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build"
   cargo build --release --frozen
 }
 

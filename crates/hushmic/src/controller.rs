@@ -278,13 +278,24 @@ fn spa_escape(s: &str) -> String {
 /// metadata — mirroring `/usr/share/pipewire/filter-chain.conf` and
 /// `minimal.conf`) and then appends the hushmic filter-chain module.
 ///
-/// The filter-chain is mono, 48 kHz, and (when a mic is chosen) pins
-/// `target.object`. Pure function — no I/O.
-pub fn render_conf(cfg: &Config, paths: &Paths) -> String {
-    // target.object line only when a specific mic is chosen; otherwise the
-    // filter-chain follows the system default capture device.
+/// The filter-chain is mono, 48 kHz, and (when a mic is chosen) pins the mic
+/// via `target.object`, plus the legacy `node.target` when `legacy_node_target`
+/// is set (PipeWire < 0.3.64 ignores `target.object`). Pure function — no I/O.
+pub fn render_conf(cfg: &Config, paths: &Paths, legacy_node_target: bool) -> String {
+    // Pin the chosen mic; otherwise follow the system default capture device.
+    // `target.object` is the modern key (PipeWire >= 0.3.64); older PipeWire
+    // ignores it, so `legacy_node_target` additionally emits the pre-0.3.64
+    // `node.target`. Only set on detected-old PipeWire, so a modern conf stays
+    // byte-identical.
     let target = match &cfg.mic {
-        Some(name) => format!("        target.object  = \"{}\"\n", spa_escape(name)),
+        Some(name) => {
+            let esc = spa_escape(name);
+            let mut t = format!("        target.object  = \"{esc}\"\n");
+            if legacy_node_target {
+                t.push_str(&format!("        node.target     = \"{esc}\"\n"));
+            }
+            t
+        }
         None => String::new(),
     };
     // Belt-and-suspenders (Config::load already sanitizes): a non-finite value
@@ -444,7 +455,31 @@ impl Controller {
             }
         }
 
-        let conf = render_conf(cfg, &self.paths);
+        // Robustness: a saved mic that no longer matches a live source (device
+        // unplugged, renamed, or re-enumerated) would pin a dead target.object,
+        // which links to nothing and leaves the chain silent. Drop it so we
+        // follow the system default instead — but only when the probe ran (a
+        // failed probe keeps the saved mic; unknown is not gone).
+        let effective_mic = pipewire::resolve_effective_mic(
+            cfg.mic.as_deref(),
+            pipewire::sources_snapshot().as_deref(),
+        );
+        // PipeWire < 0.3.64 ignores target.object; emit the legacy node.target
+        // too so mic selection is honored there (Ubuntu 22.04 ships 0.3.48).
+        let legacy = !pipewire::supports_target_object();
+        let conf = if effective_mic.as_deref() == cfg.mic.as_deref() {
+            render_conf(cfg, &self.paths, legacy)
+        } else {
+            eprintln!(
+                "[hushmic] saved microphone '{}' is not present — following the system default",
+                cfg.mic.as_deref().unwrap_or_default()
+            );
+            let adjusted = Config {
+                mic: effective_mic,
+                ..cfg.clone()
+            };
+            render_conf(&adjusted, &self.paths, legacy)
+        };
         let path = conf_path();
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;

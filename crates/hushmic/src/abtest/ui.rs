@@ -986,7 +986,7 @@ impl AbApp {
                     draw_mic_glyph(p, rect.center(), 22.0, DANGER, true);
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new("No microphone detected")
+                        RichText::new("No microphone input")
                             .size(14.5)
                             .color(TEXT)
                             .strong(),
@@ -995,9 +995,9 @@ impl AbApp {
                     ui.add(
                         Label::new(
                             RichText::new(
-                                "HushMic can't find an input device. Check that your microphone \
-                                 is connected and that PipeWire (or PulseAudio) is running, then \
-                                 try again.",
+                                "HushMic isn't receiving audio from a microphone. Pick your mic \
+                                 from the tray's Microphone menu (and check it's connected and \
+                                 PipeWire is running), then retry.",
                             )
                             .size(12.0)
                             .color(MUTED),

@@ -122,6 +122,26 @@ pub fn raw_target(traced: Option<String>, cfg_mic: Option<&str>) -> Option<Strin
     traced.or_else(|| cfg_mic.map(String::from))
 }
 
+/// The raw-leg source for the A/B window, in priority order: the live traced
+/// feeder, then the tray-configured mic, then the system default source.
+///
+/// The default-source fallback is what stops the window from showing a false
+/// "no microphone" when the chain is up but not linked to any mic and the
+/// tray is on "System default": there is a real default mic to record the
+/// raw leg from even though nothing currently feeds `hushmic_input`. It must
+/// skip our own `hushmic_source` (when HushMic is itself the configured
+/// default) and any `.monitor` — neither is a real capture device to compare
+/// against. Empty string only when nothing resolves. Pure — no I/O.
+pub fn resolve_raw(
+    traced: Option<String>,
+    cfg_mic: Option<&str>,
+    default_source: Option<String>,
+) -> String {
+    raw_target(traced, cfg_mic)
+        .or_else(|| default_source.filter(|n| n != "hushmic_source" && !n.ends_with(".monitor")))
+        .unwrap_or_default()
+}
+
 /// `pw-record` invocation for one leg: mono 48 kHz WAV (the chain's native
 /// format) pinned to an explicit source node.
 pub fn record_command(target: &str, out: &Path) -> Command {
@@ -333,10 +353,15 @@ fn record_and_play(
         &format!("Recording {RECORD_SECS} seconds — speak into your microphone…"),
     );
     let started = Instant::now();
-    let mut raw = spawn_bound(record_command(raw_node, raw_wav)).map_err(|e| {
+    // pw-cat < 0.3.64 (e.g. Ubuntu 22.04's 0.3.48) rejects a node NAME as
+    // `--target` and the recorder dies at start; resolve name→numeric id (see
+    // pipewire::record_target). Falls back to the name on modern pw-cat.
+    let raw_target = crate::pipewire::record_target(raw_node);
+    let clean_target = crate::pipewire::record_target("hushmic_source");
+    let mut raw = spawn_bound(record_command(&raw_target, raw_wav)).map_err(|e| {
         format!("could not start pw-record ({e}) — it ships with the PipeWire tools")
     })?;
-    let mut clean = match spawn_bound(record_command("hushmic_source", clean_wav)) {
+    let mut clean = match spawn_bound(record_command(&clean_target, clean_wav)) {
         Ok(c) => c,
         Err(e) => {
             stop_helper(&mut raw);
@@ -499,6 +524,32 @@ mod tests {
             Some("configured")
         );
         assert_eq!(raw_target(None, None), None);
+    }
+
+    #[test]
+    fn resolve_raw_falls_back_to_the_default_source() {
+        // Trace and configured mic win ahead of the default, in that order.
+        assert_eq!(
+            resolve_raw(Some("traced".into()), Some("cfg"), Some("dflt".into())),
+            "traced"
+        );
+        assert_eq!(resolve_raw(None, Some("cfg"), Some("dflt".into())), "cfg");
+        // The real fix: chain up but unlinked + "System default" selected ->
+        // record the raw leg from the actual default mic instead of "" (which
+        // rendered a false "no microphone detected").
+        assert_eq!(
+            resolve_raw(None, None, Some("alsa_input.mic".into())),
+            "alsa_input.mic"
+        );
+        // But never fall back to our own node or a monitor — those are not a
+        // real capture device to compare against.
+        assert_eq!(resolve_raw(None, None, Some("hushmic_source".into())), "");
+        assert_eq!(
+            resolve_raw(None, None, Some("alsa_output.x.monitor".into())),
+            ""
+        );
+        // Nothing to resolve.
+        assert_eq!(resolve_raw(None, None, None), "");
     }
 
     #[test]

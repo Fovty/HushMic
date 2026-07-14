@@ -1,4 +1,6 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -55,6 +57,142 @@ pub fn parse_pwdump_nodes(stdout: &str) -> Vec<Source> {
     out
 }
 
+/// Resolve a node NAME to its numeric PipeWire global id from a `pw-dump`
+/// snapshot. Pure — no I/O. `None` if the JSON is unparseable or no
+/// `Audio` node carries that `node.name`.
+///
+/// Older pw-cat (< 0.3.64, e.g. Ubuntu 22.04's 0.3.48) rejects a node NAME as
+/// `--target` — it prints `bad target option "<name>"` and exits before
+/// emitting a byte, which strands the A/B window at −∞ with a "failed to fill
+/// whole buffer" parse error. The numeric id is pw-cat's original,
+/// always-accepted target form (what `--list-targets` prints), so resolving
+/// name→id makes the recorder target the chosen node on every PipeWire version.
+pub fn parse_node_id(stdout: &str, name: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    for o in v.as_array()? {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let node_name = o
+            .get("info")
+            .and_then(|i| i.get("props"))
+            .and_then(|p| p.get("node.name"))
+            .and_then(|n| n.as_str());
+        if node_name == Some(name) {
+            return o.get("id").and_then(|i| i.as_u64()).map(|n| n as u32);
+        }
+    }
+    None
+}
+
+/// Resolve a node name to its numeric PipeWire id via `pw-dump`, for
+/// `pw-record --target`. `None` if the probe fails or the node is absent — the
+/// caller then falls back to passing the name (accepted by modern pw-cat).
+pub fn node_id(name: &str) -> Option<u32> {
+    parse_node_id(&pw_dump()?, name)
+}
+
+/// The string to pass to `pw-record --target` for a node NAME.
+///
+/// Modern pw-cat (>= 0.3.64) accepts the NAME and RE-RESOLVES it at connect
+/// time, so it is immune to global-id churn: on newer PipeWire an idle source
+/// (a USB mic) is suspended and RECREATED with a new id when a capture wakes
+/// it, and a numeric id captured a few ms earlier by `pw-dump` is then stale —
+/// pw-cat treats `--target` as a hint, doesn't error, and the session manager
+/// silently reroutes the stream to the SYSTEM DEFAULT source (which is how the
+/// A/B window's raw leg ended up capturing hushmic_source). So prefer the name.
+///
+/// Only legacy pw-cat (< 0.3.64) needs the numeric id — it rejects a name
+/// outright ("bad target option") — and there the id does not churn. Does I/O
+/// (`pipewire --version`, and `pw-dump` on the legacy branch).
+pub fn record_target(name: &str) -> String {
+    if supports_target_object() {
+        name.to_string()
+    } else {
+        node_id(name)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| name.to_string())
+    }
+}
+
+/// Minimum bytes proving pw-cat actually wrote a capture stream to the pipe.
+/// A container header alone is > 40 bytes; 512 is comfortably past any header
+/// yet trivially reached in a few ms of real 48 kHz f32 audio.
+const PIPE_PROBE_BYTES: usize = 512;
+
+/// Whether pw-cat can stream a capture to a PIPE on this system.
+///
+/// pw-cat before the mid-2022 rework (Ubuntu 22.04 ships 0.3.48) can only
+/// write a *seekable container file* and rejects `-`/pipes outright with
+/// `failed to open audio file "-": this file format does not support pipe
+/// write` — but a pipe is exactly how the live A/B window reads audio, so the
+/// window is unusable there (both capture legs die at the first sample write
+/// and the meters sit at −∞ with "failed to fill whole buffer"). When this is
+/// false, callers fall back to the file-based recording test, which pw-cat
+/// writes to a real file happily on every version.
+///
+/// Probes empirically rather than by version number: briefly pipe-capture
+/// `hushmic_source` (present whenever the A/B window is meaningful) and see if
+/// any stream bytes arrive. Returns as soon as the verdict is known — modern
+/// pw-cat emits the header+samples in a few ms; old pw-cat's recorder exits
+/// without writing a byte.
+///
+/// Optimistic on an inconclusive probe (source absent, pw-record missing,
+/// stall): returns true so a system we could not measure is never degraded out
+/// of the live window it might well support.
+pub fn supports_pipe_capture() -> bool {
+    let Some(id) = node_id("hushmic_source") else {
+        return true; // nothing to probe against — don't degrade blindly
+    };
+    let mut child = match Command::new("pw-record")
+        .args([
+            "--target",
+            &id.to_string(),
+            "--rate",
+            "48000",
+            "--channels",
+            "1",
+            "--format",
+            "f32",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return true, // pw-record unavailable is not "old pw-cat"
+    };
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Reader on its own thread: read(2) has no timeout, and old pw-cat exits
+    // without ever writing (clean EOF), so we cannot block the caller on it.
+    std::thread::spawn(move || {
+        let mut buf = [0u8; PIPE_PROBE_BYTES];
+        let mut got = 0usize;
+        while got < PIPE_PROBE_BYTES {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break, // EOF (old pw-cat) or error
+                Ok(n) => got += n,
+            }
+        }
+        let _ = tx.send(got);
+    });
+    // Distinguish a finished read from a stall. The reader sends a count only
+    // once it hits the threshold or EOF: old pw-cat's clean 0-byte EOF → false;
+    // a real stream → true. A recv timeout means neither happened in the budget
+    // (a cold-resuming USB/Bluetooth-HFP source on modern pw-cat can be that
+    // slow) — that is INCONCLUSIVE, so stay optimistic and don't degrade a
+    // system that likely does support pipes.
+    let supported = match rx.recv_timeout(Duration::from_millis(800)) {
+        Ok(got) => got >= PIPE_PROBE_BYTES,
+        Err(_) => true,
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    supported
+}
+
 /// Extract the node name from a pw-metadata value line: value:'{"name":"X"}'.
 pub fn parse_metadata_value(stdout: &str) -> Option<String> {
     // pw-metadata prints: update: id:0 key:'…' value:'{"name":"X"}' type:'…'.
@@ -107,6 +245,54 @@ pub fn list_real_sources() -> Vec<Source> {
     sources_snapshot()
         .map(|v| filter_real(&v))
         .unwrap_or_default()
+}
+
+/// The mic to actually pin in the filter-chain, given the saved choice and a
+/// source snapshot. A saved mic that no longer matches any live source is
+/// dropped (`None` → follow the system default) so a stale or re-enumerated
+/// device can't pin a dead `target.object`, which links to nothing and leaves
+/// the chain silent. A failed probe (`None` snapshot) keeps the saved mic —
+/// unknown is not the same as gone. A mic still re-enumerating (autostart,
+/// resume-from-suspend) can be dropped on that single snapshot, and the chain
+/// then follows the default until it is re-selected — an accepted tradeoff for
+/// auto-healing a permanently-stale saved device. Pure — no I/O.
+pub fn resolve_effective_mic(cfg_mic: Option<&str>, snapshot: Option<&[Source]>) -> Option<String> {
+    match (cfg_mic, snapshot) {
+        (None, _) => None,
+        (Some(m), None) => Some(m.to_string()),
+        (Some(m), Some(srcs)) => srcs.iter().any(|s| s.name == m).then(|| m.to_string()),
+    }
+}
+
+/// Whether the running PipeWire honors `target.object` in a filter-chain
+/// capture. The key was added in PipeWire 0.3.64; older releases silently
+/// ignore it (the capture then follows the system default), so they need the
+/// legacy `node.target` to pin a specific mic. A failed probe is treated as
+/// modern — old PipeWire is rare and `target.object`-only is the safe default.
+pub fn supports_target_object() -> bool {
+    match Command::new("pipewire").arg("--version").output() {
+        Ok(o) => pw_version_at_least(&String::from_utf8_lossy(&o.stdout), (0, 3, 64)),
+        Err(_) => true,
+    }
+}
+
+/// Parse the first `X.Y.Z` version triple out of `pipewire --version` output
+/// ("Compiled with libpipewire 0.3.48") and compare it to `min`. No triple
+/// found → true (assume modern). Pure.
+pub fn pw_version_at_least(text: &str, min: (u32, u32, u32)) -> bool {
+    for tok in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        let parts: Vec<&str> = tok.split('.').collect();
+        if parts.len() >= 3 {
+            if let (Ok(a), Ok(b), Ok(c)) = (
+                parts[0].parse::<u32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            ) {
+                return (a, b, c) >= min;
+            }
+        }
+    }
+    true
 }
 
 /// Whether our virtual mic node `hushmic_source` is currently a live PipeWire

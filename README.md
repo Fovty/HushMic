@@ -85,14 +85,30 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.2.0-1_amd64.deb
-sudo apt install ./hushmic_0.2.0-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.2.1-1_amd64.deb
+sudo apt install ./hushmic_0.2.1-1_amd64.deb
 ```
 
 > On stock **Ubuntu 22.04** apt refuses with a `pipewire-media-session`/`wireplumber`
 > conflict (22.04 still ships the deprecated session manager). Install with
-> `sudo apt install ./hushmic_0.2.0-1_amd64.deb wireplumber pipewire-media-session-`
+> `sudo apt install ./hushmic_0.2.1-1_amd64.deb wireplumber pipewire-media-session-`
 > (the trailing `-` swaps it out), then log out and back in.
+
+**Arch Linux** (AUR):
+
+```bash
+yay -S hushmic     # or: paru -S hushmic
+```
+
+**NixOS** (flake, builds from source):
+
+```bash
+nix run github:Fovty/hushmic-nix -- --tray
+# install for good: nix profile install github:Fovty/hushmic-nix
+```
+
+> Needs flakes enabled — if Nix complains, prepend
+> `--extra-experimental-features 'nix-command flakes'`.
 
 **AppImage** (any distro, no install):
 

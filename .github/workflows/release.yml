@@ -82,42 +82,40 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   aur:
-    name: Publish to AUR (disabled)
+    name: Publish to AUR
     needs: release
-    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Configure SSH for AUR
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
-          cat > ~/.ssh/config <<'EOF'
-          Host aur.archlinux.org
-            User aur
-            IdentityFile ~/.ssh/aur
-          EOF
+      - name: Set pkgver from the release tag
+        run: sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" packaging/PKGBUILD
 
-      - name: Clone AUR package repo
-        run: git clone ssh://aur@aur.archlinux.org/hushmic.git aur-repo
+      # Clones the AUR repo, re-hashes the new tag tarball (updpkgsums) and
+      # regenerates .SRCINFO in an Arch container, then commits and pushes.
+      # Pinned to a commit SHA like every other action here.
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: hushmic
+          pkgbuild: packaging/PKGBUILD
+          commit_username: Fovty
+          commit_email: 38868829+Fovty@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          ssh_keyscan_types: ed25519
+          updpkgsums: true
 
-      - name: Update PKGBUILD and .SRCINFO
-        run: |
-          cd aur-repo
-          VERSION="${GITHUB_REF_NAME#v}"
-          cp ../packaging/PKGBUILD PKGBUILD
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
-          # makepkg --printsrcinfo > .SRCINFO   # run on an Arch container/runner
-          git config user.name "hushmic"
-          git config user.email "hushmic@users.noreply.github.com"
-          git add PKGBUILD .SRCINFO || git add PKGBUILD
-          git commit -m "Update to ${VERSION}"
-
-      - name: Push to AUR
-        run: |
-          cd aur-repo
-          git push origin master
+  nix:
+    name: Trigger the NixOS flake update
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # Fire the self-maintained hushmic-nix fork's updater the moment a release
+      # lands so the flake tracks the new version immediately (it also runs on a
+      # daily cron as a fallback). Needs a token with actions:write on the fork.
+      - name: Dispatch hushmic-nix update
+        env:
+          GH_TOKEN: ${{ secrets.NIX_FORK_TOKEN }}
+        run: gh workflow run update.yml --repo Fovty/hushmic-nix

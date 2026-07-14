@@ -1,4 +1,7 @@
-use hushmic::pipewire::{parse_metadata_value, parse_pwdump_nodes};
+use hushmic::pipewire::{
+    parse_metadata_value, parse_node_id, parse_pwdump_nodes, pw_version_at_least,
+    resolve_effective_mic,
+};
 
 /// A trimmed `pw-dump` array: a Device (not a Node), our virtual source, a real
 /// RODE capture source, a Sink (not a source), a sink monitor source, and a
@@ -83,6 +86,72 @@ fn hushmic_source_presence_detected() {
     assert!(!parse_pwdump_nodes(without)
         .iter()
         .any(|s| s.name == "hushmic_source"));
+}
+
+#[test]
+fn resolve_effective_mic_drops_stale_and_keeps_on_probe_failure() {
+    let srcs = parse_pwdump_nodes(PWDUMP);
+    let rode = "alsa_input.usb-RODE_Microphones_RODE_NT-USB-00.analog-stereo";
+    // A saved mic that is a live source is kept.
+    assert_eq!(
+        resolve_effective_mic(Some(rode), Some(&srcs)).as_deref(),
+        Some(rode)
+    );
+    // A saved mic that no longer matches any live source is dropped (follow default).
+    assert_eq!(
+        resolve_effective_mic(Some("alsa_input.gone"), Some(&srcs)),
+        None
+    );
+    // No saved mic stays None (already following the default).
+    assert_eq!(resolve_effective_mic(None, Some(&srcs)), None);
+    // Probe failure keeps the saved mic — unknown is not gone.
+    assert_eq!(
+        resolve_effective_mic(Some("alsa_input.gone"), None).as_deref(),
+        Some("alsa_input.gone")
+    );
+}
+
+#[test]
+fn pw_version_parse_and_compare() {
+    let v048 = "pipewire\nCompiled with libpipewire 0.3.48\nLinked with libpipewire 0.3.48";
+    assert!(!pw_version_at_least(v048, (0, 3, 64)), "0.3.48 < 0.3.64");
+    assert!(
+        pw_version_at_least("libpipewire 0.3.64", (0, 3, 64)),
+        "0.3.64 == min"
+    );
+    assert!(
+        pw_version_at_least("Compiled with libpipewire 1.6.7", (0, 3, 64)),
+        "1.6.7 >= min"
+    );
+    // No parseable triple -> assume modern.
+    assert!(pw_version_at_least("no version", (0, 3, 64)));
+}
+
+#[test]
+fn node_id_resolves_name_to_numeric_target() {
+    // pw-record --target needs a NUMERIC id on old pw-cat; resolve by node.name.
+    assert_eq!(parse_node_id(PWDUMP, "hushmic_source"), Some(39));
+    assert_eq!(
+        parse_node_id(
+            PWDUMP,
+            "alsa_input.usb-RODE_Microphones_RODE_NT-USB-00.analog-stereo"
+        ),
+        Some(46)
+    );
+    // Not source-only: any Node resolves by name (the Sink id 52 too), so the
+    // A/B recorder can target whatever node it was handed.
+    assert_eq!(
+        parse_node_id(PWDUMP, "alsa_output.pci-0000_00_1f.3.analog-stereo"),
+        Some(52)
+    );
+    // A name no node carries is None so the caller falls back to the name.
+    assert_eq!(parse_node_id(PWDUMP, "alsa_input.does-not-exist"), None);
+    // A Device (not a Node) must never be matched by a node-name lookup.
+    assert_eq!(parse_node_id(PWDUMP, "alsa_card.pci-0000_00_1f.3"), None);
+    // Garbage/empty input is safe.
+    assert_eq!(parse_node_id("", "hushmic_source"), None);
+    assert_eq!(parse_node_id("not json", "hushmic_source"), None);
+    assert_eq!(parse_node_id("{}", "hushmic_source"), None);
 }
 
 #[test]

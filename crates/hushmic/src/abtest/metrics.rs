@@ -84,7 +84,14 @@ pub fn compute(raw: &[f32], filtered: &[f32]) -> SampleMetrics {
     let raw_voice_floor = percentile(&raw_voice, FLOOR_PCT);
 
     SampleMetrics {
-        voice_measurable: raw_speech - raw_voice_floor >= MIN_SPEECH_DYNAMICS_DB,
+        // Measurable only when the RAW take has speech dynamics AND the
+        // FILTERED take actually carries voice-band signal above the silence
+        // floor. Without the second half, a filtered leg that captured silence
+        // (a stalled/mis-routed A/B capture) yields filt(−120) − raw(−12) and
+        // prints a fabricated "Voice N dB quieter". Genuine over-suppression
+        // still sits above SILENT_FLOOR_DBFS (see ducked_voice test).
+        voice_measurable: raw_speech - raw_voice_floor >= MIN_SPEECH_DYNAMICS_DB
+            && filt_speech > SILENT_FLOOR_DBFS,
         background_reduction_db: sanitize((raw_floor - filt_floor_disp).max(0.0)),
         raw_floor_dbfs: sanitize(raw_floor),
         filtered_floor_dbfs: sanitize(filt_floor_disp),
@@ -277,6 +284,21 @@ mod tests {
         let m = compute(&raw, &filtered);
         assert!(m.voice_measurable, "{m:?}");
         assert!(m.voice_retention_db < -10.0, "retention {m:?}");
+    }
+
+    #[test]
+    fn filtered_silence_is_not_voice_measurable() {
+        // Real speech in the raw take but the FILTERED leg captured digital
+        // silence (a stalled / mis-routed A/B capture on modern PipeWire). The
+        // voice card must fall back to "not measurable" instead of fabricating
+        // a huge "Voice N dB quieter" number from filt(−120) − raw(−12).
+        let raw = take(48_000 * 6, -12.0, -35.0, 21, 0.0, 0.0);
+        let filtered = vec![0.0f32; raw.len()];
+        let m = compute(&raw, &filtered);
+        assert!(
+            !m.voice_measurable,
+            "a silent filtered leg must not be voice-measurable: {m:?}"
+        );
     }
 
     #[test]
