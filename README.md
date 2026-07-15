@@ -97,7 +97,7 @@ sudo apt install ./hushmic_0.2.1-1_amd64.deb
 **Arch Linux** (AUR):
 
 ```bash
-yay -S hushmic     # or: paru -S hushmic
+yay -S hushmic-bin     # or: paru -S hushmic-bin
 ```
 
 **NixOS** (flake, builds from source):

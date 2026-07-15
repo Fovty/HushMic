@@ -107,6 +107,98 @@ jobs:
           ssh_keyscan_types: ed25519
           updpkgsums: true
 
+  aur-bin:
+    name: Publish hushmic-bin to the AUR
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set pkgver from the release tag
+        run: sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" packaging/aur-bin/PKGBUILD
+
+      # Same flow as the source package, but the source= here is the release
+      # ASSET this run just published, so updpkgsums re-hashes the artifact
+      # rather than the tag tarball. Depends on `release` for exactly that.
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: hushmic-bin
+          pkgbuild: packaging/aur-bin/PKGBUILD
+          commit_username: Fovty
+          commit_email: 38868829+Fovty@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          ssh_keyscan_types: ed25519
+          updpkgsums: true
+
+  copr:
+    name: Build the Fedora COPR package
+    needs: release
+    runs-on: ubuntu-latest
+    # Fedora tooling (rpmbuild/spectool/copr-cli) isn't on the stock runner;
+    # only the SRPM is assembled here — COPR does the per-chroot builds. Pinned
+    # to a release rather than :latest, which would silently roll onto the next
+    # Fedora major in a job that holds the API token.
+    container: fedora:44
+    steps:
+      - name: Install tooling
+        run: dnf install -y --setopt=install_weak_deps=False rpm-build rpmdevtools copr-cli git
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Everything up to the SRPM needs no credentials, so it runs on every tag:
+      # that keeps proving the spec still builds even while COPR is unconfigured,
+      # instead of going untested until the day the token is added.
+      - name: Set the version and changelog from the release tag
+        # Block scalar: the sed expression contains ": ", which YAML would
+        # otherwise read as a mapping and fail to parse the whole workflow.
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          sed -i "s/^Version:.*/Version:        $V/" packaging/hushmic.spec
+          # The changelog has to move with the version: rpm derives
+          # SOURCE_DATE_EPOCH from the newest entry and clamps every packaged
+          # file's mtime to it, so a stale entry would both misreport the
+          # release and freeze mtimes at the old date.
+          printf '* %s Fovty <38868829+Fovty@users.noreply.github.com> - %s-1\n- Update to %s.\n\n' \
+            "$(LC_ALL=C date -u '+%a %b %d %Y')" "$V" "$V" > /tmp/changelog.entry
+          sed -i "/^%changelog$/r /tmp/changelog.entry" packaging/hushmic.spec
+
+      - name: Build the SRPM
+        run: |
+          rpmdev-setuptree
+          spectool -g -R packaging/hushmic.spec
+          rpmbuild -bs packaging/hushmic.spec
+
+      # COPR needs an account + API token this repo may not have yet. Skip only
+      # the submission, not the build above, and never fail the release over it.
+      - name: Check whether COPR is configured
+        id: gate
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_API_CONFIG }}
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "::notice::COPR_API_CONFIG is not set — SRPM built but not submitted."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write the COPR credentials
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_API_CONFIG }}
+        run: |
+          mkdir -p ~/.config
+          printf '%s' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+
+      - name: Submit the build to COPR
+        if: steps.gate.outputs.configured == 'true'
+        run: copr-cli build "${{ vars.COPR_PROJECT || 'fovty/hushmic' }}" ~/rpmbuild/SRPMS/hushmic-*.src.rpm
+
   nix:
     name: Trigger the NixOS flake update
     needs: release
