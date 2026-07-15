@@ -100,6 +100,13 @@ sudo apt install ./hushmic_0.2.1-1_amd64.deb
 yay -S hushmic-bin     # or: paru -S hushmic-bin
 ```
 
+**Fedora** (COPR):
+
+```bash
+sudo dnf copr enable fovty/hushmic
+sudo dnf install hushmic
+```
+
 **NixOS** (flake, builds from source):
 
 ```bash
