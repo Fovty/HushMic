@@ -7,6 +7,12 @@ install elsewhere.
 
 ## Build
 
+Needs `flatpak-builder` >= 1.4 (older versions fail at export against the
+25.08 runtime; on Debian 12 it's in backports). The manifest builds the
+**pinned release tag** — to build your working tree instead, swap the
+`hushmic` module's source for the `type: dir` variant shown in the
+manifest comment.
+
 ```bash
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak-builder --user --install-deps-from=flathub --force-clean --install \
