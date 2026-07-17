@@ -45,7 +45,7 @@
       <!-- Pin this URL to the release tag that ships the Flatpak (Flathub
            wants a tag/commit URL, not a branch) — update the version
            segment when tagging. -->
-      <image>https://raw.githubusercontent.com/Fovty/HushMic/main/docs/img/hushmic-ab-window.png</image>
+      <image>https://raw.githubusercontent.com/Fovty/HushMic/v0.3.0/docs/img/hushmic-ab-window.png</image>
       <caption>Live A/B mic test: raw input next to the cleaned output other apps receive</caption>
     </screenshot>
   </screenshots>

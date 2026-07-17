@@ -335,18 +335,11 @@ modules:
       - install -Dm644 packaging/flatpak/50-hushmic-manager.conf /app/share/pipewire/client.conf.d/50-hushmic-manager.conf
       - install -Dm644 packaging/flatpak/io.github.fovty.HushMic.metainfo.xml /app/share/metainfo/io.github.fovty.HushMic.metainfo.xml
     sources:
-      # The working tree: local/dev builds test exactly what is checked
-      # out. A Flathub submission replaces this with a type: git source
-      # pinned to a release tag (see README.md).
-      - type: dir
-        path: ../..
-        skip:
-          - .git
-          - .build-tools
-          - .venv-assets
-          - assets
-          - dist
-          - docs
-          - live
-          - target
+      # Pinned to the release tag. For local development against the working
+      # tree, swap this for:  - type: dir
+      #                         path: ../..
+      - type: git
+        url: https://github.com/Fovty/hushmic.git
+        tag: v0.3.0
+        commit: 5f7d3180d07e5636d694ca6d4e2a1d1dfe3d42b7
       - cargo-sources.json
