@@ -9,5 +9,7 @@ pub mod lock;
 pub mod mictest;
 pub mod notify;
 pub mod pipewire;
+pub mod portal;
+pub mod sandbox;
 pub mod tray;
 pub mod watchdog;

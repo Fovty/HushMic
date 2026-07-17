@@ -118,7 +118,17 @@ pub fn is_autostart_enabled() -> bool {
 /// (existence-based reconciliation left it broken on every boot), and a
 /// relocated AppImage leaves a stale Exec pointing at the old path. Both
 /// heal on the next tray start.
+///
+/// Inside a Flatpak the sandbox's `~/.config/autostart` is invisible to the
+/// host session manager — the Background portal owns the HOST-side entry
+/// instead, and re-requesting the current desired state at launch is the
+/// portal-shaped equivalent of this reconciliation (enabled rewrites the
+/// entry, disabled deletes it; both idempotent).
 pub fn reconcile(enabled: bool) -> std::io::Result<()> {
+    if crate::sandbox::is_flatpak() {
+        crate::portal::request_autostart(enabled);
+        return Ok(());
+    }
     reconcile_at(&desktop_path(), enabled, &desktop_contents())
 }
 
@@ -136,6 +146,13 @@ fn reconcile_at(p: &Path, enabled: bool, want: &str) -> std::io::Result<()> {
 }
 
 pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
+    // Sandboxed: the Background portal is the only host-visible channel
+    // (and the portal's Exec rewrite — `flatpak run … io.github.… --tray` —
+    // is nothing the file writer below could produce anyway).
+    if crate::sandbox::is_flatpak() {
+        crate::portal::request_autostart(enabled);
+        return Ok(());
+    }
     let p = desktop_path();
     if enabled {
         // Atomic + fsynced: this file is often written seconds before a

@@ -210,7 +210,8 @@ pub fn parse_metadata_value(stdout: &str) -> Option<String> {
 }
 
 /// Run `pw-dump`. `None` means the PROBE failed (binary missing, daemon
-/// unreachable, non-zero exit) — callers must treat that as "unknown", never
+/// unreachable, non-zero exit, or output that isn't JSON even after the
+/// old-pw-dump repair below) — callers must treat that as "unknown", never
 /// as "no nodes": tearing down a healthy child on a failed probe is exactly
 /// the watchdog misfire this distinction prevents.
 ///
@@ -221,7 +222,113 @@ pub fn pw_dump() -> Option<String> {
     if !o.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&o.stdout).into_owned())
+    let raw = String::from_utf8_lossy(&o.stdout).into_owned();
+    // Fast path: valid JSON passes through untouched (IgnoredAny validates
+    // without building a tree).
+    if serde_json::from_str::<serde::de::IgnoredAny>(&raw).is_ok() {
+        return Some(raw);
+    }
+    let repaired = repair_keyless_members(&raw);
+    if serde_json::from_str::<serde::de::IgnoredAny>(&repaired).is_ok() {
+        return Some(repaired);
+    }
+    None
+}
+
+/// Salvage the invalid JSON old pw-dump emits when the graph contains a node
+/// param type it has no name for: `pw-dump` before ~0.3.80 prints such a
+/// param as a KEYLESS `[ ]` object member — `"ProcessLatency": [ ], [ ] }` —
+/// which no JSON parser accepts. Any client linking a modern libpipewire
+/// triggers it (every Flatpak app with native PipeWire nodes attaches the
+/// 0.3.79+ `Tag` param; observed live on Debian 12's pw-dump 0.3.65 while
+/// the sandboxed HushMic filter-chain ran). Without the repair every
+/// consumer's parse fails and the dump reads as an EMPTY graph — see
+/// `pw_dump` for why that must instead surface as a failed probe.
+///
+/// Only called on input that already failed to parse, and only removes empty
+/// `[ ]` members whose enclosing container is an OBJECT (keyless members are
+/// impossible in valid JSON); empty arrays nested in arrays or sitting as a
+/// key's value are legitimate and preserved. String-aware so brackets inside
+/// node names can't derail the scan. Pub for testability.
+pub fn repair_keyless_members(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    // Container stack: true = object, false = array.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'"' => {
+                // Copy the whole string literal, honoring escapes.
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let end = i.min(b.len());
+                match s.get(start..end) {
+                    Some(chunk) => out.push_str(chunk),
+                    // An escape overshooting a non-ASCII boundary: not
+                    // structurally salvageable — hand back the original so
+                    // the caller's re-parse fails and the probe reads as
+                    // failed. Never panic under the tray.
+                    None => return s.to_string(),
+                }
+                continue;
+            }
+            b'{' => stack.push(true),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            b'[' => {
+                // An empty `[ <ws> ]` directly inside an OBJECT that does
+                // NOT follow a `:` is the keyless-member emission (a key's
+                // empty-array VALUE follows its colon; a keyless member can
+                // only follow `,` or the opening `{`). Drop it together
+                // with ONE adjacent comma (the preceding one when present,
+                // else the following one for a leading member).
+                if stack.last() == Some(&true) {
+                    let mut j = i + 1;
+                    while j < b.len() && (b[j] as char).is_whitespace() {
+                        j += 1;
+                    }
+                    let prev = out.trim_end().chars().last();
+                    if j < b.len() && b[j] == b']' && matches!(prev, Some(',') | Some('{')) {
+                        if prev == Some(',') {
+                            // Trim back through whitespace and the comma.
+                            let keep = out.trim_end().len() - 1;
+                            out.truncate(keep);
+                        } else {
+                            // Leading member: consume a following comma.
+                            let mut k = j + 1;
+                            while k < b.len() && (b[k] as char).is_whitespace() {
+                                k += 1;
+                            }
+                            if k < b.len() && b[k] == b',' {
+                                i = k + 1;
+                                continue;
+                            }
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                stack.push(false);
+            }
+            _ => {}
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
 }
 
 /// One consistent snapshot of every Audio/Source node; `None` = probe failed.
@@ -269,11 +376,43 @@ pub fn resolve_effective_mic(cfg_mic: Option<&str>, snapshot: Option<&[Source]>)
 /// ignore it (the capture then follows the system default), so they need the
 /// legacy `node.target` to pin a specific mic. A failed probe is treated as
 /// modern — old PipeWire is rare and `target.object`-only is the safe default.
+///
+/// What must be versioned here is the HOST side (its session manager
+/// interprets the key). Outside a sandbox `pipewire --version` is the host;
+/// inside a Flatpak that binary is the BUNDLED daemon — always modern, even
+/// against an old host session — so there the version comes from the daemon's
+/// own Core object in a `pw-dump` snapshot instead.
 pub fn supports_target_object() -> bool {
+    if crate::sandbox::is_flatpak() {
+        return match pw_dump().as_deref().and_then(parse_core_version) {
+            Some(v) => pw_version_at_least(&v, (0, 3, 64)),
+            None => true, // probe failed -> same optimistic default as below
+        };
+    }
     match Command::new("pipewire").arg("--version").output() {
         Ok(o) => pw_version_at_least(&String::from_utf8_lossy(&o.stdout), (0, 3, 64)),
         Err(_) => true,
     }
+}
+
+/// The HOST daemon's version from a `pw-dump` snapshot: the
+/// `PipeWire:Interface:Core` object's `info.version`. This is the daemon
+/// being talked to, regardless of which pw-* binaries do the talking. Pure.
+pub fn parse_core_version(stdout: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    for o in v.as_array()? {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Core") {
+            continue;
+        }
+        if let Some(ver) = o
+            .get("info")
+            .and_then(|i| i.get("version"))
+            .and_then(|s| s.as_str())
+        {
+            return Some(ver.to_string());
+        }
+    }
+    None
 }
 
 /// Parse the first `X.Y.Z` version triple out of `pipewire --version` output
@@ -327,6 +466,26 @@ pub fn get_default_source() -> Option<String> {
     parse_metadata_value(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The flatpak-manifest-installed drop-in that gives the bundled pw-* tools
+/// `media.category = Manager` context properties. WirePlumber grants plain
+/// flatpak-flagged clients `rx` only and silently discards their metadata
+/// writes (`pw-metadata` exits 0, the key never changes — verified on
+/// PipeWire 1.6 / WirePlumber 0.5.14); Manager-flagged clients get full
+/// `rwxm` (the sanctioned mechanism EasyEffects and pavucontrol use, also
+/// verified live). The path must stay in lockstep with
+/// packaging/flatpak/io.github.fovty.HushMic.yml.
+const FLATPAK_MANAGER_DROPIN: &str = "/app/share/pipewire/client.conf.d/50-hushmic-manager.conf";
+
+/// Whether this process is able to change the system default source.
+/// Native installs always can. Inside a Flatpak it works exactly when the
+/// Manager drop-in ships next to the bundled tools — a rebuild that strips
+/// it would otherwise leave every takeover to fail invisibly, so the whole
+/// take-the-default feature (menu entry included) is gated on the actual
+/// capability rather than attempted blindly.
+pub fn can_set_default() -> bool {
+    !crate::sandbox::is_flatpak() || std::path::Path::new(FLATPAK_MANAGER_DROPIN).exists()
+}
+
 /// Set the default source node name via pw-metadata.
 pub fn set_default_source(node_name: &str) -> std::io::Result<()> {
     // serde_json handles escaping; a node name containing `"` or `\` must not
@@ -342,11 +501,27 @@ pub fn set_default_source(node_name: &str) -> std::io::Result<()> {
             "Spa:String:JSON",
         ])
         .status()?;
-    if st.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("pw-metadata set failed"))
+    if !st.success() {
+        return Err(std::io::Error::other("pw-metadata set failed"));
     }
+    // Exit status alone is not proof: the daemon acks metadata writes it has
+    // no intention of applying (a permission-restricted client's set is
+    // dropped server-side with pw-metadata still exiting 0). Success is the
+    // key actually holding the value — callers persist prior-default state
+    // on this result, so a false Ok would strand the user's real device.
+    // One retried read guards the OTHER false verdict: a transiently failed
+    // read-back must not report an applied write as dropped.
+    for attempt in 0..2 {
+        if get_default_source().as_deref() == Some(node_name) {
+            return Ok(());
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(std::io::Error::other(
+        "pw-metadata set was not applied (insufficient permissions on the metadata object?)",
+    ))
 }
 
 /// Delete the `default.configured.audio.source` metadata key entirely.
@@ -365,9 +540,26 @@ pub fn clear_default_source() -> std::io::Result<()> {
             "default.configured.audio.source",
         ])
         .status()?;
-    if st.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("pw-metadata delete failed"))
+    if !st.success() {
+        return Err(std::io::Error::other("pw-metadata delete failed"));
     }
+    // Same silent-drop hazard as set_default_source, but the goal here is
+    // narrower: the key must no longer strand the default on OUR dead node.
+    // Absent is success; someone ELSE's value appearing concurrently (a
+    // session manager restoring its persisted default the moment ours is
+    // deleted) is success too — treating that as failure would loop the
+    // teardown against an actor that keeps winning. Only the key still
+    // reading `hushmic_source` (after one retried look) proves the delete
+    // was dropped.
+    for attempt in 0..2 {
+        if get_default_source().as_deref() != Some("hushmic_source") {
+            return Ok(());
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(std::io::Error::other(
+        "pw-metadata delete was not applied (insufficient permissions on the metadata object?)",
+    ))
 }

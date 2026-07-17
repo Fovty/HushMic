@@ -124,9 +124,13 @@ pub fn send_blocking(
     let idx = slot as usize;
     let replaces = LAST_ID[idx].load(Ordering::Relaxed);
     let mut hints: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
-    // Lets the desktop associate the bubble with hushmic.desktop (app name +
-    // icon in notification centers).
-    hints.insert("desktop-entry", "hushmic".into());
+    // Lets the desktop associate the bubble with the app's .desktop file
+    // (app name + icon in notification centers). In a Flatpak the exported
+    // entry is named after the app ID, not "hushmic".
+    hints.insert(
+        "desktop-entry",
+        crate::sandbox::flatpak_app_id().unwrap_or("hushmic").into(),
+    );
     if transient {
         hints.insert("transient", true.into());
     }

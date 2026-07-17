@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.fovty.HushMic</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+
+  <name>HushMic</name>
+  <summary>Real-time mic noise suppression</summary>
+
+  <developer id="io.github.fovty">
+    <name>Fovty</name>
+  </developer>
+
+  <description>
+    <p>
+      HushMic runs DPDFNet deep-learning noise suppression on your microphone
+      and exposes the cleaned audio as a virtual PipeWire microphone, so any
+      call or recording app can simply select it. Keyboard clatter, fans and
+      street noise are removed while your voice stays natural.
+    </p>
+    <p>
+      Processing is local and CPU-only: audio never leaves the machine and no
+      network connection is ever made. A tray menu switches models, picks the
+      microphone and sets the suppression strength, and the built-in A/B test
+      window shows your raw and cleaned signal side by side so you can hear
+      and see the difference before a call.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.fovty.HushMic.desktop</launchable>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#9be5ea</color>
+    <color type="primary" scheme_preference="dark">#0d3c44</color>
+  </branding>
+
+  <content_rating type="oars-1.1" />
+
+  <url type="homepage">https://github.com/Fovty/HushMic</url>
+  <url type="bugtracker">https://github.com/Fovty/HushMic/issues</url>
+  <url type="vcs-browser">https://github.com/Fovty/HushMic</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <!-- Pin this URL to the release tag that ships the Flatpak (Flathub
+           wants a tag/commit URL, not a branch) — update the version
+           segment when tagging. -->
+      <image>https://raw.githubusercontent.com/Fovty/HushMic/main/docs/img/hushmic-ab-window.png</image>
+      <caption>Live A/B mic test: raw input next to the cleaned output other apps receive</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.3.0" date="2026-07-17">
+      <description>
+        <p>
+          First Flatpak release. Launching HushMic from the application menu
+          now opens the live A/B window, and launching it again brings the
+          window back; autostart stays silent in the tray.
+        </p>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-07-14">
+      <description>
+        <p>
+          "Test my mic" and microphone selection now work across every
+          PipeWire version, and two new install channels (AUR binary
+          package, Fedora COPR) shipped alongside.
+        </p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-07-09">
+      <description>
+        <p>
+          Live A/B mic-test window, desktop notifications for failures and
+          recoveries, and Arch (AUR) plus NixOS packaging.
+        </p>
+      </description>
+    </release>
+  </releases>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+
+  <keywords>
+    <keyword>noise</keyword>
+    <keyword>suppression</keyword>
+    <keyword>microphone</keyword>
+    <keyword>pipewire</keyword>
+    <keyword>virtual microphone</keyword>
+  </keywords>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+</component>

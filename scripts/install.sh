@@ -420,7 +420,7 @@ install_file "$uninstaller" "$DEST_BIN" 755
 echo
 echo "hushmic ${VERSION} installed."
 echo
-echo "Start it (system tray):  hushmic --tray"
+echo "Start it:                hushmic          (tray + A/B window; --tray = tray only)"
 if [ -f "$0" ]; then
   echo "Uninstall:               hushmic-uninstall   (or: $0 --uninstall --prefix \"$PREFIX\")"
 else

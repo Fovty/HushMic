@@ -76,7 +76,24 @@ impl Tray for HushMicTray {
         format!("HushMic{}", self.status.title_suffix())
     }
     fn icon_name(&self) -> String {
-        self.status.icon_name().into()
+        // Inside a Flatpak only app-ID-prefixed icon names are exported to
+        // the host theme (~/.local/share/flatpak/exports/share/icons on the
+        // host XDG_DATA_DIRS), so the SNI host can resolve
+        // `<app-id>-tray[-off|-error]` but never the bare `hushmic-tray`
+        // set — the manifest installs the ladder under the prefixed names
+        // only. The pixmap fallback below stays the safety net for hosts
+        // that resolve nothing.
+        match crate::sandbox::flatpak_app_id() {
+            Some(id) => {
+                let suffix = self
+                    .status
+                    .icon_name()
+                    .strip_prefix("hushmic")
+                    .expect("tray icon names start with 'hushmic'");
+                format!("{id}{suffix}")
+            }
+            None => self.status.icon_name().into(),
+        }
     }
     fn icon_theme_path(&self) -> String {
         // Read per call, not cached: ksni re-queries on every property fetch
@@ -246,6 +263,11 @@ impl Tray for HushMicTray {
             CheckmarkItem {
                 label: "Set as default microphone".into(),
                 checked: self.cfg.set_default,
+                // Hidden where changing the system default is impossible (a
+                // sandbox without Manager access — see
+                // pipewire::can_set_default): a checkbox whose click
+                // silently does nothing is worse than no checkbox.
+                visible: crate::pipewire::can_set_default(),
                 activate: Box::new(|t: &mut Self| {
                     t.cfg.set_default = !t.cfg.set_default;
                     let _ = t.cmd_tx.send(TrayCmd::SetDefaultToggle(t.cfg.set_default));

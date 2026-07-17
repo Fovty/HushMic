@@ -1,6 +1,6 @@
 use hushmic::pipewire::{
-    parse_metadata_value, parse_node_id, parse_pwdump_nodes, pw_version_at_least,
-    resolve_effective_mic,
+    parse_core_version, parse_metadata_value, parse_node_id, parse_pwdump_nodes,
+    pw_version_at_least, resolve_effective_mic,
 };
 
 /// A trimmed `pw-dump` array: a Device (not a Node), our virtual source, a real
@@ -169,4 +169,111 @@ update: id:0 key:'default.configured.audio.source' value:'{"name":"alsa_input.us
         parse_metadata_value(out).as_deref(),
         Some("alsa_input.usb-RODE")
     );
+}
+
+#[test]
+fn extracts_the_daemon_version_from_the_core_object() {
+    // The Core object is the DAEMON being talked to — inside a Flatpak this
+    // is the only truthful version source (`pipewire --version` there
+    // reports the bundled binary, not the host).
+    let dump = r#"[
+      { "id": 0, "type": "PipeWire:Interface:Core", "version": 4,
+        "info": { "cookie": 1, "user-name": "u", "host-name": "h",
+                  "version": "0.3.48", "name": "pipewire-0", "props": {} } },
+      { "id": 31, "type": "PipeWire:Interface:Node",
+        "info": { "props": { "media.class": "Audio/Source", "node.name": "m" } } }
+    ]"#;
+    assert_eq!(parse_core_version(dump).as_deref(), Some("0.3.48"));
+    // and the parsed triple feeds the same comparator the probe uses
+    assert!(!pw_version_at_least("0.3.48", (0, 3, 64)));
+    assert!(pw_version_at_least("1.6.2", (0, 3, 64)));
+    // garbage/missing core: unknown, caller stays optimistic
+    assert_eq!(parse_core_version("[]"), None);
+    assert_eq!(parse_core_version("not json"), None);
+}
+
+#[test]
+fn repairs_old_pwdump_keyless_param_members() {
+    use hushmic::pipewire::repair_keyless_members;
+    // Shape captured from a REAL pw-dump 0.3.65 run on Debian 12 while a
+    // modern (libpipewire 1.4.9, sandboxed) client's node was in the graph:
+    // params the old pw-dump has no name for come out as a KEYLESS `[ ]`
+    // object member — invalid JSON.
+    let broken = r#"[
+      { "id": 62, "type": "PipeWire:Interface:Node",
+        "info": {
+          "params": {
+            "ProcessLatency": [
+            ],
+            [ ]
+          },
+          "props": { "media.class": "Audio/Source", "node.name": "hushmic_source" }
+        } }
+    ]"#;
+    assert!(serde_json::from_str::<serde_json::Value>(broken).is_err());
+    let repaired = repair_keyless_members(broken);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+        "repaired output must parse: {repaired}"
+    );
+    // The graph content survives the repair — this is exactly what keeps the
+    // watchdog from reading a healthy chain as "node gone".
+    assert!(parse_pwdump_nodes(&repaired)
+        .iter()
+        .any(|s| s.name == "hushmic_source"));
+}
+
+#[test]
+fn repair_handles_leading_and_multiple_keyless_members() {
+    use hushmic::pipewire::repair_keyless_members;
+    for broken in [
+        r#"{ [ ], "a": 1 }"#,              // leading member: trailing comma consumed
+        r#"{ "a": 1, [ ], [ ] }"#,         // several in a row
+        r#"{ "a": { "b": [ 1 ], [ ] } }"#, // nested object
+        r#"{ [ ] }"#,                      // sole member
+    ] {
+        assert!(serde_json::from_str::<serde_json::Value>(broken).is_err());
+        let repaired = repair_keyless_members(broken);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+            "should repair {broken:?} but got {repaired:?}"
+        );
+    }
+}
+
+#[test]
+fn repair_preserves_legitimate_json() {
+    use hushmic::pipewire::repair_keyless_members;
+    // Empty arrays as VALUES or as ARRAY elements are valid and must pass
+    // through byte-identical — including brackets/braces inside strings and
+    // escaped quotes, which must not derail the container tracking.
+    for valid in [
+        r#"{ "a": [], "b": [ [], [] ] }"#,
+        r#"{ "name": "we[ird{ , ]", "x": [ ] }"#,
+        r#"{ "q": "a\"b[", "arr": [ { "y": [] } ] }"#,
+        r#"[ [], { "z": [] } ]"#,
+    ] {
+        assert_eq!(
+            repair_keyless_members(valid),
+            valid,
+            "must not touch {valid:?}"
+        );
+    }
+}
+
+#[test]
+fn repair_leaves_nonempty_keyless_members_alone() {
+    use hushmic::pipewire::repair_keyless_members;
+    // The salvage removes only EMPTY keyless `[ ]` members — the one shape
+    // old pw-dump emits. A NON-empty keyless member is a different (unknown)
+    // corruption: it must pass through unrepaired so the caller's re-parse
+    // still fails and the dump reads as a failed probe, never as a mangled
+    // graph.
+    let broken = r#"{ "a": 1, [ 1, 2 ] }"#;
+    let repaired = repair_keyless_members(broken);
+    assert_eq!(
+        repaired, broken,
+        "non-empty keyless member must not be touched"
+    );
+    assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_err());
 }

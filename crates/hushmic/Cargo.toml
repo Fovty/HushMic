@@ -17,6 +17,11 @@ ksni = { version = "0.3", features = ["blocking"] }
 # stack), used directly for org.freedesktop.Notifications — desktop
 # notifications without requiring libnotify/notify-send on the host.
 zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+# Already in the tree via zbus's tokio mode; direct deps only so portal.rs
+# can bound a SIGNAL wait (blocking zbus offers no signal timeout): a
+# current-thread runtime + StreamExt::next around the portal Response.
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+futures-util = { version = "0.3", default-features = false }
 directories = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

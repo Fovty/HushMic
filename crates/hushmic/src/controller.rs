@@ -218,6 +218,14 @@ fn clear_persisted_prior_default() {
 /// changed since (by the user or anything else), their choice wins and the
 /// stale record is dropped.
 pub fn recover_dangling_default() {
+    // Where default-source writes are impossible (a Flatpak without the
+    // Manager drop-in — see pipewire::can_set_default), the restore below
+    // would fail anyway, and no takeover can have happened from in here
+    // either (take_default is gated the same way) — any breadcrumb file is
+    // another install's to fix.
+    if !pipewire::can_set_default() {
+        return;
+    }
     let p = prior_default_path();
     let Ok(prev) = std::fs::read_to_string(&p) else {
         return;
@@ -539,7 +547,21 @@ impl Controller {
         self.child = Some(child);
         self.spawned_at = Some(Instant::now());
 
-        if cfg.set_default {
+        if cfg.set_default && !pipewire::can_set_default() {
+            // One line, once: the toggle is hidden in the tray when the
+            // sandbox can't do this, but a config written by a native
+            // install (or a build that still had the capability) can carry
+            // set_default=true into one that doesn't.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[hushmic] this sandbox cannot change the system default \
+                     microphone — select \"HushMic\" directly in your call app or \
+                     sound settings"
+                );
+            });
+        }
+        if cfg.set_default && pipewire::can_set_default() {
             // Never repoint the system default at a node that never appeared:
             // wait (bounded) for hushmic_source to register first. On timeout
             // the user's default is left completely untouched — a broken
@@ -586,7 +608,14 @@ impl Controller {
             persist_prior_default(self.prior_default.as_deref().unwrap_or(""));
             self.set_default_active = true;
         }
-        let _ = pipewire::set_default_source("hushmic_source");
+        // The read-back inside set_default_source is what detects silently
+        // dropped writes (restricted sandboxes) — a swallowed Err here
+        // would defeat it. State is deliberately NOT rolled back: the
+        // breadcrumb and set_default_active make disable() restore/clear
+        // whatever half-state the failed attempt left behind.
+        if let Err(e) = pipewire::set_default_source("hushmic_source") {
+            eprintln!("[hushmic] could not make hushmic_source the default microphone: {e}");
+        }
     }
 
     /// Complete a pending default takeover: no-op unless `set_default` is
@@ -594,7 +623,12 @@ impl Controller {
     /// the watchdog so a node that registered AFTER enable()'s bounded wait
     /// still gets the takeover — otherwise it would silently never happen.
     pub fn ensure_default_takeover(&mut self, cfg: &Config, node_present: bool) {
-        if cfg.set_default && !self.set_default_active && node_present && self.is_running() {
+        if cfg.set_default
+            && pipewire::can_set_default()
+            && !self.set_default_active
+            && node_present
+            && self.is_running()
+        {
             self.take_default();
         }
     }

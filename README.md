@@ -62,7 +62,7 @@ _(Averaged over the three clips; higher is better, 1–5.)_ DPDFNet comes out on
 
 - One virtual microphone, usable by any PipeWire- or PulseAudio-compatible app.
 - A tray menu for everything: on/off, which mic to clean, model (quality vs. light), suppression strength, set-as-default, start-on-login.
-- **Test my mic**: a live A/B window — your raw microphone and the cleaned output side by side as scrolling spectrograms with level meters, plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_, with honest before/after numbers. No call needed to hear (and see) the difference. On setups without a display for it, an audio-only record-and-playback test runs instead.
+- **Test my mic**: a live A/B window — raw vs. cleaned side by side, plus a record-and-replay sample with before/after numbers (details under [Usage](#usage)).
 - Failures show up as desktop notifications — a broken install or a virtual mic that will not come back says so on screen, not just in a terminal you never see.
 - The audio runs in a dedicated PipeWire process, so no elevated privileges (`setcap`) are needed.
 - Re-creates itself automatically after a PipeWire restart or a suspend/resume, and puts your previous default mic back when you quit (the virtual mic is tied to the app: quitting removes it cleanly).
@@ -85,13 +85,13 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.2.1-1_amd64.deb
-sudo apt install ./hushmic_0.2.1-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.3.0-1_amd64.deb
+sudo apt install ./hushmic_0.3.0-1_amd64.deb
 ```
 
 > On stock **Ubuntu 22.04** apt refuses with a `pipewire-media-session`/`wireplumber`
 > conflict (22.04 still ships the deprecated session manager). Install with
-> `sudo apt install ./hushmic_0.2.1-1_amd64.deb wireplumber pipewire-media-session-`
+> `sudo apt install ./hushmic_0.3.0-1_amd64.deb wireplumber pipewire-media-session-`
 > (the trailing `-` swaps it out), then log out and back in.
 
 **Arch Linux** (AUR):
@@ -130,10 +130,13 @@ chmod +x hushmic-x86_64.AppImage
 Launch HushMic from your desktop's application menu, or from a terminal:
 
 ```bash
-hushmic --tray
+hushmic          # tray + the live A/B window (relaunching re-opens the window)
+hushmic --tray   # tray only — what autostart uses
 ```
 
-A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The same menu has the on/off toggle (**Enable noise suppression**), the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, a start-on-login toggle, and **About HushMic** (version, license, links; `hushmic --version` works in a terminal too). **Test my mic** opens a live A/B window: raw microphone and cleaned output side by side — spectrograms and level meters running live — plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_ with measured before/after numbers. The tray icon doubles as a status light: cyan while active, struck-through gray when suppression is off, a warning badge on errors.
+A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The menu also has the on/off toggle, the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, start-on-login, and **About**.
+
+**Test my mic** opens the live A/B window: raw microphone and cleaned output side by side — scrolling spectrograms and level meters — plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_ with measured before/after numbers (headless or no GL: an audio-only record-and-playback test runs instead). The tray icon doubles as a status light: cyan while active, struck-through gray when off, a warning badge on errors.
 
 <p align="center">
   <img src="docs/img/hushmic-ab-window.png" alt="Live A/B mic test — raw microphone vs. HushMic output" width="720">
@@ -173,7 +176,7 @@ autostart   = false                        # launch on login
 
 **The tray icon doesn't show up (GNOME).** GNOME doesn't implement the tray spec natively — install the _AppIndicator and KStatusNotifierItem Support_ extension. KDE and most other desktops work out of the box.
 
-**Is it actually doing anything?** Click **Test my mic** in the tray: a window shows your raw microphone and the cleaned output live, side by side; record a 10-second sample and replay either take back-to-back. (Headless or no GL? An audio-only version records both and plays them back instead.)
+**Is it actually doing anything?** Click **Test my mic** in the tray — see [Usage](#usage).
 
 **Does it survive sleep / a PipeWire restart?** Yes — a watchdog re-creates the virtual mic automatically. If it ever can't (or an install is broken), you get a desktop notification instead of silence.
 

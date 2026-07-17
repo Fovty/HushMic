@@ -37,7 +37,14 @@ jobs:
         run: |
           V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           if [ "v$V" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $V — bump Cargo.toml (+ PKGBUILD pkgver, README .deb URL) before tagging"
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $V — bump Cargo.toml (+ PKGBUILD pkgver, README .deb URL, flatpak metainfo release entry) before tagging"
+            exit 1
+          fi
+          # The AppStream metainfo ships verbatim inside the flatpak: a tag
+          # whose version has no <release> entry would advertise the previous
+          # release as latest (and fail Flathub's appstream lint).
+          if ! grep -q "<release version=\"$V\"" packaging/flatpak/io.github.fovty.HushMic.metainfo.xml; then
+            echo "::error::packaging/flatpak/io.github.fovty.HushMic.metainfo.xml has no <release version=\"$V\"> entry — add it before tagging"
             exit 1
           fi
 

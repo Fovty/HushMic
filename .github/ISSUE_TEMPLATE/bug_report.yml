@@ -13,7 +13,7 @@ body:
     attributes:
       label: HushMic version
       description: Output of `hushmic --version` (or the AppImage / .deb filename).
-      placeholder: "hushmic 0.2.1"
+      placeholder: "hushmic 0.3.0"
     validations:
       required: true
   - type: dropdown

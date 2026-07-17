@@ -764,7 +764,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "dpdfnet-ladspa"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "claxon",
  "hound",
@@ -1349,11 +1349,12 @@ checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "hushmic"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "directories",
  "eframe",
  "egui_kittest",
+ "futures-util",
  "hound",
  "ksni",
  "libc",
@@ -1361,6 +1362,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
  "winit",
  "zbus",
