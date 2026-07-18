@@ -10,7 +10,4 @@ export HUSHMIC_MODEL_DIR="$HERE/usr/share/hushmic/models"
 # bundled icons are invisible to the system hicolor lookup; the tray forwards
 # this dir via ksni's icon_theme_path() so hosts find them here instead.
 export HUSHMIC_TRAY_THEME_DIR="$HERE/usr/share/icons"
-# Double-clicking the AppImage passes no args; default to the tray app instead
-# of printing usage to an invisible stderr and exiting.
-[ "$#" -eq 0 ] && set -- --tray
 exec "$HERE/usr/bin/hushmic" "$@"

@@ -47,6 +47,13 @@ jobs:
             echo "::error::packaging/flatpak/io.github.fovty.HushMic.metainfo.xml has no <release version=\"$V\"> entry — add it before tagging"
             exit 1
           fi
+          # The flatpak builds from the manifest's pinned tag, not from the
+          # tree: a tag whose manifest still pins the previous release would
+          # silently ship old code in the flatpak.
+          if ! grep -q "tag: $GITHUB_REF_NAME\$" packaging/flatpak/io.github.fovty.HushMic.yml; then
+            echo "::error::packaging/flatpak/io.github.fovty.HushMic.yml hushmic module does not pin tag: $GITHUB_REF_NAME — update the tag/commit pin before tagging"
+            exit 1
+          fi
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (pinned)

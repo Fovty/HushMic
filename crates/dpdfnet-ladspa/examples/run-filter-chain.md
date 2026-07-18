@@ -1,10 +1,11 @@
 # Running the hushmic DPDFNet filter-chain (operator notes)
 
-These are manual/operator steps for the v0.1 acceptance gate: load the LADSPA
-plugin in PipeWire as a virtual microphone source and confirm it is visible via
-pipewire-pulse and processes audio without xruns. v0.2 will own this lifecycle
-(systemd user service); for now we host the filter-chain in a dedicated
-`pipewire -c` process so we can inject the runtime env vars.
+Manual/operator steps to load the LADSPA plugin in PipeWire as a virtual
+microphone source without the tray app, and to confirm it is visible via
+pipewire-pulse and processes audio without xruns. The tray app manages this
+lifecycle automatically (it hosts the filter-chain in a dedicated
+`pipewire -c` child so it can inject the runtime env vars); these notes are
+for running the chain by hand.
 
 ## Prerequisites
 
@@ -74,9 +75,9 @@ sleep 2
 
 Either way the dedicated `pipewire -c` process connects to the running daemon
 as a client and registers only the filter-chain nodes — it does not touch the
-audio devices or the default source. v0.1 validation used method B.
+audio devices or the default source. Method B is what the tray app does.
 
-## Verify the virtual source appears (acceptance bar)
+## Verify the virtual source appears
 
 ```bash
 wpctl status              | grep -i hushmic   # PipeWire graph
