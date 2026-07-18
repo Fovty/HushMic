@@ -25,3 +25,4 @@
 # Raw icon exports (bulky, metadata-laden ~1 MB each); the cleaned masters
 # and the hicolor ladder are the committed artifacts.
 /packaging/tray/tray*.png
+/packaging/flatpak/ci-tree-manifest.yml
