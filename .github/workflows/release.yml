@@ -37,7 +37,7 @@ jobs:
         run: |
           V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           if [ "v$V" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $V — bump Cargo.toml (+ PKGBUILD pkgver, README .deb URL, flatpak metainfo release entry) before tagging"
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $V — bump Cargo.toml (+ README .deb URL, flatpak metainfo release entry) before tagging"
             exit 1
           fi
           # The AppStream metainfo ships verbatim inside the flatpak: a tag
@@ -97,7 +97,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set pkgver from the release tag
-        run: sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" packaging/PKGBUILD
+        run: sed -i -e "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" -e "s/^pkgrel=.*/pkgrel=1/" packaging/PKGBUILD
 
       # Clones the AUR repo, re-hashes the new tag tarball (updpkgsums) and
       # regenerates .SRCINFO in an Arch container, then commits and pushes.
@@ -123,7 +123,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set pkgver from the release tag
-        run: sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" packaging/aur-bin/PKGBUILD
+        run: sed -i -e "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" -e "s/^pkgrel=.*/pkgrel=1/" packaging/aur-bin/PKGBUILD
 
       # Same flow as the source package, but the source= here is the release
       # ASSET this run just published, so updpkgsums re-hashes the artifact
