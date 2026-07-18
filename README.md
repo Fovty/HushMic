@@ -215,6 +215,8 @@ Two parts:
 
 HushMic is free, open source, and makes zero network calls — no ads, no telemetry, no accounts. If it saved you a Krisp subscription, a coffee on **[Ko-fi](https://ko-fi.com/fovty)** is genuinely appreciated and helps keep it maintained. Starring the repo helps too.
 
+Curious where the project is headed? See the [roadmap](ROADMAP.md).
+
 ## License
 
 Dual-licensed under either **MIT** ([LICENSE-MIT](LICENSE-MIT)) or **Apache-2.0** ([LICENSE-APACHE](LICENSE-APACHE)), at your option.
