@@ -453,11 +453,33 @@ impl Controller {
         // device again. (This is the watchdog-on-exited-child path.)
         self.disable()?;
 
+        // Robustness: a saved mic that no longer matches a live source (device
+        // unplugged, renamed, or re-enumerated) would pin a dead target.object,
+        // which links to nothing and leaves the chain silent. Drop it so we
+        // follow the system default instead — but only when the probe ran (a
+        // failed probe keeps the saved mic; unknown is not gone).
+        let effective_mic = pipewire::resolve_effective_mic(
+            cfg.mic.as_deref(),
+            pipewire::sources_snapshot().as_deref(),
+        );
+        // Settings follow the ACTIVE device (per-mic profiles): the default
+        // source is only probed when the chain will follow it — the one case
+        // where its profile applies.
+        let default_source = if effective_mic.is_none() {
+            pipewire::get_default_source()
+        } else {
+            None
+        };
+        let (eff_model, eff_attn) =
+            cfg.effective_settings(effective_mic.as_deref(), default_source.as_deref());
+
         // Preflight the assets. A missing plugin/model/runtime otherwise fails
         // INSIDE the child where `flags = [ nofail ]` hides it completely: the
         // child stays alive, `is_running()` reports healthy, no node appears,
         // and the user gets a generic error icon with no message anywhere.
-        let model = self.paths.model_dir.join(format!("{}.onnx", cfg.model));
+        // The model checked is the EFFECTIVE one — the profile the conf will
+        // actually name.
+        let model = self.paths.model_dir.join(format!("{eff_model}.onnx"));
         for (what, p) in [
             ("LADSPA plugin", &self.paths.plugin_so),
             ("model file", &model),
@@ -476,31 +498,23 @@ impl Controller {
             }
         }
 
-        // Robustness: a saved mic that no longer matches a live source (device
-        // unplugged, renamed, or re-enumerated) would pin a dead target.object,
-        // which links to nothing and leaves the chain silent. Drop it so we
-        // follow the system default instead — but only when the probe ran (a
-        // failed probe keeps the saved mic; unknown is not gone).
-        let effective_mic = pipewire::resolve_effective_mic(
-            cfg.mic.as_deref(),
-            pipewire::sources_snapshot().as_deref(),
-        );
-        // PipeWire < 0.3.64 ignores target.object; emit the legacy node.target
-        // too so mic selection is honored there (Ubuntu 22.04 ships 0.3.48).
-        let legacy = !pipewire::supports_target_object();
-        let conf = if effective_mic.as_deref() == cfg.mic.as_deref() {
-            render_conf(cfg, &self.paths, legacy)
-        } else {
+        if effective_mic.as_deref() != cfg.mic.as_deref() {
             eprintln!(
                 "[hushmic] saved microphone '{}' is not present — following the system default",
                 cfg.mic.as_deref().unwrap_or_default()
             );
-            let adjusted = Config {
-                mic: effective_mic.clone(),
-                ..cfg.clone()
-            };
-            render_conf(&adjusted, &self.paths, legacy)
+        }
+        // PipeWire < 0.3.64 ignores target.object; emit the legacy node.target
+        // too so mic selection is honored there (Ubuntu 22.04 ships 0.3.48).
+        let legacy = !pipewire::supports_target_object();
+        // One adjusted copy carries every effective value (mic + profile).
+        let adjusted = Config {
+            mic: effective_mic.clone(),
+            model: eff_model,
+            attn_limit: eff_attn,
+            ..cfg.clone()
         };
+        let conf = render_conf(&adjusted, &self.paths, legacy);
         let path = conf_path();
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;

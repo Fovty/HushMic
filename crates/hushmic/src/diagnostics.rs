@@ -28,6 +28,8 @@ pub struct Report {
     pub model: String,
     pub attn_limit: f32,
     pub set_default: bool,
+    /// Saved per-mic profiles (config `mic_prefs` entries).
+    pub mic_profiles: usize,
     /// None = probe failed; Some = real capture sources by description.
     pub sources: Option<Vec<String>>,
     pub default_source: Option<String>,
@@ -81,6 +83,7 @@ pub fn collect() -> Report {
         model: cfg.model.clone(),
         attn_limit: cfg.attn_limit,
         set_default: cfg.set_default,
+        mic_profiles: cfg.mic_prefs.len(),
         sources: snapshot.as_deref().map(|v| {
             crate::pipewire::filter_real(v)
                 .into_iter()
@@ -186,6 +189,11 @@ pub fn render(r: &Report) -> (String, usize) {
         format!("  attenuation limit: {} dB", r.attn_limit),
     );
     line(&mut out, false, format!("  set default: {}", r.set_default));
+    line(
+        &mut out,
+        false,
+        format!("  per-mic profiles: {}", r.mic_profiles),
+    );
     line(
         &mut out,
         false,
@@ -391,6 +399,7 @@ mod tests {
             model: "dpdfnet8_48khz_hr".into(),
             attn_limit: 100.0,
             set_default: true,
+            mic_profiles: 1,
             sources: Some(vec!["RODE NT-USB".into(), "Webcam C920".into()]),
             default_source: Some("hushmic_source".into()),
             hushmic_present: Some(true),
@@ -422,6 +431,7 @@ mod tests {
             "libdpdfnet_ladspa.so",
             "pw-dump",
             "chain up",
+            "per-mic profiles: 1",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }

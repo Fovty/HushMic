@@ -667,19 +667,24 @@ fn main() {
                         applied = apply(&mut controller, &cfg);
                     }
                     TrayCmd::SelectMic(m) => {
-                        cfg.mic = m;
+                        // Loads the pick's saved profile into model/attn
+                        // (per-mic prefs); the snapshot pushed back below
+                        // updates the tray radios to match.
+                        cfg.apply_mic_selection(m);
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SelectModel(m) => {
                         cfg.model = m;
+                        cfg.remember_selected_prefs();
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SetAttn(v) => {
                         cfg.attn_limit = v;
+                        cfg.remember_selected_prefs();
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }

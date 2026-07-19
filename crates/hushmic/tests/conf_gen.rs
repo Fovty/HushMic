@@ -204,3 +204,41 @@ fn active_mic_none_initially_and_after_failed_enable_and_disable() {
     let _ = c.disable();
     assert_eq!(c.active_mic(), None);
 }
+
+// --- per-mic prefs reach the rendered conf ----------------------------------
+// enable() renders from an adjusted Config carrying effective_settings():
+// a pinned mic with a saved profile must produce a conf with THAT profile's
+// attenuation, not the globals.
+#[test]
+fn per_mic_profile_drives_the_rendered_conf() {
+    use hushmic::config::MicPrefs;
+    let mut cfg = Config {
+        mic: Some("alsa_input.rode".into()),
+        attn_limit: 100.0,
+        ..Config::default()
+    };
+    cfg.mic_prefs.insert(
+        "alsa_input.rode".into(),
+        MicPrefs {
+            model: "dpdfnet2_48khz_hr".into(),
+            attn_limit: 24.0,
+        },
+    );
+    let (model, attn) = cfg.effective_settings(cfg.mic.as_deref(), None);
+    let adjusted = Config {
+        model,
+        attn_limit: attn,
+        ..cfg.clone()
+    };
+    let paths = Paths {
+        plugin_so: PathBuf::from("/usr/lib/ladspa/libdpdfnet_ladspa.so"),
+        model_dir: PathBuf::from("/usr/share/hushmic/models"),
+        dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
+    };
+    let conf = render_conf(&adjusted, &paths, false);
+    assert!(
+        conf.contains("\"Attenuation Limit (dB)\" = 24"),
+        "profile attn missing:\n{conf}"
+    );
+    assert!(conf.contains("alsa_input.rode"), "{conf}");
+}

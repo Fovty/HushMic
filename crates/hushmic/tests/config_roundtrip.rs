@@ -37,6 +37,7 @@ fn toml_roundtrips() {
         attn_limit: 24.0,
         set_default: true,
         autostart: true,
+        ..Config::default()
     };
     let s = toml::to_string_pretty(&c).unwrap();
     let back: Config = toml::from_str(&s).unwrap();
