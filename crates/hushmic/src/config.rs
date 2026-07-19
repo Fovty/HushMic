@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::{fs, path::PathBuf};
 
-/// One microphone's remembered settings (roadmap item 5). Keyed by
+/// One microphone's remembered settings. Keyed by
 /// `node.name` in [`Config::mic_prefs`]; the globals stay as the
 /// System-default settings and the fallback for mics without an entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

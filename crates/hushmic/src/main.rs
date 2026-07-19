@@ -1007,7 +1007,7 @@ fn main() {
                 // let a flapping pw-dump collapse a fully-escalated backoff
                 // to zero and re-log/attempt nearly every tick.
 
-                // --- mic recovery (spec 2026-07-19): the watchdog above
+                // --- mic recovery: the watchdog above
                 // judges the NODE; this judges the INPUT. When the preferred
                 // mic disappears the (healthy) chain restarts onto the system
                 // default; when it returns, back onto it — both via the

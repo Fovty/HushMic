@@ -756,7 +756,7 @@ mod tests {
     // The toasts carry diagnoses ("no audio is arriving from the
     // microphone…"), not confirmations: the duration must cover READING
     // the longest one at a comfortable ~15 chars/s, or it vanishes before
-    // it informs (user-reported on the silent-mic hint).
+    // it informs.
     #[test]
     fn toast_duration_covers_reading_the_longest_hint() {
         let longest = crate::abtest::audio::SILENT_MIC_HINT.len() as f32;
