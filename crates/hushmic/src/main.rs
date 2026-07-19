@@ -253,15 +253,17 @@ fn main() {
     let test_window = args.iter().any(|a| a == "--test-window");
     let about = args.iter().any(|a| a == "--about");
     let version = args.iter().any(|a| a == "--version");
-    const KNOWN_FLAGS: [&str; 5] = [
+    let doctor = args.iter().any(|a| a == "--doctor");
+    const KNOWN_FLAGS: [&str; 6] = [
         "--tray",
         "--enable-once",
         "--test-window",
         "--about",
         "--version",
+        "--doctor",
     ];
     let unrecognized = args.iter().any(|a| !KNOWN_FLAGS.contains(&a.as_str()));
-    let modes = [tray_mode, enable_once, test_window, about, version]
+    let modes = [tray_mode, enable_once, test_window, about, version, doctor]
         .iter()
         .filter(|m| **m)
         .count();
@@ -273,6 +275,9 @@ fn main() {
         eprintln!("       hushmic --test-window   open the live A/B mic-test window");
         eprintln!("       hushmic --about         open the About window");
         eprintln!("       hushmic --version       print the version and install paths");
+        eprintln!(
+            "       hushmic --doctor        print a diagnostics report (exits 1 on problems)"
+        );
         std::process::exit(2);
     }
     // No flag at all is the DESKTOP LAUNCH: run the tray AND surface the A/B
@@ -308,6 +313,23 @@ fn main() {
             }
         }
         return;
+    }
+
+    if doctor {
+        // Same SIGPIPE stance as --version: `hushmic --doctor | head` must
+        // exit quietly, not panic.
+        use std::io::Write;
+        let (text, problems) = {
+            let report = hushmic::diagnostics::collect();
+            hushmic::diagnostics::render(&report)
+        };
+        if let Err(e) = std::io::stdout().write_all(text.as_bytes()) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                eprintln!("hushmic: cannot write to stdout: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(if problems == 0 { 0 } else { 1 });
     }
 
     if about {

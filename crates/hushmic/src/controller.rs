@@ -543,7 +543,14 @@ impl Controller {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        // Pipe the child's stderr through the diagnostics tee: every line
+        // still reaches our own stderr, and the persisted copy is what
+        // `--doctor` / "Copy diagnostics" include (also post-mortem).
+        command.stderr(std::process::Stdio::piped());
+        let mut child = command.spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            crate::diagnostics::spawn_stderr_tee(stderr, crate::diagnostics::log_path());
+        }
         self.child = Some(child);
         self.spawned_at = Some(Instant::now());
 

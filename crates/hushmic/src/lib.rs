@@ -4,6 +4,7 @@ pub mod autostart;
 pub mod branding;
 pub mod config;
 pub mod controller;
+pub mod diagnostics;
 pub mod fsutil;
 pub mod lock;
 pub mod mictest;

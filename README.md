@@ -132,6 +132,7 @@ Launch HushMic from your desktop's application menu, or from a terminal:
 ```bash
 hushmic          # tray + the live A/B window (relaunching re-opens the window)
 hushmic --tray   # tray only — what autostart uses
+hushmic --doctor # print a diagnostics report (exits 1 if it finds problems)
 ```
 
 A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The menu also has the on/off toggle, the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, start-on-login, and **About**.
@@ -183,6 +184,8 @@ autostart   = false                        # launch on login
 **TeamSpeak / Discord don't see it?** Make sure `pipewire-pulse` is running; HushMic exposes the mic through it so PulseAudio/ALSA-compat apps can pick it.
 
 **Recording still sounds noisy / unprocessed?** A few apps that use the **Qt Multimedia** backend (some KDE recorders, etc.) capture the hardware device directly and ignore the selected virtual mic. Switch the app to its **PulseAudio/PipeWire** backend, or enable _Set as default microphone_ in the tray so default-following apps pick HushMic.
+
+**Something's broken — what should I put in a bug report?** Run `hushmic --doctor` (or click **Copy diagnostics** in the About window) and paste the output into the issue. It's plain text — versions, paths, and device names, nothing sensitive.
 
 ## Alternatives
 

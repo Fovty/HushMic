@@ -10,7 +10,7 @@ use std::time::Duration;
 
 // Fixed window size; the height is pinned by the window_fits_content_height
 // test (measured with the same content probe as the A/B window).
-const WINDOW_SIZE: [f32; 2] = [400.0, 348.0];
+const WINDOW_SIZE: [f32; 2] = [400.0, 388.0];
 
 // Logo edge in px (the 256 px asset, GPU-downscaled).
 const LOGO_SIZE: f32 = 96.0;
@@ -32,6 +32,15 @@ fn border(alpha: f32) -> Color32 {
     with_alpha(Color32::from_rgb(126, 166, 214), alpha)
 }
 
+/// "Copy diagnostics" lifecycle: collect off-thread (the probes shell out
+/// to pw-dump — never block a frame), copy on arrival, confirm briefly.
+enum CopyState {
+    Idle,
+    Collecting(std::sync::mpsc::Receiver<String>),
+    /// Seconds the "Copied ✓" confirmation stays up.
+    Copied(f32),
+}
+
 struct AboutApp {
     /// KWin remembers per-app window sizes (Wayland AND Xwayland) and can
     /// map us at another window's size, overriding the creation request —
@@ -44,15 +53,29 @@ struct AboutApp {
     logo_tex: Option<TextureHandle>,
     /// Set by the Close button or Esc; `ui` answers with ViewportCommand::Close.
     close_requested: bool,
+    /// Produces the diagnostics report text; a fn pointer so the kittest
+    /// harness can inject a stub instead of probing live PipeWire.
+    collector: fn() -> String,
+    copy_state: CopyState,
+}
+
+fn collect_report_text() -> String {
+    crate::diagnostics::render(&crate::diagnostics::collect()).0
 }
 
 impl AboutApp {
     fn new() -> Self {
+        Self::with_collector(collect_report_text)
+    }
+
+    fn with_collector(collector: fn() -> String) -> Self {
         AboutApp {
             size_asserts_left: 3,
             size_assert_cooldown: 0.0,
             logo_tex: None,
             close_requested: false,
+            collector,
+            copy_state: CopyState::Idle,
         }
     }
 
@@ -94,6 +117,33 @@ impl AboutApp {
         }
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         self.size_assert_cooldown = (self.size_assert_cooldown - dt).max(0.0);
+
+        // Copy-diagnostics lifecycle: poll the worker, copy on arrival,
+        // let the confirmation decay back to idle.
+        self.copy_state = match std::mem::replace(&mut self.copy_state, CopyState::Idle) {
+            CopyState::Collecting(rx) => match rx.try_recv() {
+                Ok(text) => {
+                    #[cfg(test)]
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new("t_about_copied"), text.clone()));
+                    ctx.copy_text(text);
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    CopyState::Copied(2.0)
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(33));
+                    CopyState::Collecting(rx)
+                }
+                // Collector thread died: give the button back rather than
+                // wedge it on "Collecting…" forever.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => CopyState::Idle,
+            },
+            CopyState::Copied(t) if t - dt <= 0.0 => CopyState::Idle,
+            CopyState::Copied(t) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                CopyState::Copied(t - dt)
+            }
+            idle => idle,
+        };
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_requested = true;
@@ -182,6 +232,28 @@ impl AboutApp {
         ui.add_space(16.0);
         // Same breathing room as the A/B window's transport buttons.
         ui.spacing_mut().button_padding = vec2(14.0, 7.0);
+        let copy_label = match self.copy_state {
+            CopyState::Idle => "Copy diagnostics",
+            CopyState::Collecting(_) => "Collecting…",
+            CopyState::Copied(_) => "Copied ✓",
+        };
+        let copy = ui.add_enabled(
+            matches!(self.copy_state, CopyState::Idle),
+            Button::new(RichText::new(copy_label).size(12.0).color(TEXT))
+                .fill(TRACK_BG)
+                .stroke(Stroke::new(1.0_f32, border(0.16)))
+                .corner_radius(7.0)
+                .min_size(vec2(150.0, 32.0)),
+        );
+        if copy.clicked() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let collector = self.collector;
+            std::thread::spawn(move || {
+                let _ = tx.send(collector());
+            });
+            self.copy_state = CopyState::Collecting(rx);
+        }
+        ui.add_space(8.0);
         let close = ui.add(
             Button::new(RichText::new("Close").size(12.0).color(TEXT))
                 .fill(TRACK_BG)
@@ -282,6 +354,41 @@ mod tests {
         harness.get_by_label(&format!("Version {}", env!("CARGO_PKG_VERSION")));
         harness.get_by_label("Real-time noise suppression for Linux");
         harness.get_by_label("MIT OR Apache-2.0");
+    }
+
+    fn harness_with_collector(collector: fn() -> String) -> egui_kittest::Harness<'static> {
+        let mut app = AboutApp::with_collector(collector);
+        egui_kittest::Harness::builder()
+            .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+            .build(move |ctx| app.ui(ctx))
+    }
+
+    /// Drive frames until the copy probe appears (the collect runs on a
+    /// worker thread, so arrival is not frame-deterministic).
+    fn wait_for_copy(harness: &mut egui_kittest::Harness<'static>) -> Option<String> {
+        for _ in 0..100 {
+            harness.run_steps(1);
+            let copied: Option<String> = harness
+                .ctx
+                .data(|d| d.get_temp(egui::Id::new("t_about_copied")));
+            if copied.is_some() {
+                return copied;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn copy_diagnostics_button_copies_the_report() {
+        let mut harness = harness_with_collector(|| "stub diagnostics report".into());
+        harness.run_steps(2);
+        harness.get_by_label("Copy diagnostics").click();
+        let copied = wait_for_copy(&mut harness);
+        assert_eq!(copied.as_deref(), Some("stub diagnostics report"));
+        // The button confirms, then settles back to idle.
+        harness.run_steps(2);
+        harness.get_by_label("Copied ✓");
     }
 
     #[test]
