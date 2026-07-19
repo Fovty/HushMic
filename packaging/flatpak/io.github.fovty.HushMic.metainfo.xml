@@ -49,6 +49,18 @@
   </screenshots>
 
   <releases>
+    <release version="0.4.0" date="2026-07-19">
+      <description>
+        <p>
+          HushMic now recovers on its own when your microphone disconnects:
+          it falls back to the system default and switches back when the mic
+          returns, without touching your saved choice. Each microphone
+          remembers its own model and suppression strength, and a new
+          diagnostics report (hushmic --doctor, or Copy diagnostics in the
+          About window) makes bug reports one paste.
+        </p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-07-17">
       <description>
         <p>
