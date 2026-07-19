@@ -277,3 +277,53 @@ fn repair_leaves_nonempty_keyless_members_alone() {
     );
     assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_err());
 }
+
+// --- retry_probe: transient probe failures must not become verdicts --------
+#[test]
+fn retry_probe_returns_first_definitive_answer_without_extra_calls() {
+    let mut calls = 0;
+    let got = hushmic::pipewire::retry_probe(
+        || {
+            calls += 1;
+            Some(true)
+        },
+        3,
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(got, Some(true));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn retry_probe_retries_past_transient_failures() {
+    let mut calls = 0;
+    let got = hushmic::pipewire::retry_probe(
+        || {
+            calls += 1;
+            if calls < 3 {
+                None
+            } else {
+                Some(false)
+            }
+        },
+        3,
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(got, Some(false));
+    assert_eq!(calls, 3);
+}
+
+#[test]
+fn retry_probe_gives_up_after_attempts_and_stays_unknown() {
+    let mut calls = 0;
+    let got = hushmic::pipewire::retry_probe(
+        || {
+            calls += 1;
+            None
+        },
+        3,
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(got, None);
+    assert_eq!(calls, 3);
+}

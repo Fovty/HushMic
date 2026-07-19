@@ -707,11 +707,18 @@ fn main() {
                         // disabled suppression or a missing chain must get
                         // the actionable message, not a window whose device
                         // overlay misdiagnoses it as a missing microphone.
-                        let node_present = pipewire::pw_dump().as_deref().map(|d| {
-                            pipewire::parse_pwdump_nodes(d)
-                                .iter()
-                                .any(|s| s.name == "hushmic_source")
-                        });
+                        // Same transient-churn retry as the ShowWindow probe.
+                        let node_present = pipewire::retry_probe(
+                            || {
+                                pipewire::pw_dump().as_deref().map(|d| {
+                                    pipewire::parse_pwdump_nodes(d)
+                                        .iter()
+                                        .any(|s| s.name == "hushmic_source")
+                                })
+                            },
+                            3,
+                            Duration::from_millis(400),
+                        );
                         if window_alive {
                             notify::send(
                                 Slot::MicTest,
@@ -799,11 +806,21 @@ fn main() {
                 // an already-open window is closed and respawned — the fresh
                 // one appears on top and re-resolves the node pair for free.
                 close_ab_window(&mut ab_window);
-                let node_present = pipewire::pw_dump().as_deref().map(|d| {
-                    pipewire::parse_pwdump_nodes(d)
-                        .iter()
-                        .any(|s| s.name == "hushmic_source")
-                });
+                // Retried: pw-dump fails transiently under graph churn
+                // (which is exactly when windows get opened), and one
+                // failed probe must not decline the reopen — root cause
+                // of the declined relaunches on the v0.4.0 tag pipelines.
+                let node_present = pipewire::retry_probe(
+                    || {
+                        pipewire::pw_dump().as_deref().map(|d| {
+                            pipewire::parse_pwdump_nodes(d)
+                                .iter()
+                                .any(|s| s.name == "hushmic_source")
+                        })
+                    },
+                    3,
+                    Duration::from_millis(400),
+                );
                 // Same gate as a tray-menu mic test: a disabled chain or a
                 // missing node gets the actionable notification, not a
                 // window whose device overlay misdiagnoses it.

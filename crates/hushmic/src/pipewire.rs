@@ -438,6 +438,30 @@ pub fn pw_version_at_least(text: &str, min: (u32, u32, u32)) -> bool {
 /// source. Used by the watchdog: the host child can linger after a daemon
 /// restart while the node itself is gone, so node presence (not child PID) is
 /// the real liveness signal. `None` = the probe itself failed (unknown).
+/// Retry a definitive-answer probe across transient failures. `pw-dump`
+/// exits non-zero (or emits unparseable JSON) under graph churn — several
+/// concurrent clients plus node registration at once, which is exactly
+/// when the A/B window gets (re)opened — and one transient probe failure
+/// must not decline a user-visible action (observed live: tag pipeline
+/// 3158's declined window reopen). First `Some` wins; `delay` between
+/// attempts; all-`None` after `attempts` stays `None` (unknown is still
+/// not a verdict). Pure over the injected probe — unit-tested.
+pub fn retry_probe<F: FnMut() -> Option<bool>>(
+    mut probe: F,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Option<bool> {
+    for i in 0..attempts {
+        if let Some(v) = probe() {
+            return Some(v);
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    None
+}
+
 pub fn hushmic_source_present() -> Option<bool> {
     sources_snapshot().map(|v| v.iter().any(|s| s.name == "hushmic_source"))
 }
