@@ -808,12 +808,18 @@ fn main() {
                 // missing node gets the actionable notification, not a
                 // window whose device overlay misdiagnoses it.
                 if let Err(msg) = mictest::precondition(cfg.enabled, node_present, testing) {
+                    // Journal breadcrumb: without it, a declined reopen is
+                    // indistinguishable from a spawn that died instantly.
+                    eprintln!("[hushmic] not reopening the A/B window: {msg}");
                     notify::send(Slot::MicTest, "audio-input-microphone", "HushMic", msg);
                 } else {
                     match spawn_child_window("--test-window") {
                         // Not user_initiated: never escalate a launch into
                         // the audio-only recording (see ab_window above).
-                        Ok(child) => ab_window = Some((child, Instant::now(), false)),
+                        Ok(child) => {
+                            eprintln!("[hushmic] A/B window opened (pid {})", child.id());
+                            ab_window = Some((child, Instant::now(), false));
+                        }
                         Err(e) => eprintln!("hushmic: could not open the A/B window: {e}"),
                     }
                 }
@@ -854,6 +860,10 @@ fn main() {
                 let mut window_quick_fail = None;
                 if let Some((child, spawned, user_initiated)) = ab_window.as_mut() {
                     if let Ok(Some(status)) = child.try_wait() {
+                        eprintln!(
+                            "[hushmic] A/B window exited ({status}) after {:.1}s",
+                            spawned.elapsed().as_secs_f32()
+                        );
                         // Exit code 1 is --test-window's own "could not
                         // start" path; signals (WM kill) and user closes
                         // (0) must not trigger a surprise audio-only test.
