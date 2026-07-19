@@ -10,7 +10,7 @@ use std::time::Duration;
 
 // Fixed window size; the height is pinned by the window_fits_content_height
 // test (measured with the same content probe as the A/B window).
-const WINDOW_SIZE: [f32; 2] = [400.0, 388.0];
+const WINDOW_SIZE: [f32; 2] = [400.0, 345.0];
 
 // Logo edge in px (the 256 px asset, GPU-downscaled).
 const LOGO_SIZE: f32 = 96.0;
@@ -232,14 +232,17 @@ impl AboutApp {
         ui.add_space(16.0);
         // Same breathing room as the A/B window's transport buttons.
         ui.spacing_mut().button_padding = vec2(14.0, 7.0);
-        let copy_label = match self.copy_state {
-            CopyState::Idle => "Copy diagnostics",
-            CopyState::Collecting(_) => "Collecting…",
-            CopyState::Copied(_) => "Copied ✓",
+        // Plain text states — no glyphs (U+2713 renders as tofu where
+        // egui's bundled fonts lack coverage); the confirmation reads in
+        // the accent color instead.
+        let (copy_label, copy_color) = match self.copy_state {
+            CopyState::Idle => ("Copy diagnostics", TEXT),
+            CopyState::Collecting(_) => ("Collecting…", TEXT),
+            CopyState::Copied(_) => ("Copied", ACCENT),
         };
         let copy = ui.add_enabled(
             matches!(self.copy_state, CopyState::Idle),
-            Button::new(RichText::new(copy_label).size(12.0).color(TEXT))
+            Button::new(RichText::new(copy_label).size(12.0).color(copy_color))
                 .fill(TRACK_BG)
                 .stroke(Stroke::new(1.0_f32, border(0.16)))
                 .corner_radius(7.0)
@@ -253,17 +256,7 @@ impl AboutApp {
             });
             self.copy_state = CopyState::Collecting(rx);
         }
-        ui.add_space(8.0);
-        let close = ui.add(
-            Button::new(RichText::new("Close").size(12.0).color(TEXT))
-                .fill(TRACK_BG)
-                .stroke(Stroke::new(1.0_f32, border(0.16)))
-                .corner_radius(7.0)
-                .min_size(vec2(96.0, 32.0)),
-        );
-        if close.clicked() {
-            self.close_requested = true;
-        }
+        // No Close button: Esc and the WM titlebar close the card.
     }
 }
 
@@ -386,19 +379,25 @@ mod tests {
         harness.get_by_label("Copy diagnostics").click();
         let copied = wait_for_copy(&mut harness);
         assert_eq!(copied.as_deref(), Some("stub diagnostics report"));
-        // The button confirms, then settles back to idle.
+        // The button confirms in plain text — no glyphs: egui's bundled
+        // fonts don't cover U+2713 everywhere (rendered as tofu on Arch).
         harness.run_steps(2);
-        harness.get_by_label("Copied ✓");
+        harness.get_by_label("Copied");
     }
 
+    // No Close button by design (2026-07-19): Esc and the WM titlebar
+    // close the card; a button was redundant chrome.
     #[test]
-    fn close_button_requests_close() {
-        let mut harness = harness(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]));
-        harness.run_steps(2);
-        assert!(!close_requested(&harness));
-        harness.get_by_label("Close").click();
-        harness.run_steps(2);
-        assert!(close_requested(&harness));
+    fn no_close_button_rendered() {
+        let harness = {
+            let mut h = harness(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]));
+            h.run_steps(2);
+            h
+        };
+        assert!(
+            harness.query_by_label("Close").is_none(),
+            "Close button should be gone"
+        );
     }
 
     #[test]
