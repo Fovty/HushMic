@@ -46,6 +46,17 @@ body:
     validations:
       required: true
   - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      description: >
+        On HushMic 0.4 or newer, run `hushmic --doctor` (or click
+        **Copy diagnostics** in the About window) and paste the output —
+        it answers most environment questions in one go and includes the
+        recent filter-chain log. It's plain text: versions, paths, and
+        device names, nothing sensitive. On older versions, skip this.
+      render: shell
+  - type: textarea
     id: what
     attributes:
       label: What happened?
