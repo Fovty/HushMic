@@ -388,6 +388,10 @@ pub struct Controller {
     /// later instead of being dropped.
     set_default_active: bool,
     spawned_at: Option<Instant>,
+    /// The mic the running child's conf pins (None = follows the system
+    /// default). Set only once a child actually spawned; cleared by
+    /// `disable()` — see [`Controller::active_mic`].
+    active_mic: Option<String>,
 }
 
 impl Controller {
@@ -398,7 +402,16 @@ impl Controller {
             prior_default: None,
             set_default_active: false,
             spawned_at: None,
+            active_mic: None,
         }
+    }
+
+    /// The mic the RUNNING chain was rendered with (None = following the
+    /// system default, or no child at all). This is the state the mic-
+    /// recovery machine compares against `config.mic`: `Some` only while a
+    /// live child's conf pins that device.
+    pub fn active_mic(&self) -> Option<&str> {
+        self.active_mic.as_deref()
     }
 
     /// Seconds since the current child was spawned (None = no child). The
@@ -483,7 +496,7 @@ impl Controller {
                 cfg.mic.as_deref().unwrap_or_default()
             );
             let adjusted = Config {
-                mic: effective_mic,
+                mic: effective_mic.clone(),
                 ..cfg.clone()
             };
             render_conf(&adjusted, &self.paths, legacy)
@@ -553,6 +566,7 @@ impl Controller {
         }
         self.child = Some(child);
         self.spawned_at = Some(Instant::now());
+        self.active_mic = effective_mic;
 
         if cfg.set_default && !pipewire::can_set_default() {
             // One line, once: the toggle is hidden in the tray when the
@@ -674,6 +688,7 @@ impl Controller {
             let _ = c.wait();
         }
         self.spawned_at = None;
+        self.active_mic = None;
         Ok(())
     }
 }

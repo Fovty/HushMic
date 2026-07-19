@@ -7,7 +7,10 @@
 use crate::abtest::types::{Channel, Command, Frame, SampleMetrics, RECORD_SECS};
 
 /// Toast auto-dismiss time.
-pub const TOAST_SECS: f32 = 2.6;
+// Long enough to READ the longest diagnosis toast (~100 chars at ~15
+// chars/s — pinned by toast_duration_covers_reading_the_longest_hint);
+// 2.6 s was fine for confirmations but ate the silent-mic hint.
+pub const TOAST_SECS: f32 = 7.0;
 
 /// Live monitoring starts on window open, so there is no Idle mode.
 /// `Sample` = "not live": reviewing a recorded sample, or stopped with none.
@@ -746,8 +749,21 @@ mod tests {
         s.on_frame(&Frame::Warn("hi".into()));
         s.tick(1.0);
         assert_eq!(s.toast, Some(("hi".into(), TOAST_SECS - 1.0)));
-        s.tick(2.0);
+        s.tick(TOAST_SECS); // past the remaining time, whatever the value
         assert_eq!(s.toast, None);
+    }
+
+    // The toasts carry diagnoses ("no audio is arriving from the
+    // microphone…"), not confirmations: the duration must cover READING
+    // the longest one at a comfortable ~15 chars/s, or it vanishes before
+    // it informs (user-reported on the silent-mic hint).
+    #[test]
+    fn toast_duration_covers_reading_the_longest_hint() {
+        let longest = crate::abtest::audio::SILENT_MIC_HINT.len() as f32;
+        assert!(
+            TOAST_SECS >= longest / 15.0,
+            "TOAST_SECS {TOAST_SECS} too short for a {longest}-char hint"
+        );
     }
 
     #[test]

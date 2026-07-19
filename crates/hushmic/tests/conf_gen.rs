@@ -174,3 +174,33 @@ fn prefix_derivation_from_binary_location() {
         None
     );
 }
+
+// --- Controller::active_mic() lifecycle (mic recovery) ----------------------
+// The recovery state machine keys off which mic the RUNNING chain was
+// rendered with. Safe to test without spawning anything: enable() preflights
+// the assets first, so nonexistent paths fail it before any side effect.
+#[test]
+fn active_mic_none_initially_and_after_failed_enable_and_disable() {
+    use hushmic::controller::Controller;
+    let paths = Paths {
+        plugin_so: PathBuf::from("/nonexistent/plugin.so"),
+        model_dir: PathBuf::from("/nonexistent/models"),
+        dylib: PathBuf::from("/nonexistent/libonnxruntime.so"),
+    };
+    let mut c = Controller::new(paths);
+    assert_eq!(c.active_mic(), None);
+    // A failed enable must not leave a phantom active mic behind — the
+    // recovery machine would judge switches against a chain that isn't up.
+    let cfg = Config {
+        mic: Some("some-mic".into()),
+        set_default: false,
+        ..Config::default()
+    };
+    assert!(
+        c.enable(&cfg).is_err(),
+        "preflight must fail on missing assets"
+    );
+    assert_eq!(c.active_mic(), None);
+    let _ = c.disable();
+    assert_eq!(c.active_mic(), None);
+}

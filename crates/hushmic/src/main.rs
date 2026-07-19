@@ -465,6 +465,7 @@ fn main() {
             cmd_tx: ctx.clone(),
             status: TrayStatus::Off,
             testing: false,
+            fallback_active: false,
         };
         // Inside a Flatpak the session-bus proxy only lets us own names under
         // our app ID, so registering the spec's well-known
@@ -601,6 +602,7 @@ fn main() {
     // watchdog respawn backoff + throttled "node down" logging (state-change only)
     let mut backoff = hushmic::watchdog::Backoff::new();
     let mut logged_down = false;
+    let mut recovery = watchdog::Recovery::new();
     // A mic test is running (worker thread active). Owned by the main loop:
     // set on TrayCmd::TestMic, cleared on Event::MicTestDone. The flag lets
     // the loop cancel the test when the filter-chain is mutated under it.
@@ -772,11 +774,16 @@ fn main() {
                 let new_mics = known_mics.clone();
                 let snapshot = cfg.clone();
                 let testing_now = testing;
+                let fallback_now = cfg.enabled
+                    && cfg.mic.is_some()
+                    && controller.is_running()
+                    && controller.active_mic() != cfg.mic.as_deref();
                 let _ = handle.update(move |t: &mut HushMicTray| {
                     t.cfg = snapshot;
                     t.mics = new_mics;
                     t.status = status;
                     t.testing = testing_now;
+                    t.fallback_active = fallback_now;
                 });
             }
             Event::ShowWindow => {
@@ -994,12 +1001,80 @@ fn main() {
                 // "healthy": resetting the backoff/log throttle on it would
                 // let a flapping pw-dump collapse a fully-escalated backoff
                 // to zero and re-log/attempt nearly every tick.
+
+                // --- mic recovery (spec 2026-07-19): the watchdog above
+                // judges the NODE; this judges the INPUT. When the preferred
+                // mic disappears the (healthy) chain restarts onto the system
+                // default; when it returns, back onto it — both via the
+                // normal enable(), whose resolution renders the right conf
+                // either way. config.mic is never touched. All debounce/
+                // freeze/cooldown policy lives in watchdog::Recovery.
+                if cfg.enabled && !down {
+                    let preferred_present = nodes.as_ref().map(|v| {
+                        cfg.mic
+                            .as_deref()
+                            .is_some_and(|name| v.iter().any(|s| s.name == name))
+                    });
+                    let decision = recovery.observe(
+                        cfg.mic.is_some(),
+                        controller.active_mic() == cfg.mic.as_deref(),
+                        preferred_present,
+                        in_grace,
+                    );
+                    if let Some(switch) = decision {
+                        let (log_what, body) = match switch {
+                            watchdog::Switch::Fallback => (
+                                "preferred microphone disconnected",
+                                "Your microphone was disconnected — HushMic is \
+                                 following the system default for now.",
+                            ),
+                            watchdog::Switch::Return => (
+                                "preferred microphone reconnected",
+                                "Your microphone is back — HushMic switched back \
+                                 to it.",
+                            ),
+                        };
+                        eprintln!("[hushmic] {log_what}; restarting the chain");
+                        // Same rule as the watchdog respawn: a running mic
+                        // test would record a chain mid-restart.
+                        if testing {
+                            if let Some(c) = &mictest_cancel {
+                                c.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        match controller.enable(&cfg) {
+                            Ok(()) => notify::send_transient(
+                                Slot::Status,
+                                "audio-input-microphone",
+                                "HushMic",
+                                body,
+                            ),
+                            Err(e) => {
+                                eprintln!("hushmic: enable failed: {e}");
+                                if gate.on_enable_error(&e.to_string(), false) {
+                                    notify::send(
+                                        Slot::Status,
+                                        "dialog-error",
+                                        FAIL_SUMMARY,
+                                        &e.to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // reflect liveness in the tray status (icon + title) every tick
                 let status = compute_status(&cfg, &mut controller, node_present);
                 let testing_now = testing;
+                let fallback_now = cfg.enabled
+                    && cfg.mic.is_some()
+                    && controller.is_running()
+                    && controller.active_mic() != cfg.mic.as_deref();
                 let _ = handle.update(move |t: &mut HushMicTray| {
                     t.status = status;
                     t.testing = testing_now;
+                    t.fallback_active = fallback_now;
                 });
             }
             Event::Shutdown => {

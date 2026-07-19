@@ -55,6 +55,10 @@ pub struct HushMicTray {
     /// A mic test is currently recording/playing (the menu item is disabled
     /// while it runs; the main loop flips this via handle.update).
     pub testing: bool,
+    /// The recovery fallback is engaged: the chain runs on the system
+    /// default while the preferred mic is unplugged. Only affects how the
+    /// missing-mic entry is labelled.
+    pub fallback_active: bool,
 }
 
 const MODELS: &[(&str, &str)] = &[
@@ -140,8 +144,15 @@ impl Tray for HushMicTray {
             _ => None,
         };
         if let Some(name) = &missing_mic {
+            // Once recovery has switched the chain, say what it is actually
+            // doing; before that (or when recovery can't run), plain truth.
+            let suffix = if self.fallback_active {
+                "(unplugged — using system default)"
+            } else {
+                "(unavailable)"
+            };
             mic_opts.push(RadioItem {
-                label: format!("{name} (unavailable)"),
+                label: format!("{name} {suffix}"),
                 ..Default::default()
             });
         }
@@ -356,7 +367,55 @@ mod tests {
             cmd_tx: tx,
             status: TrayStatus::Off,
             testing,
+            fallback_active: false,
         }
+    }
+
+    fn mic_labels(tray: &HushMicTray) -> Vec<String> {
+        tray.menu()
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::SubMenu(s) if s.label == "Microphone" => Some(s),
+                _ => None,
+            })
+            .expect("Microphone submenu")
+            .submenu
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::RadioGroup(g) => {
+                    Some(g.options.iter().map(|o| o.label.clone()).collect())
+                }
+                _ => None,
+            })
+            .expect("mic radio group")
+    }
+
+    #[test]
+    fn missing_mic_label_reflects_fallback_state() {
+        let mut tray = test_tray(false);
+        tray.cfg.mic = Some("alsa_input.rode".into());
+        // Not yet fallen back (or recovery can't run): plain truth.
+        let labels = mic_labels(&tray);
+        assert_eq!(
+            labels.last().map(String::as_str),
+            Some("alsa_input.rode (unavailable)")
+        );
+        // Fallback engaged: say what the chain is actually doing.
+        tray.fallback_active = true;
+        let labels = mic_labels(&tray);
+        assert_eq!(
+            labels.last().map(String::as_str),
+            Some("alsa_input.rode (unplugged — using system default)")
+        );
+        // A present mic never gets either suffix.
+        tray.cfg.mic = Some("alsa_input.test".into());
+        let labels = mic_labels(&tray);
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("unavailable") || l.contains("unplugged")),
+            "{labels:?}"
+        );
     }
 
     fn mic_test_item(menu: &[MenuItem<HushMicTray>]) -> &StandardItem<HushMicTray> {
@@ -400,6 +459,7 @@ mod tests {
             cmd_tx: tx,
             status: TrayStatus::Off,
             testing: false,
+            fallback_active: false,
         };
         let menu = tray.menu();
         let item = mic_test_item(&menu);
@@ -420,6 +480,7 @@ mod tests {
             cmd_tx: tx,
             status: TrayStatus::Off,
             testing: false,
+            fallback_active: false,
         };
         let menu = tray.menu();
         let pos = |label: &str| {
