@@ -135,9 +135,21 @@ hushmic --tray   # tray only — what autostart uses
 hushmic --doctor # print a diagnostics report (exits 1 if it finds problems)
 ```
 
-A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The menu also has the on/off toggle, the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, start-on-login, and **About**.
+A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The **Mode** menu switches between noise suppression, **bypass** (your raw voice, mic stays connected) and **mute** (a hardware-level cutoff no app can un-mute) — switches are instant, with no reconnect in your call. The menu also has the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, start-on-login, and **About**.
 
-**Test my mic** opens the live A/B window: raw microphone and cleaned output side by side — scrolling spectrograms and level meters — plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_ with measured before/after numbers (headless or no GL: an audio-only record-and-playback test runs instead). The tray icon doubles as a status light: cyan while active, struck-through gray when off, a warning badge on errors.
+The same controls are scriptable — bind them to hotkeys (KDE custom shortcuts, sxhkd, a Stream Deck):
+
+```bash
+hushmic status [--json]  # what the running tray is doing
+hushmic mode             # print: suppress | bypass | mute | off
+hushmic mode mute        # set any of the four states
+hushmic toggle mute      # one-key toggle; returns to where you came from
+hushmic toggle bypass
+```
+
+Exit codes: `0` ok, `1` invalid usage or a failed command, `2` HushMic is not running.
+
+**Test my mic** opens the live A/B window: raw microphone and cleaned output side by side — scrolling spectrograms and level meters — plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_ with measured before/after numbers (headless or no GL: an audio-only record-and-playback test runs instead). The tray icon doubles as a status light: cyan while active, plain gray in bypass, a red struck-through mic while muted, struck-through gray when off, a warning badge on errors.
 
 <p align="center">
   <img src="docs/img/hushmic-ab-window.png" alt="Live A/B mic test — raw microphone vs. HushMic output" width="720">

@@ -3,6 +3,7 @@ pub mod abtest;
 pub mod autostart;
 pub mod branding;
 pub mod config;
+pub mod control;
 pub mod controller;
 pub mod diagnostics;
 pub mod fsutil;

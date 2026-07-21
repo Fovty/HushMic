@@ -57,12 +57,34 @@ pub fn default_show_socket_path() -> PathBuf {
     }
 }
 
+/// Default path of the CLI control socket, next to the lock file (same
+/// flatpak-shared-dir and /tmp-fallback reasoning as its siblings).
+pub fn default_control_socket_path() -> PathBuf {
+    match shared_runtime_dir() {
+        Some(d) => d.join("hushmic-control.sock"),
+        None => {
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("hushmic-control-{uid}.sock"))
+        }
+    }
+}
+
 /// Bind the show socket. Only the lock holder ever calls this, so a leftover
 /// socket file is guaranteed dead (a crashed previous instance) — unlink it
 /// first. In the /tmp fallback a foreign-uid squatter file makes the unlink
 /// fail and the bind error out: the caller logs it and relaunch forwarding is
 /// simply off, same failure posture as the lock's ownership check.
 pub fn bind_show_socket(path: &Path) -> std::io::Result<UnixListener> {
+    unlink_and_bind(path)
+}
+
+/// Bind the CLI control socket — identical stale-file posture: only the
+/// lock holder binds, so any leftover file is a dead predecessor's.
+pub fn bind_control_socket(path: &Path) -> std::io::Result<UnixListener> {
+    unlink_and_bind(path)
+}
+
+fn unlink_and_bind(path: &Path) -> std::io::Result<UnixListener> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

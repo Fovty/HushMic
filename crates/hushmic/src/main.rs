@@ -1,4 +1,5 @@
 use hushmic::config::Config;
+use hushmic::control;
 use hushmic::controller::{self, Controller, Paths, RunMode};
 use hushmic::notify::{self, FailureGate, Slot};
 use hushmic::pipewire;
@@ -22,6 +23,9 @@ enum Event {
     /// (flag-less) launch, and again whenever a second launch finds this
     /// instance already running and forwards itself via the show socket.
     ShowWindow,
+    /// A CLI request from the control socket; the reply goes back through
+    /// the embedded sender once the outcome is known.
+    Control(control::ControlReq),
     Shutdown,
 }
 
@@ -254,6 +258,31 @@ fn start_fallback_mictest(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Control subcommands are CLIENT invocations: talk to the running
+    // tray's socket, print, exit. Same SIGPIPE stance as --version.
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("status" | "mode" | "toggle")
+    ) {
+        use std::io::Write;
+        let (code, out) = control::client_run(&args);
+        let text = if out.ends_with('\n') {
+            out
+        } else {
+            format!("{out}\n")
+        };
+        let res = if code == 0 {
+            std::io::stdout().write_all(text.as_bytes())
+        } else {
+            std::io::stderr().write_all(text.as_bytes())
+        };
+        if let Err(e) = res {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                eprintln!("hushmic: cannot write output: {e}");
+            }
+        }
+        std::process::exit(code);
+    }
     let tray_mode = args.iter().any(|a| a == "--tray");
     let enable_once = args.iter().any(|a| a == "--enable-once");
     let test_window = args.iter().any(|a| a == "--test-window");
@@ -284,6 +313,9 @@ fn main() {
         eprintln!(
             "       hushmic --doctor        print a diagnostics report (exits 1 on problems)"
         );
+        eprintln!("       hushmic status [--json] show what the running tray is doing");
+        eprintln!("       hushmic mode [STATE]    print or set: suppress|bypass|mute|off");
+        eprintln!("       hushmic toggle mute|bypass   hotkey-friendly overlay toggle");
         std::process::exit(2);
     }
     // No flag at all is the DESKTOP LAUNCH: run the tray AND surface the A/B
@@ -405,6 +437,21 @@ fn main() {
             Ok(l) => Some(l),
             Err(e) => {
                 eprintln!("hushmic: relaunch forwarding disabled: {e}");
+                None
+            }
+        }
+    };
+    // The CLI control socket, bound equally early for the same backlog
+    // reason: a `hushmic mode mute` racing the tray's startup should queue,
+    // not exit 2.
+    let control_socket_path = lock::default_control_socket_path();
+    let control_listener = if enable_once {
+        None
+    } else {
+        match lock::bind_control_socket(&control_socket_path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("hushmic: CLI control disabled: {e}");
                 None
             }
         }
@@ -567,6 +614,20 @@ fn main() {
             }
         });
     }
+    // Control listener + a small bridge into the event channel (the
+    // listener speaks ControlReq, the loop speaks Event).
+    if let Some(listener) = control_listener {
+        let (ctl_tx, ctl_rx) = mpsc::channel::<control::ControlReq>();
+        control::spawn_listener(listener, ctl_tx);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for req in ctl_rx {
+                if tx.send(Event::Control(req)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // Gate for failure/recovery notifications: dedups the watchdog's
     // backoff-gated retries so the same error does not re-pop forever.
@@ -638,8 +699,71 @@ fn main() {
     // opens another), but every one must be reaped on Tick or it lingers as a
     // zombie after close.
     let mut about_windows: Vec<std::process::Child> = Vec::new();
+    // The toggle overlay's return address: the last chain-alive mode before
+    // the current one, updated on EVERY SetMode (tray radio or CLI) so
+    // tray-mute then CLI-untoggle round-trips. See control::update_prev_alive.
+    let mut prev_alive = RunMode::Suppress;
+    // Last hushmic_source probe verdict, refreshed by Tick and the Cmd
+    // epilogue — `status` reports it instead of re-probing on the hot path.
+    let mut last_node_present: Option<bool> = None;
 
     for ev in rx {
+        // Mutating control requests become synthetic SetMode commands so
+        // they share the entire Cmd path (mic-test invalidation, live
+        // switch + restart fallback, config save, tray refresh); the reply
+        // is written from the Cmd epilogue once the outcome is known.
+        // Read-only requests answer inline from loop-owned state.
+        let mut control_reply: Option<mpsc::Sender<String>> = None;
+        let ev = match ev {
+            Event::Control(req) => {
+                let words: Vec<&str> = req.line.split_whitespace().collect();
+                match control::parse_request(&words) {
+                    Err(msg) => {
+                        let _ = req.reply.send(control::encode_err(&msg));
+                        continue;
+                    }
+                    Ok(control::Request::GetMode) => {
+                        let cur = cfg.enabled.then(|| controller.mode());
+                        let _ = req.reply.send(control::encode_ok(control::mode_word(cur)));
+                        continue;
+                    }
+                    Ok(control::Request::Status { json }) => {
+                        let s = control::Status {
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                            mode: cfg.enabled.then(|| controller.mode()),
+                            mic_configured: cfg.mic.clone(),
+                            mic_active: controller.active_mic().map(str::to_string),
+                            fallback_active: cfg.enabled
+                                && cfg.mic.is_some()
+                                && controller.is_running()
+                                && controller.active_mic() != cfg.mic.as_deref(),
+                            model: cfg.model.clone(),
+                            attn_limit: cfg.attn_limit,
+                            chain_running: controller.is_running(),
+                            node_present: last_node_present,
+                        };
+                        let payload = if json {
+                            control::render_status_json(&s)
+                        } else {
+                            control::render_status_human(&s)
+                        };
+                        let _ = req.reply.send(control::encode_ok(&payload));
+                        continue;
+                    }
+                    Ok(control::Request::SetMode(sel)) => {
+                        control_reply = Some(req.reply);
+                        Event::Cmd(TrayCmd::SetMode(sel))
+                    }
+                    Ok(control::Request::Toggle(target)) => {
+                        let cur = cfg.enabled.then(|| controller.mode());
+                        let sel = control::toggle_next(cur, prev_alive, target);
+                        control_reply = Some(req.reply);
+                        Event::Cmd(TrayCmd::SetMode(sel))
+                    }
+                }
+            }
+            other => other,
+        };
         match ev {
             Event::Cmd(cmd) => {
                 // Any command that will re-render/restart the chain (or tear
@@ -676,38 +800,42 @@ fn main() {
                 }
                 let mut applied: Result<(), String> = Ok(());
                 match cmd {
-                    TrayCmd::SetMode(sel) => match sel {
-                        None => {
-                            cfg.enabled = false;
-                            applied = apply(&mut controller, &cfg);
-                        }
-                        Some(m) => {
-                            let live = cfg.enabled && controller.is_running();
-                            controller.set_mode_state(m);
-                            cfg.enabled = true;
-                            if live && pipewire::set_chain_mode(m.control_value()) {
-                                // switched on the running node - no restart,
-                                // no audible gap, nothing else to do
-                            } else {
-                                if live {
-                                    eprintln!(
-                                        "[hushmic] live mode switch failed; \
-                                         restarting the chain with mode {m:?}"
-                                    );
-                                    // the restart invalidates what the
-                                    // mutates_chain gate above skipped for
-                                    // the live path
-                                    if testing {
-                                        if let Some(c) = &mictest_cancel {
-                                            c.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                    close_ab_window(&mut ab_window);
-                                }
+                    TrayCmd::SetMode(sel) => {
+                        let old_sel = cfg.enabled.then(|| controller.mode());
+                        match sel {
+                            None => {
+                                cfg.enabled = false;
                                 applied = apply(&mut controller, &cfg);
                             }
+                            Some(m) => {
+                                let live = cfg.enabled && controller.is_running();
+                                controller.set_mode_state(m);
+                                cfg.enabled = true;
+                                if live && pipewire::set_chain_mode(m.control_value()) {
+                                    // switched on the running node - no restart,
+                                    // no audible gap, nothing else to do
+                                } else {
+                                    if live {
+                                        eprintln!(
+                                            "[hushmic] live mode switch failed; \
+                                         restarting the chain with mode {m:?}"
+                                        );
+                                        // the restart invalidates what the
+                                        // mutates_chain gate above skipped for
+                                        // the live path
+                                        if testing {
+                                            if let Some(c) = &mictest_cancel {
+                                                c.store(true, Ordering::Relaxed);
+                                            }
+                                        }
+                                        close_ab_window(&mut ab_window);
+                                    }
+                                    applied = apply(&mut controller, &cfg);
+                                }
+                            }
                         }
-                    },
+                        prev_alive = control::update_prev_alive(prev_alive, old_sel, sel);
+                    }
                     TrayCmd::SelectMic(m) => {
                         // Loads the pick's saved profile into model/attn
                         // (per-mic prefs); the snapshot pushed back below
@@ -805,15 +933,26 @@ fn main() {
                         break;
                     }
                 }
-                if let Err(e) = applied {
+                if let Err(e) = &applied {
                     eprintln!("hushmic: enable failed: {e}");
-                    if gate.on_enable_error(&e, true) {
-                        notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, &e);
+                    if gate.on_enable_error(e, true) {
+                        notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, e);
                     }
                 } else if !cfg.enabled {
                     // user turned it off: stale failure state must not
                     // produce a "running again" notice later
                     gate.reset();
+                }
+                // A CLI-originated SetMode gets its answer now that the
+                // outcome is known: the resulting mode word, or the error.
+                if let Some(reply) = control_reply.take() {
+                    let msg = match &applied {
+                        Ok(()) => control::encode_ok(control::mode_word(
+                            cfg.enabled.then(|| controller.mode()),
+                        )),
+                        Err(e) => control::encode_err(e),
+                    };
+                    let _ = reply.send(msg);
                 }
                 let _ = cfg.save();
                 // reflect updated state + refreshed mic list + status in the tray
@@ -824,6 +963,7 @@ fn main() {
                 if let Some(v) = nodes {
                     known_mics = pipewire::filter_real(&v);
                 }
+                last_node_present = node_present;
                 let status = compute_status(&cfg, &mut controller, node_present);
                 let new_mics = known_mics.clone();
                 let snapshot = cfg.clone();
@@ -961,6 +1101,7 @@ fn main() {
                 let node_present = nodes
                     .as_ref()
                     .map(|v| v.iter().any(|s| s.name == "hushmic_source"));
+                last_node_present = node_present;
                 if let Some(v) = nodes.as_ref() {
                     let real = pipewire::filter_real(v);
                     if real != known_mics {
@@ -1159,8 +1300,14 @@ fn main() {
                 let _ = controller.disable();
                 break;
             }
+            // consumed by the preprocessing above (answered inline or
+            // rewritten into a synthetic SetMode command)
+            Event::Control(_) => unreachable!("control requests are preprocessed"),
         }
     }
+    // Orderly shutdown removes the control socket; a crash leaves it for
+    // the next start's unlink+rebind (and clients' connects fail = exit 2).
+    let _ = std::fs::remove_file(&control_socket_path);
     // Quit/Shutdown may interrupt a running mic test: its worker dies with
     // the process (recorders via PDEATHSIG) before its own cleanup runs —
     // the voice recordings must not outlive the app. (Unlinking files the
