@@ -1,6 +1,24 @@
 use hushmic::config::Config;
-use hushmic::controller::{render_conf, Paths};
+use hushmic::controller::{render_conf, Paths, RunMode};
 use std::path::PathBuf;
+
+#[test]
+fn conf_renders_the_run_mode() {
+    let cfg = Config::default();
+    let paths = Paths {
+        plugin_so: PathBuf::from("/usr/lib/ladspa/libdpdfnet_ladspa.so"),
+        model_dir: PathBuf::from("/usr/share/hushmic/models"),
+        dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
+    };
+    let c = render_conf(&cfg, &paths, false, RunMode::Suppress);
+    assert!(c.contains("\"Mode\" = 0"), "suppress renders Mode 0: {c}");
+    // A chain spawned while Mute is selected must be BORN muted (no
+    // unmuted window between spawn and a later set-param).
+    let c = render_conf(&cfg, &paths, false, RunMode::Mute);
+    assert!(c.contains("\"Mode\" = 2"), "mute renders Mode 2: {c}");
+    let c = render_conf(&cfg, &paths, false, RunMode::Bypass);
+    assert!(c.contains("\"Mode\" = 1"), "bypass renders Mode 1: {c}");
+}
 
 #[test]
 fn conf_contains_required_fields() {
@@ -14,7 +32,7 @@ fn conf_contains_required_fields() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let c = render_conf(&cfg, &paths, false);
+    let c = render_conf(&cfg, &paths, false, RunMode::Suppress);
     assert!(c.contains("label  = \"dpdfnet_mono\""), "label missing");
     assert!(
         c.contains("/usr/lib/ladspa/libdpdfnet_ladspa.so"),
@@ -60,7 +78,7 @@ fn conf_escapes_hostile_values() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let c = render_conf(&cfg, &paths, false);
+    let c = render_conf(&cfg, &paths, false, RunMode::Suppress);
     assert!(
         c.contains(r#"target.object  = "evil\" } inject = { x""#),
         "quotes must be escaped: {c}"
@@ -81,7 +99,7 @@ fn conf_omits_target_when_no_mic() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let c = render_conf(&cfg, &paths, false);
+    let c = render_conf(&cfg, &paths, false, RunMode::Suppress);
     assert!(
         !c.contains("target.object"),
         "target.object must be absent when no mic chosen"
@@ -100,14 +118,14 @@ fn legacy_node_target_only_on_old_pipewire() {
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
     // Modern PipeWire: target.object only, byte-for-byte as before.
-    let modern = render_conf(&cfg, &paths, false);
+    let modern = render_conf(&cfg, &paths, false, RunMode::Suppress);
     assert!(modern.contains("target.object  = \"alsa_input.realmic\""));
     assert!(
         !modern.contains("node.target"),
         "node.target must NOT appear on modern PipeWire"
     );
     // Old PipeWire (< 0.3.64): also emit the legacy node.target so the mic pins.
-    let legacy = render_conf(&cfg, &paths, true);
+    let legacy = render_conf(&cfg, &paths, true, RunMode::Suppress);
     assert!(legacy.contains("target.object  = \"alsa_input.realmic\""));
     assert!(
         legacy.contains("node.target     = \"alsa_input.realmic\""),
@@ -235,7 +253,7 @@ fn per_mic_profile_drives_the_rendered_conf() {
         model_dir: PathBuf::from("/usr/share/hushmic/models"),
         dylib: PathBuf::from("/usr/lib/hushmic/libonnxruntime.so"),
     };
-    let conf = render_conf(&adjusted, &paths, false);
+    let conf = render_conf(&adjusted, &paths, false, RunMode::Suppress);
     assert!(
         conf.contains("\"Attenuation Limit (dB)\" = 24"),
         "profile attn missing:\n{conf}"

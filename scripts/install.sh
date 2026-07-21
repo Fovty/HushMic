@@ -109,10 +109,10 @@ DEST_ICONS="$PREFIX/share/icons/hicolor/256x256/apps"
 DEST_HICOLOR="$PREFIX/share/icons/hicolor"
 DEST_LICENSES="$PREFIX/share/licenses/hushmic"
 
-# Tray status-icon ladder shipped in the payload (three SNI names x eight
+# Tray status-icon ladder shipped in the payload (five SNI names x eight
 # sizes, status/ context); must stay in lockstep with packaging/tray/hicolor/.
 TRAY_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256"
-TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-error"
+TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error"
 
 refresh_icon_cache() {
   # Refresh the hicolor cache so SNI hosts pick icon changes up without a

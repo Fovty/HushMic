@@ -58,6 +58,14 @@ pub fn tray_icon_rgba(name: &str) -> Vec<(u32, u32, Vec<u8>)> {
             tray_png!("22x22", "hushmic-tray-off"),
             tray_png!("48x48", "hushmic-tray-off"),
         ],
+        "hushmic-tray-bypass" => [
+            tray_png!("22x22", "hushmic-tray-bypass"),
+            tray_png!("48x48", "hushmic-tray-bypass"),
+        ],
+        "hushmic-tray-mute" => [
+            tray_png!("22x22", "hushmic-tray-mute"),
+            tray_png!("48x48", "hushmic-tray-mute"),
+        ],
         "hushmic-tray-error" => [
             tray_png!("22x22", "hushmic-tray-error"),
             tray_png!("48x48", "hushmic-tray-error"),
@@ -80,7 +88,13 @@ mod tests {
 
     #[test]
     fn tray_pixmaps_decode_at_both_sizes_for_every_status() {
-        for name in ["hushmic-tray", "hushmic-tray-off", "hushmic-tray-error"] {
+        for name in [
+            "hushmic-tray",
+            "hushmic-tray-off",
+            "hushmic-tray-bypass",
+            "hushmic-tray-mute",
+            "hushmic-tray-error",
+        ] {
             let pix = tray_icon_rgba(name);
             assert_eq!(pix.len(), 2, "{name}");
             for (w, h, rgba) in &pix {

@@ -56,7 +56,7 @@ package() {
   # Tray status-icon ladder (three SNI names x eight sizes); explicit installs
   # so a missing size or state fails packaging instead of shipping incomplete.
   for _size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256; do
-    for _icon in hushmic-tray hushmic-tray-off hushmic-tray-error; do
+    for _icon in hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error; do
       install -Dm644 "packaging/tray/hicolor/$_size/status/$_icon.png" \
         "$pkgdir/usr/share/icons/hicolor/$_size/status/$_icon.png"
     done

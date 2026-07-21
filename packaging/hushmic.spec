@@ -76,7 +76,7 @@ install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.onnx \
 install -Dm644 share/applications/hushmic.desktop \
   %{buildroot}%{_datadir}/applications/hushmic.desktop
 
-# App icon + the tray status ladder (three SNI names x eight sizes); copying the
+# App icon + the tray status ladder (five SNI names x eight sizes); copying the
 # tree keeps every size/state the release ships.
 find share/icons -type f -name '*.png' -print0 | while IFS= read -r -d '' _icon; do
   install -Dm644 "$_icon" "%{buildroot}%{_prefix}/$_icon"

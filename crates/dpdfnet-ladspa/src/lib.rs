@@ -1,11 +1,13 @@
 //! hushmic DPDFNet LADSPA plugin.
 pub mod attn;
 pub mod engine;
+pub mod mode;
 pub mod model;
 pub mod stft;
 
 use engine::Engine;
 use ladspa::{DefaultValue, Plugin, PluginDescriptor, Port, PortConnection, PortDescriptor};
+use mode::Mode;
 use std::path::PathBuf;
 use stft::HOP;
 
@@ -28,6 +30,7 @@ struct DpdfnetPlugin {
     in_buf: Vec<f32>,
     out_buf: Vec<f32>, // committed enhanced samples waiting to be emitted
     last_db: f32,
+    last_mode: f32,
     run_err_logged: bool,
 }
 
@@ -57,6 +60,7 @@ impl DpdfnetPlugin {
             in_buf: Vec::with_capacity(MAX_EXPECTED_QUANTUM + HOP),
             out_buf: Vec::with_capacity(MAX_EXPECTED_QUANTUM + HOP),
             last_db: f32::NAN,
+            last_mode: f32::NAN,
             run_err_logged: false,
         }
     }
@@ -73,6 +77,7 @@ impl Plugin for DpdfnetPlugin {
         // pre-fill one hop of silence => one-hop output latency, absorbs the first frame.
         self.out_buf.resize(HOP, 0.0);
         self.last_db = f32::NAN;
+        self.last_mode = f32::NAN; // NAN forces a set_mode on the first run()
         self.run_err_logged = false;
     }
 
@@ -93,6 +98,11 @@ impl Plugin for DpdfnetPlugin {
         if db != self.last_db {
             engine.set_attn_db(db);
             self.last_db = db;
+        }
+        let mode_ctl = *ports[3].unwrap_control();
+        if mode_ctl != self.last_mode {
+            engine.set_mode(Mode::from_control(mode_ctl));
+            self.last_mode = mode_ctl;
         }
 
         // 1. enqueue input
@@ -171,6 +181,17 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 lower_bound: Some(0.0),
                 upper_bound: Some(100.0),
             },
+            Port {
+                // 0 = process, 1 = bypass (latency-aligned raw), 2 = mute.
+                // Appended after the attn port so confs addressing controls
+                // by name stay valid.
+                name: "Mode",
+                desc: PortDescriptor::ControlInput,
+                hint: Some(ladspa::HINT_INTEGER),
+                default: Some(DefaultValue::Minimum),
+                lower_bound: Some(0.0),
+                upper_bound: Some(2.0),
+            },
         ],
         new: new_instance,
     })
@@ -179,6 +200,21 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_port_is_declared_fourth() {
+        // Appended after the attn port so existing confs stay valid
+        // (filter-chain addresses controls by name).
+        let d = get_ladspa_descriptor(0).expect("descriptor 0 exists");
+        assert_eq!(d.ports.len(), 4, "Input, Output, Attn, Mode");
+        let p = &d.ports[3];
+        assert_eq!(p.name, "Mode");
+        assert!(matches!(p.desc, PortDescriptor::ControlInput));
+        assert_eq!(p.lower_bound, Some(0.0));
+        assert_eq!(p.upper_bound, Some(2.0));
+        assert!(matches!(p.default, Some(DefaultValue::Minimum)));
+        assert_eq!(p.hint, Some(ladspa::HINT_INTEGER), "integer-valued mode");
+    }
 
     #[test]
     fn mismatched_sample_rate_disables_engine() {

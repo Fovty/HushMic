@@ -1,5 +1,5 @@
 use hushmic::config::Config;
-use hushmic::controller::{self, Controller, Paths};
+use hushmic::controller::{self, Controller, Paths, RunMode};
 use hushmic::notify::{self, FailureGate, Slot};
 use hushmic::pipewire;
 use hushmic::tray::{HushMicTray, TrayCmd, TrayStatus};
@@ -55,7 +55,13 @@ fn compute_status(
                 .secs_since_spawn()
                 .is_some_and(|s| s < STARTUP_GRACE_SECS))
     {
-        TrayStatus::Active
+        // Healthy chain: the icon reflects the processing mode. Error keeps
+        // precedence via the arm below.
+        match controller.mode() {
+            RunMode::Suppress => TrayStatus::Active,
+            RunMode::Bypass => TrayStatus::Bypass,
+            RunMode::Mute => TrayStatus::Mute,
+        }
     } else {
         TrayStatus::Error
     }
@@ -466,6 +472,7 @@ fn main() {
             status: TrayStatus::Off,
             testing: false,
             fallback_active: false,
+            mode: RunMode::default(),
         };
         // Inside a Flatpak the session-bus proxy only lets us own names under
         // our app ID, so registering the spec's well-known
@@ -638,7 +645,14 @@ fn main() {
                 // Any command that will re-render/restart the chain (or tear
                 // it down) invalidates a running mic test's cleaned leg —
                 // cancel it rather than let it record a dead node.
-                let mutates_chain = matches!(cmd, TrayCmd::SetEnabled(_))
+                // A live mode switch (SetMode(Some) with a running chain)
+                // deliberately does NOT count: it flips a control on the
+                // running node without restarting anything, and the A/B
+                // window showing the flip live is the honest behavior. Its
+                // rare set-param-failed fallback DOES restart — that path
+                // re-runs this invalidation inline before applying.
+                let mutates_chain = matches!(cmd, TrayCmd::SetMode(None))
+                    || (!cfg.enabled && matches!(cmd, TrayCmd::SetMode(Some(_))))
                     || (cfg.enabled
                         && matches!(
                             cmd,
@@ -662,10 +676,38 @@ fn main() {
                 }
                 let mut applied: Result<(), String> = Ok(());
                 match cmd {
-                    TrayCmd::SetEnabled(v) => {
-                        cfg.enabled = v;
-                        applied = apply(&mut controller, &cfg);
-                    }
+                    TrayCmd::SetMode(sel) => match sel {
+                        None => {
+                            cfg.enabled = false;
+                            applied = apply(&mut controller, &cfg);
+                        }
+                        Some(m) => {
+                            let live = cfg.enabled && controller.is_running();
+                            controller.set_mode_state(m);
+                            cfg.enabled = true;
+                            if live && pipewire::set_chain_mode(m.control_value()) {
+                                // switched on the running node - no restart,
+                                // no audible gap, nothing else to do
+                            } else {
+                                if live {
+                                    eprintln!(
+                                        "[hushmic] live mode switch failed; \
+                                         restarting the chain with mode {m:?}"
+                                    );
+                                    // the restart invalidates what the
+                                    // mutates_chain gate above skipped for
+                                    // the live path
+                                    if testing {
+                                        if let Some(c) = &mictest_cancel {
+                                            c.store(true, Ordering::Relaxed);
+                                        }
+                                    }
+                                    close_ab_window(&mut ab_window);
+                                }
+                                applied = apply(&mut controller, &cfg);
+                            }
+                        }
+                    },
                     TrayCmd::SelectMic(m) => {
                         // Loads the pick's saved profile into model/attn
                         // (per-mic prefs); the snapshot pushed back below
@@ -790,12 +832,14 @@ fn main() {
                     && cfg.mic.is_some()
                     && controller.is_running()
                     && controller.active_mic() != cfg.mic.as_deref();
+                let mode_now = controller.mode();
                 let _ = handle.update(move |t: &mut HushMicTray| {
                     t.cfg = snapshot;
                     t.mics = new_mics;
                     t.status = status;
                     t.testing = testing_now;
                     t.fallback_active = fallback_now;
+                    t.mode = mode_now;
                 });
             }
             Event::ShowWindow => {

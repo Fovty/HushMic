@@ -24,11 +24,11 @@ NAME="hushmic-${VERSION}-${ARCH}"
 DIST="$REPO_ROOT/dist"
 TOOLS="$REPO_ROOT/.build-tools"
 
-# Tray status-icon ladder (three SNI names x eight sizes) shipped alongside the
+# Tray status-icon ladder (five SNI names x eight sizes) shipped alongside the
 # app icon in every artifact; must stay in lockstep with packaging/tray/hicolor/
 # and the names the tray requests over SNI.
 TRAY_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256"
-TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-error"
+TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error"
 
 # Install-layout paths to bake into the plugin for system builds.
 export HUSHMIC_BUILD_MODEL="/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx"

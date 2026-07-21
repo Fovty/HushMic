@@ -510,6 +510,35 @@ pub fn can_set_default() -> bool {
     !crate::sandbox::is_flatpak() || std::path::Path::new(FLATPAK_MANAGER_DROPIN).exists()
 }
 
+/// The SPA-JSON argument `pw-cli set-param … Props` takes to change the
+/// plugin's "Mode" control (0 process / 1 bypass / 2 mute).
+pub fn mode_param_arg(value: u8) -> String {
+    format!(r#"{{ params = [ "hushmic_dsp:Mode" {value} ] }}"#)
+}
+
+/// Switch the running filter-chain's mode live — no restart, no audible gap.
+/// The controls surface on the `hushmic_input` stream node (verified against
+/// a live chain: enum-params shows them there, and a set-param read-back
+/// round-trips). False = node missing or pw-cli failed; the caller falls
+/// back to a chain restart with the mode rendered into the conf.
+pub fn set_chain_mode(value: u8) -> bool {
+    let Some(id) = node_id("hushmic_input") else {
+        return false;
+    };
+    Command::new("pw-cli")
+        .args([
+            "set-param",
+            &id.to_string(),
+            "Props",
+            &mode_param_arg(value),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Set the default source node name via pw-metadata.
 pub fn set_default_source(node_name: &str) -> std::io::Result<()> {
     // serde_json handles escaping; a node name containing `"` or `\` must not

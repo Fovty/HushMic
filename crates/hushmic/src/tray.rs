@@ -3,6 +3,7 @@
 #![allow(clippy::needless_update)]
 
 use crate::config::Config;
+use crate::controller::RunMode;
 use crate::pipewire::Source;
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{MenuItem, Tray};
@@ -10,7 +11,9 @@ use std::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub enum TrayCmd {
-    SetEnabled(bool),
+    /// `Some(mode)` = a chain-alive state (suppress / bypass / mute);
+    /// `None` = Off, the existing tear-the-chain-down disable path.
+    SetMode(Option<RunMode>),
     SelectMic(Option<String>),
     SelectModel(String),
     SetAttn(f32),
@@ -25,6 +28,11 @@ pub enum TrayCmd {
 pub enum TrayStatus {
     Off,
     Active,
+    /// Chain alive, filter bypassed (raw voice) — gray mic icon.
+    Bypass,
+    /// Chain alive, output muted — red slashed-mic icon (privacy state,
+    /// must be visible at a glance).
+    Mute,
     Error,
 }
 
@@ -36,11 +44,15 @@ impl TrayStatus {
         match self {
             TrayStatus::Active => "hushmic-tray",
             TrayStatus::Off => "hushmic-tray-off",
+            TrayStatus::Bypass => "hushmic-tray-bypass",
+            TrayStatus::Mute => "hushmic-tray-mute",
             TrayStatus::Error => "hushmic-tray-error",
         }
     }
     pub fn title_suffix(&self) -> &'static str {
         match self {
+            TrayStatus::Bypass => " (bypass)",
+            TrayStatus::Mute => " (muted)",
             TrayStatus::Error => " (error)",
             _ => "",
         }
@@ -59,6 +71,9 @@ pub struct HushMicTray {
     /// default while the preferred mic is unplugged. Only affects how the
     /// missing-mic entry is labelled.
     pub fallback_active: bool,
+    /// The chain-alive processing mode (mirrors the Controller's). Only
+    /// meaningful while `cfg.enabled`; the mode radio shows Off otherwise.
+    pub mode: RunMode,
 }
 
 const MODELS: &[(&str, &str)] = &[
@@ -176,17 +191,17 @@ impl Tray for HushMicTray {
             .position(|(v, _)| (*v - self.cfg.attn_limit).abs() < 0.5)
             .unwrap_or(0);
 
-        vec![
-            CheckmarkItem {
-                label: "Enable noise suppression".into(),
-                checked: self.cfg.enabled,
-                activate: Box::new(|t: &mut Self| {
-                    t.cfg.enabled = !t.cfg.enabled;
-                    let _ = t.cmd_tx.send(TrayCmd::SetEnabled(t.cfg.enabled));
-                }),
-                ..Default::default()
+        let mode_selected = if !self.cfg.enabled {
+            3
+        } else {
+            match self.mode {
+                RunMode::Suppress => 0,
+                RunMode::Bypass => 1,
+                RunMode::Mute => 2,
             }
-            .into(),
+        };
+
+        vec![
             StandardItem {
                 label: if self.testing {
                     "Mic test running…".into()
@@ -198,6 +213,41 @@ impl Tray for HushMicTray {
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.cmd_tx.send(TrayCmd::TestMic);
                 }),
+                ..Default::default()
+            }
+            .into(),
+            SubMenu {
+                label: "Mode".into(),
+                submenu: vec![RadioGroup {
+                    selected: mode_selected,
+                    select: Box::new(|t: &mut Self, idx| {
+                        let sel = match idx {
+                            0 => Some(RunMode::Suppress),
+                            1 => Some(RunMode::Bypass),
+                            2 => Some(RunMode::Mute),
+                            _ => None, // Off
+                        };
+                        // Optimistic local update, same pattern as the other
+                        // items; the main loop pushes authoritative state back.
+                        match sel {
+                            Some(m) => {
+                                t.cfg.enabled = true;
+                                t.mode = m;
+                            }
+                            None => t.cfg.enabled = false,
+                        }
+                        let _ = t.cmd_tx.send(TrayCmd::SetMode(sel));
+                    }),
+                    options: ["Noise suppression", "Bypass", "Mute", "Off"]
+                        .iter()
+                        .map(|l| RadioItem {
+                            label: (*l).into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+                .into()],
                 ..Default::default()
             }
             .into(),
@@ -331,16 +381,90 @@ mod tests {
         assert_eq!(Active.icon_name(), "hushmic-tray");
         assert_eq!(Off.icon_name(), "hushmic-tray-off");
         assert_eq!(Error.icon_name(), "hushmic-tray-error");
-        assert_ne!(Off.icon_name(), Active.icon_name());
-        assert_ne!(Active.icon_name(), Error.icon_name());
-        assert_ne!(Off.icon_name(), Error.icon_name());
-        for s in [Off, Active, Error] {
+        assert_eq!(Bypass.icon_name(), "hushmic-tray-bypass");
+        assert_eq!(Mute.icon_name(), "hushmic-tray-mute");
+        let all = [Off, Active, Bypass, Mute, Error];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.icon_name(), b.icon_name(), "{a:?} vs {b:?}");
+            }
             assert!(
-                s.icon_name().starts_with("hushmic-tray"),
-                "{s:?} icon must come from the shipped hushmic-tray set"
+                a.icon_name().starts_with("hushmic-tray"),
+                "{a:?} icon must come from the shipped hushmic-tray set"
             );
         }
         assert_eq!(Error.title_suffix(), " (error)");
+        assert_eq!(Bypass.title_suffix(), " (bypass)");
+        assert_eq!(Mute.title_suffix(), " (muted)");
+    }
+
+    fn mode_radio(menu: &[MenuItem<HushMicTray>]) -> &RadioGroup<HushMicTray> {
+        // The mode radio lives in a "Mode" submenu right below "Test my
+        // mic…", matching the Microphone/Model/strength submenu pattern.
+        let MenuItem::SubMenu(s) = &menu[1] else {
+            panic!("second menu item must be the Mode submenu");
+        };
+        assert_eq!(s.label, "Mode");
+        match s.submenu.first() {
+            Some(MenuItem::RadioGroup(g)) => g,
+            _ => panic!("Mode submenu must hold the mode radio group"),
+        }
+    }
+
+    #[test]
+    fn mode_radio_labels_and_selection() {
+        let mut tray = test_tray(false); // Config::default() is enabled
+        let menu = tray.menu();
+        let g = mode_radio(&menu);
+        let labels: Vec<&str> = g.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Noise suppression", "Bypass", "Mute", "Off"]);
+        assert_eq!(g.selected, 0, "enabled + Suppress selects the first entry");
+
+        tray.mode = RunMode::Bypass;
+        assert_eq!(mode_radio(&tray.menu()).selected, 1);
+        tray.mode = RunMode::Mute;
+        assert_eq!(mode_radio(&tray.menu()).selected, 2);
+
+        // Disabled wins over whatever mode is remembered.
+        tray.cfg.enabled = false;
+        assert_eq!(mode_radio(&tray.menu()).selected, 3);
+    }
+
+    #[test]
+    fn mode_radio_select_sends_commands() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tray = HushMicTray {
+            cfg: Config::default(),
+            mics: vec![],
+            cmd_tx: tx,
+            status: TrayStatus::Active,
+            testing: false,
+            fallback_active: false,
+            mode: RunMode::Suppress,
+        };
+        let menu = tray.menu();
+        let g = mode_radio(&menu);
+
+        (g.select)(&mut tray, 2);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TrayCmd::SetMode(Some(RunMode::Mute)))
+        ));
+        assert!(tray.cfg.enabled, "mute is a chain-alive state");
+        assert_eq!(tray.mode, RunMode::Mute, "optimistic local state update");
+
+        (g.select)(&mut tray, 3);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SetMode(None))));
+        assert!(!tray.cfg.enabled, "Off maps onto the disable path");
+
+        // From Off, picking a chain-alive state re-enables with that mode.
+        (g.select)(&mut tray, 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TrayCmd::SetMode(Some(RunMode::Bypass)))
+        ));
+        assert!(tray.cfg.enabled);
+        assert!(rx.try_recv().is_err(), "exactly one command per activation");
     }
 
     #[test]
@@ -368,6 +492,7 @@ mod tests {
             status: TrayStatus::Off,
             testing,
             fallback_active: false,
+            mode: RunMode::Suppress,
         }
     }
 
@@ -460,6 +585,7 @@ mod tests {
             status: TrayStatus::Off,
             testing: false,
             fallback_active: false,
+            mode: RunMode::Suppress,
         };
         let menu = tray.menu();
         let item = mic_test_item(&menu);
@@ -481,6 +607,7 @@ mod tests {
             status: TrayStatus::Off,
             testing: false,
             fallback_active: false,
+            mode: RunMode::Suppress,
         };
         let menu = tray.menu();
         let pos = |label: &str| {
@@ -517,7 +644,7 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                vec!["Enable noise suppression", "Test my mic…"],
+                vec!["Test my mic…", "Mode"],
                 vec![
                     "Microphone",
                     "Model",

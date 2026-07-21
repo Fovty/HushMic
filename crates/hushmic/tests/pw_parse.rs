@@ -327,3 +327,18 @@ fn retry_probe_gives_up_after_attempts_and_stays_unknown() {
     assert_eq!(got, None);
     assert_eq!(calls, 3);
 }
+
+// --- live mode switching -----------------------------------------------------
+#[test]
+fn mode_param_arg_is_exact_spa_json() {
+    // The precise SPA-JSON pw-cli set-param accepts (verified against a live
+    // filter-chain); a syntax slip here fails silently at runtime.
+    assert_eq!(
+        hushmic::pipewire::mode_param_arg(2),
+        r#"{ params = [ "hushmic_dsp:Mode" 2 ] }"#
+    );
+    assert_eq!(
+        hushmic::pipewire::mode_param_arg(0),
+        r#"{ params = [ "hushmic_dsp:Mode" 0 ] }"#
+    );
+}

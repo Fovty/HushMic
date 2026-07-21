@@ -289,7 +289,7 @@ fn spa_escape(s: &str) -> String {
 /// The filter-chain is mono, 48 kHz, and (when a mic is chosen) pins the mic
 /// via `target.object`, plus the legacy `node.target` when `legacy_node_target`
 /// is set (PipeWire < 0.3.64 ignores `target.object`). Pure function — no I/O.
-pub fn render_conf(cfg: &Config, paths: &Paths, legacy_node_target: bool) -> String {
+pub fn render_conf(cfg: &Config, paths: &Paths, legacy_node_target: bool, mode: RunMode) -> String {
     // Pin the chosen mic; otherwise follow the system default capture device.
     // `target.object` is the modern key (PipeWire >= 0.3.64); older PipeWire
     // ignores it, so `legacy_node_target` additionally emits the pre-0.3.64
@@ -345,7 +345,7 @@ context.modules = [
             name   = hushmic_dsp
             plugin = "{plugin}"
             label  = "dpdfnet_mono"
-            control = {{ "Attenuation Limit (dB)" = {attn} }}
+            control = {{ "Attenuation Limit (dB)" = {attn} "Mode" = {mode} }}
           }}
         ]
       }}
@@ -370,8 +370,31 @@ context.modules = [
 "#,
         plugin = spa_escape(&paths.plugin_so.display().to_string()),
         attn = attn,
+        mode = mode.control_value(),
         target = target,
     )
+}
+
+/// Runtime processing mode of the chain-alive states. Ephemeral by design:
+/// never serialized to config — a muted mic must not survive into the next
+/// login unnoticed. Values mirror the plugin's "Mode" control port.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RunMode {
+    #[default]
+    Suppress,
+    Bypass,
+    Mute,
+}
+
+impl RunMode {
+    /// The plugin's "Mode" control port value.
+    pub fn control_value(&self) -> u8 {
+        match self {
+            RunMode::Suppress => 0,
+            RunMode::Bypass => 1,
+            RunMode::Mute => 2,
+        }
+    }
 }
 
 /// Owns the `pipewire -c` child that hosts the virtual mic, plus the prior
@@ -392,6 +415,11 @@ pub struct Controller {
     /// default). Set only once a child actually spawned; cleared by
     /// `disable()` — see [`Controller::active_mic`].
     active_mic: Option<String>,
+    /// The processing mode every spawn renders into the conf. Living here
+    /// (not per-`enable` argument) is what makes the mode survive automatic
+    /// restarts — mic recovery re-enabling the chain must never silently
+    /// unmute the mic.
+    mode: RunMode,
 }
 
 impl Controller {
@@ -403,7 +431,18 @@ impl Controller {
             set_default_active: false,
             spawned_at: None,
             active_mic: None,
+            mode: RunMode::default(),
         }
+    }
+
+    pub fn mode(&self) -> RunMode {
+        self.mode
+    }
+
+    /// Record the mode future spawns render into the conf. Does NOT touch a
+    /// running child — the live set-param path (or a restart) does that.
+    pub fn set_mode_state(&mut self, mode: RunMode) {
+        self.mode = mode;
     }
 
     /// The mic the RUNNING chain was rendered with (None = following the
@@ -514,7 +553,7 @@ impl Controller {
             attn_limit: eff_attn,
             ..cfg.clone()
         };
-        let conf = render_conf(&adjusted, &self.paths, legacy);
+        let conf = render_conf(&adjusted, &self.paths, legacy, self.mode);
         let path = conf_path();
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;

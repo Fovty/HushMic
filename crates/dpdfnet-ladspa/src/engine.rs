@@ -1,4 +1,5 @@
 use crate::attn::AttnLimiter;
+use crate::mode::{GainRamp, Mode};
 use crate::model::Model;
 use crate::stft::{Analysis, Synthesis, HOP, SPEC_LEN};
 use std::path::Path;
@@ -12,6 +13,7 @@ pub struct Engine {
     spec_e: [f32; SPEC_LEN],
     state_out: Vec<f32>,
     attn: AttnLimiter,
+    gain: GainRamp,
 }
 
 impl Engine {
@@ -28,6 +30,7 @@ impl Engine {
             spec_e: [0f32; SPEC_LEN],
             state_out,
             attn: AttnLimiter::new(),
+            gain: GainRamp::new(),
         })
     }
 
@@ -37,10 +40,18 @@ impl Engine {
         self.state.clear();
         self.state.extend_from_slice(&self.model.init_state);
         self.attn.reset();
+        self.gain.reset(); // unprimed again: the next set_mode snaps
     }
 
     pub fn set_attn_db(&mut self, db: f32) {
         self.attn.set_db(db);
+    }
+
+    /// The engine keeps running in every mode (state stays warm, transitions
+    /// are instant); bypass and mute only change what leaves it.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.attn.set_bypass(mode == Mode::Bypass);
+        self.gain.set_muted(mode == Mode::Mute);
     }
 
     /// `out_hop` is ALWAYS filled, even on `Err`: a transient model failure
@@ -72,8 +83,9 @@ impl Engine {
                 self.spec_e = [0f32; SPEC_LEN];
             }
         }
-        self.attn.apply(&self.spec, &mut self.spec_e); // blend noisy floor per dB cap
+        self.attn.apply(&self.spec, &mut self.spec_e); // blend noisy floor / bypass mix
         self.synthesis.add_frame(&self.spec_e, out_hop);
+        self.gain.process(out_hop); // mute ramp, after synthesis
         result
     }
 }
