@@ -114,8 +114,14 @@ pub fn render_status_human(s: &Status) -> String {
         }
     };
     format!(
-        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\nchain: {}\n",
-        s.version, mode, mic, s.model, s.attn_limit, chain
+        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\nlatency: {} ms added\nchain: {}\n",
+        s.version,
+        mode,
+        mic,
+        s.model,
+        s.attn_limit,
+        crate::controller::LATENCY_SAMPLES * 1000 / 48_000,
+        chain
     )
 }
 
@@ -131,6 +137,7 @@ pub fn render_status_json(s: &Status) -> String {
         },
         "model": s.model,
         "attn_limit": s.attn_limit,
+        "latency_samples": crate::controller::LATENCY_SAMPLES,
         "chain": {
             "running": s.chain_running,
             "node_present": s.node_present,
@@ -431,6 +438,7 @@ mod tests {
         assert_eq!(v["mic"]["fallback_active"], false);
         assert_eq!(v["model"], "dpdfnet8_48khz_hr");
         assert_eq!(v["attn_limit"], 100.0);
+        assert_eq!(v["latency_samples"], 2880);
         assert_eq!(v["chain"]["running"], true);
         assert_eq!(v["chain"]["node_present"], true);
     }
@@ -457,6 +465,7 @@ mod tests {
         let h = render_status_human(&s);
         assert!(h.contains("mute"), "{h}");
         assert!(h.contains("alsa_input.rode"), "{h}");
+        assert!(h.contains("60 ms"), "latency stated: {h}");
         assert!(!h.contains('{'), "no JSON braces in human output: {h}");
         // fallback state is spelled out when engaged
         let mut f = demo_status();

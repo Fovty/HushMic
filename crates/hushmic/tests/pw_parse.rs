@@ -342,3 +342,43 @@ fn mode_param_arg_is_exact_spa_json() {
         r#"{ params = [ "hushmic_dsp:Mode" 0 ] }"#
     );
 }
+
+// --- latency read-back -------------------------------------------------------
+#[test]
+fn parse_process_latency_from_real_pwcli_output() {
+    // Verbatim pw-cli enum-params output from a live PipeWire 1.6.8 chain
+    // with the report-only latency node.
+    let real = r#"  Object: size 80, type Spa:Pod:Object:Param:ProcessLatency (262156), id Spa:Enum:ParamId:ProcessLatency (16)
+    Prop: key Spa:Pod:Object:Param:ProcessLatency:quantum (1), flags 00000000
+      Float 0.000000
+    Prop: key Spa:Pod:Object:Param:ProcessLatency:rate (2), flags 00000000
+      Int 2880
+    Prop: key Spa:Pod:Object:Param:ProcessLatency:ns (3), flags 00000000
+      Long 0
+"#;
+    assert_eq!(hushmic::pipewire::parse_process_latency(real), Some(2880));
+    // an unreported chain publishes rate 0 -> treated as "not reported"
+    let zero = real.replace("Int 2880", "Int 0");
+    assert_eq!(hushmic::pipewire::parse_process_latency(&zero), None);
+    assert_eq!(hushmic::pipewire::parse_process_latency(""), None);
+    assert_eq!(
+        hushmic::pipewire::parse_process_latency("garbage\nno params here"),
+        None
+    );
+}
+
+#[test]
+fn strict_version_probe_is_pessimistic_on_junk() {
+    use hushmic::pipewire::parsed_version_at_least;
+    assert_eq!(
+        parsed_version_at_least("pipewire\nCompiled with libpipewire 1.6.8", (1, 6, 0)),
+        Some(true)
+    );
+    assert_eq!(
+        parsed_version_at_least("libpipewire 1.4.9", (1, 6, 0)),
+        Some(false)
+    );
+    assert_eq!(parsed_version_at_least("0.3.48", (1, 6, 0)), Some(false));
+    assert_eq!(parsed_version_at_least("no version here", (1, 6, 0)), None);
+    assert_eq!(parsed_version_at_least("", (1, 6, 0)), None);
+}

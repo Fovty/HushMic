@@ -43,6 +43,12 @@ pub struct Report {
     pub commands: Vec<(&'static str, bool)>,
     /// Tail of the filter-chain log; None = no log file yet.
     pub log_tail: Option<String>,
+    /// The filter-chain binary can declare latency (PipeWire >= 1.6).
+    pub latency_supported: bool,
+    /// Live read-back of what the running chain reports; None = nothing
+    /// reported (or no chain/probe). Only judged when a chain is up on a
+    /// supporting host.
+    pub latency_reported: Option<u32>,
 }
 
 /// Gather every fact — the I/O half. Never panics: anything un-probeable
@@ -120,6 +126,8 @@ pub fn collect() -> Report {
         log_tail: std::fs::read_to_string(log_path())
             .ok()
             .map(|s| tail(&s, 40)),
+        latency_supported: crate::pipewire::supports_latency_report(),
+        latency_reported: crate::pipewire::chain_reported_latency(),
     }
 }
 
@@ -202,6 +210,44 @@ pub fn render(r: &Report) -> (String, usize) {
             if r.instance_running { "yes" } else { "no" }
         ),
     );
+    {
+        use crate::controller::LATENCY_SAMPLES;
+        line(
+            &mut out,
+            false,
+            format!(
+                "chain latency: {} ms ({} samples @ 48 kHz)",
+                LATENCY_SAMPLES * 1000 / 48_000,
+                LATENCY_SAMPLES
+            ),
+        );
+        // The read-back is a verdict only when there is a chain to ask on
+        // a host that can carry the declaration; otherwise a plain fact.
+        let chain_up = r.hushmic_present == Some(true);
+        let (bad, s) = if !chain_up {
+            (false, "  reported to PipeWire: (chain not running)".into())
+        } else if !r.latency_supported {
+            (
+                false,
+                "  reported to PipeWire: no (PipeWire 1.6+ required)".into(),
+            )
+        } else {
+            match r.latency_reported {
+                Some(n) if n == LATENCY_SAMPLES => {
+                    (false, format!("  reported to PipeWire: yes ({n})"))
+                }
+                Some(n) => (
+                    true,
+                    format!("  reported to PipeWire: mismatch ({n}, declared {LATENCY_SAMPLES})"),
+                ),
+                None => (
+                    true,
+                    "  reported to PipeWire: missing (declaration not in effect)".into(),
+                ),
+            }
+        };
+        line(&mut out, bad, s);
+    }
     match &r.sources {
         Some(s) if s.is_empty() => line(&mut out, false, "sources: 0".into()),
         Some(s) => line(
@@ -412,7 +458,63 @@ mod tests {
             }],
             commands: vec![("pw-dump", true), ("pw-cli", true)],
             log_tail: Some("[hushmic] chain up\n".into()),
+            latency_supported: true,
+            latency_reported: Some(2880),
         }
+    }
+
+    #[test]
+    fn latency_facts_render_and_verify() {
+        let (text, problems) = render(&healthy());
+        assert_eq!(problems, 0);
+        assert!(
+            text.contains("chain latency: 60 ms (2880 samples @ 48 kHz)"),
+            "{text}"
+        );
+        assert!(text.contains("reported to PipeWire: yes (2880)"), "{text}");
+    }
+
+    #[test]
+    fn latency_declaration_not_in_effect_is_a_problem() {
+        // Supported host, chain up — but the read-back is missing or wrong:
+        // the declaration is not in effect, which is exactly the bug class
+        // --doctor exists to catch.
+        let mut r = healthy();
+        r.latency_reported = None;
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        let line = text.lines().find(|l| l.contains("reported to")).unwrap();
+        assert!(line.starts_with("!!"), "{line}");
+
+        let mut r = healthy();
+        r.latency_reported = Some(480);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(
+            text.contains("480"),
+            "mismatch shows the wrong value: {text}"
+        );
+    }
+
+    #[test]
+    fn latency_unsupported_host_is_a_plain_fact() {
+        let mut r = healthy();
+        r.latency_supported = false;
+        r.latency_reported = None;
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("no (PipeWire 1.6+ required)"), "{text}");
+    }
+
+    #[test]
+    fn latency_readback_skipped_without_a_chain() {
+        let mut r = healthy();
+        r.hushmic_present = Some(false);
+        r.enabled = false; // absent node while disabled is a plain fact
+        r.latency_reported = None;
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("(chain not running)"), "{text}");
     }
 
     #[test]

@@ -288,8 +288,17 @@ fn spa_escape(s: &str) -> String {
 ///
 /// The filter-chain is mono, 48 kHz, and (when a mic is chosen) pins the mic
 /// via `target.object`, plus the legacy `node.target` when `legacy_node_target`
-/// is set (PipeWire < 0.3.64 ignores `target.object`). Pure function — no I/O.
-pub fn render_conf(cfg: &Config, paths: &Paths, legacy_node_target: bool, mode: RunMode) -> String {
+/// is set (PipeWire < 0.3.64 ignores `target.object`). With `report_latency`
+/// a report-only builtin `delay` node follows the DSP so PipeWire >= 1.6
+/// declares the chain's algorithmic latency to consumers (OBS A/V sync);
+/// see [`LATENCY_SAMPLES`]. Pure function — no I/O.
+pub fn render_conf(
+    cfg: &Config,
+    paths: &Paths,
+    legacy_node_target: bool,
+    mode: RunMode,
+    report_latency: bool,
+) -> String {
     // Pin the chosen mic; otherwise follow the system default capture device.
     // `target.object` is the modern key (PipeWire >= 0.3.64); older PipeWire
     // ignores it, so `legacy_node_target` additionally emits the pre-0.3.64
@@ -312,6 +321,23 @@ pub fn render_conf(cfg: &Config, paths: &Paths, legacy_node_target: bool, mode: 
         cfg.attn_limit.clamp(0.0, 100.0)
     } else {
         100.0
+    };
+    // Report-only latency node: `Delay (s) = 0.0` never delays audio; the
+    // `latency` config (seconds, derived from the samples constant so the
+    // two cannot drift) is what filter-chain >= 1.6 folds into the
+    // propagated latency. Gated: 0.3.48 has no delay builtin at all — the
+    // node would kill the chain there — and < 1.6 would ignore the key.
+    let (latency_node, links) = if report_latency {
+        let secs = LATENCY_SAMPLES as f64 / 48_000.0;
+        (
+            format!(
+                "\n          {{ type   = builtin\n            name   = hushmic_latency\n            label  = delay\n            config = {{ \"max-delay\" = 0.001 \"latency\" = {secs} }}\n            control = {{ \"Delay (s)\" = 0.0 }}\n          }}"
+            ),
+            "\n        links = [\n          { output = \"hushmic_dsp:Output\" input = \"hushmic_latency:In\" }\n        ]"
+                .to_string(),
+        )
+    } else {
+        (String::new(), String::new())
     };
     format!(
         r#"# hushmic self-contained PipeWire filter-chain host (generated; do not edit).
@@ -346,8 +372,8 @@ context.modules = [
             plugin = "{plugin}"
             label  = "dpdfnet_mono"
             control = {{ "Attenuation Limit (dB)" = {attn} "Mode" = {mode} }}
-          }}
-        ]
+          }}{latency_node}
+        ]{links}
       }}
       capture.props = {{
         node.name      = "hushmic_input"
@@ -372,8 +398,19 @@ context.modules = [
         attn = attn,
         mode = mode.control_value(),
         target = target,
+        latency_node = latency_node,
+        links = links,
     )
 }
+
+/// The chain's algorithmic latency in samples at 48 kHz: 480 (STFT
+/// framing) + 1920 (the model's 4-hop group delay) + 480 (the plugin's
+/// one-hop output prefill) = 2880 = 60 ms. MEASURED, not derived — the
+/// dpdfnet-ladspa `latency_probe` tests push impulses and real speech
+/// through the actual DSP and pin the engine part at exactly 2400 for
+/// both models; change the DSP and those tests force this constant to be
+/// re-derived. PipeWire adds its own quantum/device buffering on top.
+pub const LATENCY_SAMPLES: u32 = 2880;
 
 /// Runtime processing mode of the chain-alive states. Ephemeral by design:
 /// never serialized to config — a muted mic must not survive into the next
@@ -546,6 +583,7 @@ impl Controller {
         // PipeWire < 0.3.64 ignores target.object; emit the legacy node.target
         // too so mic selection is honored there (Ubuntu 22.04 ships 0.3.48).
         let legacy = !pipewire::supports_target_object();
+        let report_latency = pipewire::supports_latency_report();
         // One adjusted copy carries every effective value (mic + profile).
         let adjusted = Config {
             mic: effective_mic.clone(),
@@ -553,7 +591,7 @@ impl Controller {
             attn_limit: eff_attn,
             ..cfg.clone()
         };
-        let conf = render_conf(&adjusted, &self.paths, legacy, self.mode);
+        let conf = render_conf(&adjusted, &self.paths, legacy, self.mode, report_latency);
         let path = conf_path();
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;

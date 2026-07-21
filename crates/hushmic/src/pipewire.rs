@@ -395,6 +395,75 @@ pub fn supports_target_object() -> bool {
     }
 }
 
+/// Whether the filter-chain HOST binary supports the report-only latency
+/// node (builtin `delay` grew its `latency` config and the graph latency
+/// propagation in PipeWire 1.6.0). The BINARY's version matters, not the
+/// daemon's — `pipewire -c` is what hosts the graph, and in the flatpak
+/// that is the bundled binary this same probe resolves to. Failure is
+/// CONSERVATIVE (false): emitting the node on an unknown host risks
+/// 0.3.48's missing-builtin chain kill, while omitting it only costs the
+/// latency report.
+pub fn supports_latency_report() -> bool {
+    match Command::new("pipewire").arg("--version").output() {
+        // strict, unlike pw_version_at_least's optimistic unparseable
+        // default: no recognizable version token means NO node
+        Ok(o) => {
+            parsed_version_at_least(&String::from_utf8_lossy(&o.stdout), (1, 6, 0)).unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Like [`pw_version_at_least`] but `None` when no `a.b.c` token parses,
+/// for probes whose safe default is pessimistic. Pure.
+pub fn parsed_version_at_least(text: &str, min: (u32, u32, u32)) -> Option<bool> {
+    for tok in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        let parts: Vec<&str> = tok.split('.').collect();
+        if parts.len() >= 3 {
+            if let (Ok(a), Ok(b), Ok(c)) = (
+                parts[0].parse::<u32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            ) {
+                return Some((a, b, c) >= min);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the `rate` (samples) field from `pw-cli enum-params <id>
+/// ProcessLatency` output. `None` for absent/zero/unparseable — a chain
+/// that reports nothing publishes rate 0. Pure.
+pub fn parse_process_latency(text: &str) -> Option<u32> {
+    let mut in_rate = false;
+    for l in text.lines() {
+        if in_rate {
+            if let Some(v) = l.trim().strip_prefix("Int ") {
+                return v.trim().parse::<u32>().ok().filter(|&n| n > 0);
+            }
+            in_rate = false;
+        }
+        if l.contains("ProcessLatency:rate") {
+            in_rate = true;
+        }
+    }
+    None
+}
+
+/// Live read-back of the latency the RUNNING chain reports to PipeWire —
+/// no audio involved, just params. `None` = chain absent, pw-cli failed,
+/// or nothing reported (old host or missing declaration).
+pub fn chain_reported_latency() -> Option<u32> {
+    let id = node_id("hushmic_input")?;
+    let out = Command::new("pw-cli")
+        .args(["enum-params", &id.to_string(), "ProcessLatency"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    parse_process_latency(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// The HOST daemon's version from a `pw-dump` snapshot: the
 /// `PipeWire:Interface:Core` object's `info.version`. This is the daemon
 /// being talked to, regardless of which pw-* binaries do the talking. Pure.

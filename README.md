@@ -183,7 +183,7 @@ autostart   = false                        # launch on login
 
 **Does my audio go anywhere?** No. Everything runs locally on the CPU; nothing is uploaded.
 
-**How much latency does it add?** About 20 ms of processing (two 10 ms hops: the causal STFT overlap-add plus one hop of output buffering), plus PipeWire's normal buffering. Fine for calls, conferences, and gaming.
+**How much latency does it add?** 60 ms of processing (10 ms STFT framing, 40 ms of model context — the network needs a few frames of audio before its answer for a given moment is ready — and 10 ms of output buffering), plus PipeWire's normal buffering. On PipeWire 1.6+ HushMic reports this to the graph so apps like OBS compensate automatically. Fine for calls, conferences, and gaming.
 
 **How much CPU?** Roughly a third of one core in real time (RTF ~0.3) for the quality model; switch to `dpdfnet2` in the tray if you want it lighter.
 
