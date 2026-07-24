@@ -5,8 +5,7 @@ are not tied to specific releases yet.
 
 ## Next
 
-- Nothing locked in yet — the strongest candidate is the incoming voice
-  cleanup under *Exploring* below.
+- Nothing locked in currently
 
 ## Shipped
 
