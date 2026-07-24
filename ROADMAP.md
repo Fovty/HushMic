@@ -5,14 +5,15 @@ are not tied to specific releases yet.
 
 ## Next
 
-- **Seamless bypass and mute**: keep the HushMic virtual device present while
-  passing through raw audio or outputting silence.
-- **CLI and shortcut controls**: expose bypass, mute, and status commands for
-  desktop shortcuts and integrations; explore global shortcuts and
-  push-to-talk where supported.
+- Nothing locked in yet — the strongest candidate is the incoming voice
+  cleanup under *Exploring* below.
 
 ## Shipped
 
+- **v0.5.0**: seamless bypass and mute, a scriptable CLI
+  (`hushmic status | mode | toggle`), global keyboard shortcuts with
+  push-to-talk and push-to-mute (desktop portal), and accurate latency
+  reporting to PipeWire.
 - **v0.4.0**: better microphone recovery, per-microphone preferences, and
   built-in diagnostics (`hushmic --doctor`).
 

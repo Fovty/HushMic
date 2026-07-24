@@ -85,13 +85,13 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.4.0-1_amd64.deb
-sudo apt install ./hushmic_0.4.0-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.5.0-1_amd64.deb
+sudo apt install ./hushmic_0.5.0-1_amd64.deb
 ```
 
 > On stock **Ubuntu 22.04** apt refuses with a `pipewire-media-session`/`wireplumber`
 > conflict (22.04 still ships the deprecated session manager). Install with
-> `sudo apt install ./hushmic_0.4.0-1_amd64.deb wireplumber pipewire-media-session-`
+> `sudo apt install ./hushmic_0.5.0-1_amd64.deb wireplumber pipewire-media-session-`
 > (the trailing `-` swaps it out), then log out and back in.
 
 **Arch Linux** (AUR):

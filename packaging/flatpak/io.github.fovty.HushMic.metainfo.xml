@@ -49,6 +49,19 @@
   </screenshots>
 
   <releases>
+    <release version="0.5.0" date="2026-07-24">
+      <description>
+        <p>
+          Mute and bypass without disconnecting: the new Mode menu switches
+          instantly between noise suppression, raw voice, and a hard mute.
+          Control everything from scripts (hushmic status | mode | toggle)
+          or bind global keyboard shortcuts — including push-to-talk and
+          push-to-mute — through your desktop's own shortcut dialog. HushMic
+          also reports its true 60 ms processing latency to PipeWire so
+          recording apps can compensate automatically.
+        </p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-07-19">
       <description>
         <p>
