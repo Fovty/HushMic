@@ -158,9 +158,10 @@ Exit codes: `0` ok, `1` invalid usage or a failed command, `2` HushMic is not ru
 </p>
 
 <details>
-<summary><b>More screenshots</b> — microphone picker, model picker, suppression strength</summary>
+<summary><b>More screenshots</b> — mode switcher, microphone picker, model picker, suppression strength</summary>
 
 <p align="center">
+  <img src="docs/img/hushmic-menu-mode.png" alt="Mode switcher" width="360">
   <img src="docs/img/hushmic-menu-microphone.png" alt="Microphone picker" width="360">
   <img src="docs/img/hushmic-menu-model.png" alt="Model picker" width="360">
   <img src="docs/img/hushmic-menu-suppression.png" alt="Suppression strength" width="310">
