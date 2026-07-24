@@ -26,6 +26,12 @@ pub struct Config {
     /// byte-identical.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub mic_prefs: BTreeMap<String, MicPrefs>,
+    /// The user has been through the portal's shortcut-binding dialog
+    /// once (the compositor owns the actual key assignments — we persist
+    /// no key names, only whether to silently re-register at startup).
+    /// Skipped while false so pre-feature configs stay byte-identical.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shortcuts_setup: bool,
 }
 
 impl Default for Config {
@@ -41,6 +47,7 @@ impl Default for Config {
             set_default: false,
             autostart: false,
             mic_prefs: BTreeMap::new(),
+            shortcuts_setup: false,
         }
     }
 }
@@ -187,6 +194,25 @@ mod tests {
         let c: Config = toml::from_str(old).unwrap();
         assert!(c.mic_prefs.is_empty());
         assert_eq!(c.attn_limit, 87.0);
+    }
+
+    #[test]
+    fn shortcuts_setup_defaults_false_and_stays_absent_until_used() {
+        // Existing configs stay byte-identical until the user sets up
+        // shortcuts once; afterwards the bool round-trips.
+        assert!(!Config::default().shortcuts_setup);
+        let plain = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!plain.contains("shortcuts_setup"), "{plain}");
+        let c = Config {
+            shortcuts_setup: true,
+            ..Config::default()
+        };
+        let s = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert!(back.shortcuts_setup);
+        let old = "enabled = true\n";
+        let c: Config = toml::from_str(old).unwrap();
+        assert!(!c.shortcuts_setup);
     }
 
     #[test]

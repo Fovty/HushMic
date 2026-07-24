@@ -13,5 +13,6 @@ pub mod notify;
 pub mod pipewire;
 pub mod portal;
 pub mod sandbox;
+pub mod shortcuts;
 pub mod tray;
 pub mod watchdog;

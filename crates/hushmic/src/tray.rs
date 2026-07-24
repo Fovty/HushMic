@@ -20,6 +20,8 @@ pub enum TrayCmd {
     SetDefaultToggle(bool),
     SetAutostart(bool),
     TestMic,
+    /// Open the compositor's shortcut-binding dialog (portal BindShortcuts).
+    SetupShortcuts,
     About,
     Quit,
 }
@@ -74,6 +76,11 @@ pub struct HushMicTray {
     /// The chain-alive processing mode (mirrors the Controller's). Only
     /// meaningful while `cfg.enabled`; the mode radio shows Off otherwise.
     pub mode: RunMode,
+    /// The GlobalShortcuts portal answered our probe (session up, events
+    /// flowing). Flipped by the main loop via handle.update; gates the
+    /// "Set up shortcuts…" entry the way can_set_default gates the
+    /// default-mic checkbox — hidden, not explained.
+    pub shortcuts_available: bool,
 }
 
 const MODELS: &[(&str, &str)] = &[
@@ -336,6 +343,27 @@ impl Tray for HushMicTray {
                 ..Default::default()
             }
             .into(),
+            StandardItem {
+                // Before setup: the compositor's bind dialog. After: its
+                // shortcut editor (ConfigureShortcuts) — the bind dialog
+                // only ever shows for unconfigured shortcuts, so the label
+                // must promise what the click actually does.
+                label: if self.cfg.shortcuts_setup {
+                    "Change shortcuts…"
+                } else {
+                    "Set up shortcuts…"
+                }
+                .into(),
+                // The compositor owns the keys and the dialog; this entry
+                // only opens it. Hidden while the portal has not answered
+                // (no GlobalShortcuts on this desktop, or it is down).
+                visible: self.shortcuts_available,
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.cmd_tx.send(TrayCmd::SetupShortcuts);
+                }),
+                ..Default::default()
+            }
+            .into(),
             MenuItem::Separator,
             CheckmarkItem {
                 label: "Start on login".into(),
@@ -441,6 +469,7 @@ mod tests {
             testing: false,
             fallback_active: false,
             mode: RunMode::Suppress,
+            shortcuts_available: false,
         };
         let menu = tray.menu();
         let g = mode_radio(&menu);
@@ -493,6 +522,7 @@ mod tests {
             testing,
             fallback_active: false,
             mode: RunMode::Suppress,
+            shortcuts_available: false,
         }
     }
 
@@ -586,6 +616,7 @@ mod tests {
             testing: false,
             fallback_active: false,
             mode: RunMode::Suppress,
+            shortcuts_available: false,
         };
         let menu = tray.menu();
         let item = mic_test_item(&menu);
@@ -608,6 +639,7 @@ mod tests {
             testing: false,
             fallback_active: false,
             mode: RunMode::Suppress,
+            shortcuts_available: false,
         };
         let menu = tray.menu();
         let pos = |label: &str| {
@@ -624,6 +656,56 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(TrayCmd::About)),
             "activating the item must send TrayCmd::About"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one command per activation");
+    }
+
+    fn shortcuts_item(menu: &[MenuItem<HushMicTray>]) -> &StandardItem<HushMicTray> {
+        menu.iter()
+            .find_map(|i| match i {
+                MenuItem::Standard(s) if s.label.ends_with("shortcuts…") => Some(s),
+                _ => None,
+            })
+            .expect("shortcuts item present in the layout")
+    }
+
+    #[test]
+    fn shortcuts_label_flips_once_set_up() {
+        // Fresh install: first-time wording. After the bind dialog has
+        // succeeded once, the click opens the compositor's editor and the
+        // label must promise that instead.
+        let mut tray = test_tray(false);
+        assert_eq!(shortcuts_item(&tray.menu()).label, "Set up shortcuts…");
+        tray.cfg.shortcuts_setup = true;
+        assert_eq!(shortcuts_item(&tray.menu()).label, "Change shortcuts…");
+    }
+
+    #[test]
+    fn shortcuts_item_is_portal_gated_and_sends_the_command() {
+        // No portal answered (the default): hidden, not explained — the
+        // can_set_default pattern. The item still exists in the layout so
+        // visibility can flip without a menu rebuild.
+        let tray = test_tray(false);
+        assert!(!shortcuts_item(&tray.menu()).visible);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tray = HushMicTray {
+            cfg: Config::default(),
+            mics: vec![],
+            cmd_tx: tx,
+            status: TrayStatus::Off,
+            testing: false,
+            fallback_active: false,
+            mode: RunMode::Suppress,
+            shortcuts_available: true,
+        };
+        let menu = tray.menu();
+        let item = shortcuts_item(&menu);
+        assert!(item.visible, "portal present => entry visible");
+        (item.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv(), Ok(TrayCmd::SetupShortcuts)),
+            "activating the item must send TrayCmd::SetupShortcuts"
         );
         assert!(rx.try_recv().is_err(), "exactly one command per activation");
     }
@@ -650,6 +732,7 @@ mod tests {
                     "Model",
                     "Suppression strength",
                     "Set as default microphone",
+                    "Set up shortcuts…",
                 ],
                 vec!["Start on login", "About HushMic…", "Quit"],
             ]

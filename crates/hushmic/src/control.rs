@@ -51,29 +51,38 @@ pub fn mode_word(sel: Option<RunMode>) -> &'static str {
 }
 
 /// The toggle transition: entering `target` unless already there, in which
-/// case return to the remembered previous chain-alive state. Never yields
-/// Off — a mute hotkey must not kill the mic entirely.
+/// case return to the remembered previous AUDIBLE state. Never yields Off
+/// (a mute hotkey must not kill the mic entirely), and leaving `target`
+/// when the memory IS `target` falls to suppression — the return leg must
+/// always change something.
 pub fn toggle_next(
     current: Option<RunMode>,
     prev_alive: RunMode,
     target: RunMode,
 ) -> Option<RunMode> {
     if current == Some(target) {
-        Some(prev_alive)
+        Some(if prev_alive == target {
+            RunMode::Suppress
+        } else {
+            prev_alive
+        })
     } else {
         Some(target)
     }
 }
 
-/// Update the remembered previous chain-alive state after a transition
-/// `old -> new` (from ANY path — tray radio or CLI — so both round-trip).
-/// Coming out of Off remembers suppress: toggle's return leg must never
-/// resurrect Off.
+/// Update the remembered previous AUDIBLE state after a transition
+/// `old -> new` (from ANY path — tray radio, CLI or hotkey — so all of
+/// them round-trip). Only suppress/bypass are ever remembered: every
+/// return leg (untoggle, push-to-talk hold, push-to-mute release) exists
+/// to make the user AUDIBLE, so remembering Mute would turn toggle-bypass
+/// into a mute/bypass loop — and Off must never be resurrected either
+/// (coming out of Off remembers suppress).
 pub fn update_prev_alive(prev: RunMode, old: Option<RunMode>, new: Option<RunMode>) -> RunMode {
     match (old, new) {
         (None, Some(_)) => RunMode::Suppress,
-        (Some(m), Some(n)) if m != n => m,
-        (Some(m), None) => m,
+        (Some(m), Some(n)) if m != n && m != RunMode::Mute => m,
+        (Some(m), None) if m != RunMode::Mute => m,
         _ => prev,
     }
 }
@@ -394,6 +403,36 @@ mod tests {
         assert_eq!(update_prev_alive(Bypass, None, Some(Mute)), Suppress);
         // going Off keeps the last live state (harmless, next enable resets)
         assert_eq!(update_prev_alive(Suppress, Some(Bypass), None), Bypass);
+        // Mute is never a return address: it is the state toggles LEAVE,
+        // and every return leg (untoggle, PTT hold, PtM release) exists to
+        // make the user audible again.
+        assert_eq!(
+            update_prev_alive(Suppress, Some(Mute), Some(Bypass)),
+            Suppress
+        );
+        assert_eq!(update_prev_alive(Bypass, Some(Mute), None), Bypass);
+    }
+
+    #[test]
+    fn toggle_bypass_alternates_with_suppression_never_mute() {
+        use RunMode::*;
+        // Muted, then toggle-bypass repeatedly: the result must
+        // alternate bypass <-> suppression — never fall back into mute.
+        let (mut sel, mut prev) = (Some(Suppress), Suppress);
+        for (target, want) in [
+            (Mute, Mute),       // mute first
+            (Bypass, Bypass),   // toggle-bypass: audible in bypass
+            (Bypass, Suppress), // again: the OTHER processing mode, not mute
+            (Bypass, Bypass),   // and back
+        ] {
+            let next = toggle_next(sel, prev, target);
+            assert_eq!(next, Some(want), "toggle {target:?} from {sel:?}");
+            prev = update_prev_alive(prev, sel, next);
+            sel = next;
+        }
+        // Degenerate corner: bypass -> mute -> bypass leaves prev == Bypass;
+        // toggling bypass out of bypass must not be a no-op.
+        assert_eq!(toggle_next(Some(Bypass), Bypass, Bypass), Some(Suppress));
     }
 
     #[test]

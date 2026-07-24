@@ -4,7 +4,7 @@ use hushmic::controller::{self, Controller, Paths, RunMode};
 use hushmic::notify::{self, FailureGate, Slot};
 use hushmic::pipewire;
 use hushmic::tray::{HushMicTray, TrayCmd, TrayStatus};
-use hushmic::{autostart, lock, mictest, watchdog};
+use hushmic::{autostart, lock, mictest, shortcuts, watchdog};
 use ksni::blocking::TrayMethods;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -26,6 +26,9 @@ enum Event {
     /// A CLI request from the control socket; the reply goes back through
     /// the embedded sender once the outcome is known.
     Control(control::ControlReq),
+    /// A report from the global-shortcuts portal worker: availability,
+    /// key events, or a finished bind dialog.
+    Shortcut(shortcuts::PortalEvent),
     Shutdown,
 }
 
@@ -520,6 +523,7 @@ fn main() {
             testing: false,
             fallback_active: false,
             mode: RunMode::default(),
+            shortcuts_available: false,
         };
         // Inside a Flatpak the session-bus proxy only lets us own names under
         // our app ID, so registering the spec's well-known
@@ -628,6 +632,23 @@ fn main() {
             }
         });
     }
+    // Global-shortcuts portal worker + the same bridge shape into the
+    // event channel. Spawned unconditionally: on a desktop without the
+    // portal it reports Unavailable once and then only speaks when the
+    // Tick arm nudges it (backoff-gated), so there is no hot loop.
+    let shortcuts_cmd = {
+        let (sc_tx, sc_rx) = mpsc::channel::<shortcuts::PortalEvent>();
+        let worker = shortcuts::spawn(sc_tx, cfg.shortcuts_setup);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for pe in sc_rx {
+                if tx.send(Event::Shortcut(pe)).is_err() {
+                    break;
+                }
+            }
+        });
+        worker
+    };
 
     // Gate for failure/recovery notifications: dedups the watchdog's
     // backoff-gated retries so the same error does not re-pop forever.
@@ -706,6 +727,13 @@ fn main() {
     // Last hushmic_source probe verdict, refreshed by Tick and the Cmd
     // epilogue — `status` reports it instead of re-probing on the hot path.
     let mut last_node_present: Option<bool> = None;
+    // Shortcuts portal state: None until the worker's first report;
+    // Some(false) makes Tick nudge a reconnect, throttled by the backoff.
+    let mut shortcuts_up: Option<bool> = None;
+    let mut shortcuts_backoff = watchdog::Backoff::new();
+    // What the hold keys are doing (push-to-mute's armed release,
+    // push-to-talk's dangling-hold re-mute) — see shortcuts::Holds.
+    let mut shortcut_holds = shortcuts::Holds::default();
 
     for ev in rx {
         // Mutating control requests become synthetic SetMode commands so
@@ -760,6 +788,78 @@ fn main() {
                         control_reply = Some(req.reply);
                         Event::Cmd(TrayCmd::SetMode(sel))
                     }
+                }
+            }
+            // Shortcut key events run the press/release machine and, when
+            // it selects a mode, become synthetic SetMode commands — the
+            // same one state machine as the tray radio and the CLI.
+            // Housekeeping reports are absorbed here.
+            Event::Shortcut(pe) => {
+                use shortcuts::PortalEvent as PE;
+                let transition = |a, activated: bool, holds: &mut shortcuts::Holds| {
+                    let cur = cfg.enabled.then(|| controller.mode());
+                    shortcuts::shortcut_transition(a, activated, cur, prev_alive, holds)
+                };
+                match pe {
+                    PE::Available => {
+                        shortcuts_up = Some(true);
+                        shortcuts_backoff.record(true);
+                        let _ = handle.update(|t: &mut HushMicTray| t.shortcuts_available = true);
+                        continue;
+                    }
+                    PE::Unavailable => {
+                        shortcuts_up = Some(false);
+                        shortcuts_backoff.record(false);
+                        let _ = handle.update(|t: &mut HushMicTray| t.shortcuts_available = false);
+                        // A session death mid-push-to-talk loses the
+                        // release forever — the key promised "live only
+                        // while held", so err toward muted and re-mute.
+                        let ptt_dangling = shortcut_holds.ptt_held();
+                        shortcut_holds.reset();
+                        if ptt_dangling && cfg.enabled && controller.mode() != RunMode::Mute {
+                            eprintln!("[hushmic] portal session died mid push-to-talk: muting");
+                            Event::Cmd(TrayCmd::SetMode(Some(RunMode::Mute)))
+                        } else {
+                            continue;
+                        }
+                    }
+                    PE::BindDone => {
+                        // The compositor's dialog returned: from now on
+                        // every start re-binds silently so events flow,
+                        // and the menu entry becomes "Change shortcuts…".
+                        cfg.shortcuts_setup = true;
+                        if let Err(e) = cfg.save() {
+                            // Unsaved, the next start neither re-binds
+                            // silently nor shows "Change shortcuts…" —
+                            // leave the one user hitting this a trace.
+                            eprintln!("[hushmic] could not persist shortcuts_setup: {e}");
+                        }
+                        let snapshot = cfg.clone();
+                        let _ = handle.update(move |t: &mut HushMicTray| t.cfg = snapshot);
+                        continue;
+                    }
+                    PE::ConfigureUnavailable => {
+                        // No ConfigureShortcuts on this portal (v1) or the
+                        // call failed: a click that silently does nothing
+                        // is the one thing this entry must never be.
+                        notify::send(
+                            Slot::Status,
+                            "preferences-desktop-keyboard",
+                            "HushMic shortcuts",
+                            "This desktop cannot open the shortcut editor from \
+                             here. Look for HushMic in your system's keyboard \
+                             shortcut settings to change the keys.",
+                        );
+                        continue;
+                    }
+                    PE::Activated(a) => match transition(a, true, &mut shortcut_holds) {
+                        Some(sel) => Event::Cmd(TrayCmd::SetMode(sel)),
+                        None => continue,
+                    },
+                    PE::Deactivated(a) => match transition(a, false, &mut shortcut_holds) {
+                        Some(sel) => Event::Cmd(TrayCmd::SetMode(sel)),
+                        None => continue,
+                    },
                 }
             }
             other => other,
@@ -917,6 +1017,21 @@ fn main() {
                             }
                         }
                     }
+                    TrayCmd::SetupShortcuts => {
+                        // First time: the compositor's bind dialog (the
+                        // worker reports BindDone, which persists
+                        // shortcuts_setup). Once set up, compositors show
+                        // the bind dialog only for UNconfigured shortcuts
+                        // (KDE re-binds silently, and the portal allows one
+                        // bind attempt per session) — so the click becomes
+                        // ConfigureShortcuts, the portal's change-keys UI.
+                        let cmd = if cfg.shortcuts_setup {
+                            shortcuts::Cmd::Configure
+                        } else {
+                            shortcuts::Cmd::Bind
+                        };
+                        let _ = shortcuts_cmd.send(cmd);
+                    }
                     TrayCmd::About => {
                         // Same PDEATHSIG child pattern as the A/B window; a
                         // failure to open is log-only (nothing to fall back
@@ -1050,6 +1165,12 @@ fn main() {
                 });
             }
             Event::Tick => {
+                // Nudge a dead/absent shortcuts portal back to life,
+                // through the backoff so a desktop without the portal sees
+                // a rare gentle probe, never a hot loop.
+                if shortcuts_up == Some(false) && shortcuts_backoff.should_attempt() {
+                    let _ = shortcuts_cmd.send(shortcuts::Cmd::Retry);
+                }
                 // Reap finished About windows (exit status is irrelevant:
                 // they are informational, closing one is not a failure to
                 // react to). Still-running children are kept for next Tick.
@@ -1303,6 +1424,7 @@ fn main() {
             // consumed by the preprocessing above (answered inline or
             // rewritten into a synthetic SetMode command)
             Event::Control(_) => unreachable!("control requests are preprocessed"),
+            Event::Shortcut(_) => unreachable!("shortcut events are preprocessed"),
         }
     }
     // Orderly shutdown removes the control socket; a crash leaves it for

@@ -137,6 +137,8 @@ hushmic --doctor # print a diagnostics report (exits 1 if it finds problems)
 
 A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The **Mode** menu switches between noise suppression, **bypass** (your raw voice, mic stays connected) and **mute** (a hardware-level cutoff no app can un-mute) — switches are instant, with no reconnect in your call. The menu also has the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, start-on-login, and **About**.
 
+**Global shortcuts**: click **Set up shortcuts…** in the menu and your desktop's own key-binding dialog opens — assign keys to **Toggle mute**, **Toggle bypass**, **Push to talk** (live only while the key is held) and **Push to mute** (hold-to-silence — a cough button). The compositor grabs the keys, so they work while you're in any app, and they use the same instant mode switching as the menu. Once set up, the entry becomes **Change shortcuts…** and opens your desktop's shortcut editor (the keys also appear in your system's keyboard-shortcut settings). This needs a desktop with the GlobalShortcuts portal (KDE Plasma, GNOME 45+); elsewhere the entry stays hidden — bind the CLI below in your desktop's shortcut settings instead. (Starting HushMic from a terminal additionally needs xdg-desktop-portal 1.18+ so it can identify itself to the portal; app-menu and autostart launches work regardless.)
+
 The same controls are scriptable — bind them to hotkeys (KDE custom shortcuts, sxhkd, a Stream Deck):
 
 ```bash
