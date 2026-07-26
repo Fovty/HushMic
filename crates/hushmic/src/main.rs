@@ -49,6 +49,18 @@ const FLAP_BODY: &str = "It went down and was re-created several times in the la
 /// right after a spawn would flash Error / respawn a healthy child.
 const STARTUP_GRACE_SECS: u64 = 3;
 
+/// One extra Tick shortly after a chain spawn. The 5 s watchdog cadence is
+/// the wrong clock for healing a capture stream that another audio tool
+/// re-routed at creation (issue #5: EasyEffects) — without this the A/B
+/// window sits on its connecting overlay for most of a tick.
+fn schedule_early_tick(tx: &mpsc::Sender<Event>) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = tx.send(Event::Tick);
+    });
+}
+
 fn compute_status(
     cfg: &Config,
     controller: &mut Controller,
@@ -657,12 +669,16 @@ fn main() {
     // apply persisted state on launch
     let _ = autostart::reconcile(cfg.autostart);
     if cfg.enabled {
-        if let Err(e) = controller.enable(&cfg) {
-            eprintln!("hushmic: enable failed: {e}");
-            // A launch failure is invisible on stderr for .desktop/autostart
-            // starts — surface it (launch counts as user-initiated).
-            if gate.on_enable_error(&e.to_string(), true) {
-                notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, &e.to_string());
+        match controller.enable(&cfg) {
+            Ok(()) => schedule_early_tick(&tx),
+            Err(e) => {
+                eprintln!("hushmic: enable failed: {e}");
+                // A launch failure is invisible on stderr for
+                // .desktop/autostart starts — surface it (launch counts as
+                // user-initiated).
+                if gate.on_enable_error(&e.to_string(), true) {
+                    notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, &e.to_string());
+                }
             }
         }
     }
@@ -727,6 +743,16 @@ fn main() {
     // Last hushmic_source probe verdict, refreshed by Tick and the Cmd
     // epilogue — `status` reports it instead of re-probing on the hot path.
     let mut last_node_present: Option<bool> = None;
+    // Metadata stream routing (the re-pin write) exists only on modern
+    // PipeWire; probed once — on legacy hosts the theft mechanism does not
+    // exist either, and inert writes would just spam the log.
+    let repin_supported = pipewire::supports_target_object();
+    // Consecutive ticks the capture stream was observed stolen, the time
+    // of the last correction, and whether the tug-of-war notice went out
+    // (once per run) — see pipewire::repin_allowed.
+    let mut repin_streak: u32 = 0;
+    let mut repin_last: Option<Instant> = None;
+    let mut repin_notified = false;
     // Shortcuts portal state: None until the worker's first report;
     // Some(false) makes Tick nudge a reconnect, throttled by the backoff.
     let mut shortcuts_up: Option<bool> = None;
@@ -1069,6 +1095,11 @@ fn main() {
                     };
                     let _ = reply.send(msg);
                 }
+                if applied.is_ok() && cfg.enabled {
+                    // A command may have respawned the chain: heal a stolen
+                    // capture stream before the next full tick.
+                    schedule_early_tick(&tx);
+                }
                 let _ = cfg.save();
                 // reflect updated state + refreshed mic list + status in the tray
                 let nodes = pipewire::sources_snapshot();
@@ -1216,9 +1247,11 @@ fn main() {
                     }
                 }
                 // One pw-dump snapshot per tick serves the liveness check, the
-                // tray status, AND a hotplug refresh of the mic list (menu
-                // clicks are far too rare to be the only refresh trigger).
-                let nodes = pipewire::sources_snapshot();
+                // tray status, a hotplug refresh of the mic list (menu clicks
+                // are far too rare to be the only refresh trigger), AND the
+                // capture-stream feeder check below.
+                let dump = pipewire::pw_dump();
+                let nodes = dump.as_deref().map(pipewire::parse_pwdump_nodes);
                 let node_present = nodes
                     .as_ref()
                     .map(|v| v.iter().any(|s| s.name == "hushmic_source"));
@@ -1230,6 +1263,89 @@ fn main() {
                         let _ = handle.update(move |t: &mut HushMicTray| {
                             t.mics = real;
                         });
+                    }
+                }
+
+                // Self-heal a re-routed capture stream (issue #5: EasyEffects'
+                // "process all input streams" adopts every NEW capture stream
+                // onto easyeffects_source, silencing the chain — in the
+                // reported setup as a closed hushmic -> EE -> hushmic loop;
+                // a stale saved user route breaks the same way). Only OUR
+                // effective target is enforced: feeding the chain from
+                // easyeffects_source on purpose means pinning it (or having
+                // it as default), and then no mismatch arises. No startup
+                // grace here: the empty-feeders guard below already keeps
+                // the check out of the session manager's initial link setup,
+                // and the theft happens AT stream creation — the early tick
+                // a spawn schedules heals it before the A/B window's settle
+                // overlay wears out its welcome.
+                if repin_supported && cfg.enabled && controller.is_running() {
+                    if let Some(dump) = dump.as_deref() {
+                        let feeders = pipewire::parse_feeders(dump, "hushmic_input");
+                        if !feeders.is_empty() {
+                            let want = pipewire::repin_want(
+                                controller.active_mic(),
+                                pipewire::parse_default_source(dump),
+                                controller.prior_default(),
+                            );
+                            if let Some(want) = want {
+                                if pipewire::capture_stolen(&feeders, &want) {
+                                    repin_streak = repin_streak.saturating_add(1);
+                                    // Three corrections in and still stolen:
+                                    // something re-asserts its route after
+                                    // every one (EasyEffects' process-all-
+                                    // inputs). Fighting per tick would flap
+                                    // the mic — say so once, retry gently.
+                                    if repin_streak == 3 && !repin_notified {
+                                        repin_notified = true;
+                                        eprintln!(
+                                            "[hushmic] another app keeps re-routing \
+                                             HushMic's microphone (EasyEffects?) — \
+                                             backing off to a slow retry"
+                                        );
+                                        notify::send(
+                                            Slot::Status,
+                                            "audio-input-microphone",
+                                            "Another app is re-routing HushMic's microphone",
+                                            "A running audio tool (EasyEffects?) keeps \
+                                             redirecting HushMic's input to itself. In \
+                                             EasyEffects, disable \"Process All Input \
+                                             Streams\" (or exclude hushmic_input), then \
+                                             restart HushMic.",
+                                        );
+                                    }
+                                    let since = repin_last
+                                        .map(|t| t.elapsed().as_secs())
+                                        .unwrap_or(u64::MAX);
+                                    if pipewire::repin_allowed(repin_streak - 1, since) {
+                                        // Both ids come from the same
+                                        // snapshot, so they are mutually
+                                        // consistent; a respawn racing this
+                                        // tick lands the write on a dead id
+                                        // and the next tick corrects it.
+                                        if let (Some(id), Some(serial)) = (
+                                            pipewire::parse_node_id(dump, "hushmic_input"),
+                                            pipewire::parse_node_serial(dump, &want),
+                                        ) {
+                                            eprintln!(
+                                                "[hushmic] the capture stream was re-routed \
+                                                 to {feeders:?} (another audio tool?) — \
+                                                 re-pinning to {want}"
+                                            );
+                                            repin_last = Some(Instant::now());
+                                            if !pipewire::repin_capture(id, serial) {
+                                                eprintln!(
+                                                    "[hushmic] re-pin failed (pw-metadata \
+                                                     error)"
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    repin_streak = 0;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1304,6 +1420,7 @@ fn main() {
                         };
                         backoff.record(ok);
                         if ok {
+                            schedule_early_tick(&tx);
                             logged_down = false;
                             // No recovery notice here: right after a respawn
                             // the node is not yet proven STABLE (a flapping
@@ -1381,12 +1498,15 @@ fn main() {
                             }
                         }
                         match controller.enable(&cfg) {
-                            Ok(()) => notify::send_transient(
-                                Slot::Status,
-                                "audio-input-microphone",
-                                "HushMic",
-                                body,
-                            ),
+                            Ok(()) => {
+                                schedule_early_tick(&tx);
+                                notify::send_transient(
+                                    Slot::Status,
+                                    "audio-input-microphone",
+                                    "HushMic",
+                                    body,
+                                );
+                            }
                             Err(e) => {
                                 eprintln!("hushmic: enable failed: {e}");
                                 if gate.on_enable_error(&e.to_string(), false) {

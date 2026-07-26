@@ -481,7 +481,14 @@ impl AbApp {
             });
 
         if !self.state.device_ok {
-            self.error_overlay(ctx);
+            // A cold launch (chain still spawning) or the watchdog healing
+            // a re-routed capture stream resolves within seconds — present
+            // that as "connecting", not as the hard error.
+            if self.state.settling(std::time::Instant::now()) {
+                self.settle_overlay(ctx);
+            } else {
+                self.error_overlay(ctx);
+            }
         }
         if let Some((msg, _)) = self.state.toast.clone() {
             toast_overlay(ctx, &msg);
@@ -961,6 +968,55 @@ impl AbApp {
                 });
             });
         });
+    }
+
+    /// The first seconds of a missing input: the chain is spawning (cold
+    /// launch) or the watchdog is healing a re-routed capture stream, and
+    /// both self-resolve — a calm "connecting" beats the hard error. The
+    /// periodic device re-check clears it; past the settle window the
+    /// error overlay with its troubleshooting steps takes over.
+    fn settle_overlay(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        ctx.layer_painter(LayerId::new(Order::Middle, Id::new("abtest_error_dim")))
+            .rect_filled(screen, 0.0, with_alpha(Color32::from_rgb(7, 11, 18), 0.9));
+        egui::Area::new(Id::new("abtest_settle"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(46.0, 46.0), Sense::hover());
+                    let p = ui.painter();
+                    // Gentle pulse so the wait reads as activity, not a hang.
+                    let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) as f32 * 2.5).sin().abs();
+                    p.circle_filled(rect.center(), 23.0, with_alpha(ACCENT, 0.06 + 0.06 * pulse));
+                    p.circle_stroke(
+                        rect.center(),
+                        23.0,
+                        Stroke::new(1.0_f32, with_alpha(ACCENT, 0.20 + 0.20 * pulse)),
+                    );
+                    draw_mic_glyph(p, rect.center(), 22.0, ACCENT, false);
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Connecting to your microphone…")
+                            .size(14.5)
+                            .color(TEXT)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.add(
+                        Label::new(
+                            RichText::new(
+                                "HushMic is bringing up its audio chain. This takes a \
+                                 few seconds.",
+                            )
+                            .size(12.0)
+                            .color(MUTED),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
     }
 
     fn error_overlay(&mut self, ctx: &egui::Context) {

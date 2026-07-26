@@ -49,6 +49,15 @@ pub struct Report {
     /// reported (or no chain/probe). Only judged when a chain is up on a
     /// supporting host.
     pub latency_reported: Option<u32>,
+    /// Node names feeding the chain's capture stream, from the live link
+    /// graph. None = probe failed; empty = no links (yet). A running chain
+    /// fed by anything OTHER than the effective target is the issue-#5
+    /// signature (another tool re-routed the stream) — the one failure
+    /// where every presence check stays green while the mic is silent.
+    pub capture_feeders: Option<Vec<String>>,
+    /// The persisted pre-takeover default: the feeder expectation while
+    /// "Set as default microphone" makes our own node the default.
+    pub prior_default: Option<String>,
 }
 
 /// Gather every fact — the I/O half. Never panics: anything un-probeable
@@ -128,6 +137,9 @@ pub fn collect() -> Report {
             .map(|s| tail(&s, 40)),
         latency_supported: crate::pipewire::supports_latency_report(),
         latency_reported: crate::pipewire::chain_reported_latency(),
+        capture_feeders: crate::pipewire::pw_dump()
+            .map(|d| crate::pipewire::parse_feeders(&d, "hushmic_input")),
+        prior_default: crate::controller::persisted_prior_default(),
     }
 }
 
@@ -245,6 +257,46 @@ pub fn render(r: &Report) -> (String, usize) {
                     "  reported to PipeWire: missing (declaration not in effect)".into(),
                 ),
             }
+        };
+        line(&mut out, bad, s);
+    }
+    // The link-graph fact: who actually feeds the capture stream. Judged
+    // only for a running chain with a known expectation — a mismatch there
+    // means the mic the user picked is NOT what the chain hears.
+    if let Some(feeders) = &r.capture_feeders {
+        let chain_up = r.instance_running && r.hushmic_present == Some(true);
+        // Same expectation the watchdog's healer uses: pinned mic, else the
+        // default — except when the default is our own node ("Set as
+        // default microphone" on), where the persisted pre-takeover default
+        // is what the chain follows. No expectation = plain fact.
+        let expected = crate::pipewire::repin_want(
+            r.active_mic.as_deref(),
+            r.default_source.clone(),
+            r.prior_default.as_deref(),
+        );
+        let (bad, s) = if feeders.is_empty() {
+            (false, "capture fed by: (no links)".to_string())
+        } else if chain_up && feeders.iter().any(|f| f == "hushmic_source") {
+            // Needs no expectation: the chain hearing its own output is a
+            // silent loop under every configuration.
+            (
+                true,
+                format!(
+                    "capture fed by: {} (the chain's own output)",
+                    feeders.join(", ")
+                ),
+            )
+        } else if let (true, Some(want)) = (chain_up, expected.as_deref()) {
+            if feeders.iter().any(|f| f == want) {
+                (false, format!("capture fed by: {}", feeders.join(", ")))
+            } else {
+                (
+                    true,
+                    format!("capture fed by: {} (expected {want})", feeders.join(", ")),
+                )
+            }
+        } else {
+            (false, format!("capture fed by: {}", feeders.join(", ")))
         };
         line(&mut out, bad, s);
     }
@@ -460,7 +512,110 @@ mod tests {
             log_tail: Some("[hushmic] chain up\n".into()),
             latency_supported: true,
             latency_reported: Some(2880),
+            capture_feeders: Some(vec!["alsa_input.usb-mic".into()]),
+            prior_default: Some("alsa_input.usb-mic".into()),
         }
+    }
+
+    #[test]
+    fn capture_feeder_matching_the_target_is_a_plain_fact() {
+        // Follow-default mode: the expected feeder is the default source.
+        let mut r = healthy();
+        r.default_source = Some("alsa_input.usb-mic".into());
+        r.capture_feeders = Some(vec!["alsa_input.usb-mic".into()]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(
+            text.contains("capture fed by: alsa_input.usb-mic"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn capture_fed_by_a_foreign_node_is_a_problem() {
+        // Issue #5's signature: chain healthy on paper, but another tool
+        // (EasyEffects) re-routed the capture stream onto its own source.
+        let mut r = healthy();
+        r.active_mic = Some("alsa_input.usb-mic".into());
+        r.capture_feeders = Some(vec!["easyeffects_source".into()]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(
+            text.contains("capture fed by: easyeffects_source (expected alsa_input.usb-mic)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn capture_feeder_facts_stay_quiet_when_unjudgeable() {
+        // No links yet (snapshot mid-spawn), probe failure, or no chain:
+        // plain facts, never a false alarm.
+        let mut r = healthy();
+        r.active_mic = Some("alsa_input.usb-mic".into());
+        r.capture_feeders = Some(vec![]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("capture fed by: (no links)"), "{text}");
+
+        let mut r = healthy();
+        r.capture_feeders = None;
+        assert_eq!(render(&r).1, 0);
+
+        let mut r = healthy();
+        r.hushmic_present = Some(false);
+        r.capture_feeders = Some(vec!["easyeffects_source".into()]);
+        // instance not running / chain down: the feeder is stale info, and
+        // the missing node is already the reported problem.
+        let (_, problems) = render(&r);
+        assert!(problems >= 1); // the node problem, not a feeder one
+    }
+
+    #[test]
+    fn chain_fed_by_its_own_output_is_always_a_problem() {
+        // No expectation needed: hushmic_source feeding hushmic_input is a
+        // silent loop under every configuration.
+        let mut r = healthy();
+        r.active_mic = None;
+        r.prior_default = None;
+        r.capture_feeders = Some(vec!["hushmic_source".into()]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(text.contains("the chain's own output"), "{text}");
+    }
+
+    #[test]
+    fn set_default_theft_is_caught_via_the_prior_default_breadcrumb() {
+        // The set-default + follow-default config: the default source is
+        // our own node, but the persisted pre-takeover default tells us
+        // what the chain should follow — a re-routed stream is flagged.
+        let mut r = healthy();
+        r.active_mic = None;
+        r.default_source = Some("hushmic_source".into());
+        r.prior_default = Some("alsa_input.usb-mic".into());
+        r.capture_feeders = Some(vec!["easyeffects_source".into()]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(
+            text.contains("capture fed by: easyeffects_source (expected alsa_input.usb-mic)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn set_default_users_never_get_a_false_feeder_alarm() {
+        // Follow-default + set-default: the default source is our own node,
+        // so there is no outside-knowable expectation — plain fact only.
+        let mut r = healthy();
+        r.active_mic = None;
+        r.default_source = Some("hushmic_source".into());
+        r.prior_default = None; // breadcrumb missing: no expectation at all
+        r.capture_feeders = Some(vec!["alsa_input.usb-mic".into()]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(
+            text.contains("capture fed by: alsa_input.usb-mic"),
+            "{text}"
+        );
     }
 
     #[test]

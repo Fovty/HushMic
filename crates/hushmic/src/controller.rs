@@ -198,6 +198,14 @@ fn persist_prior_default(name: &str) {
 
 /// A previous run's persisted prior default, if any (crash leftover). Never
 /// yields our own node name.
+/// The persisted pre-takeover default (the breadcrumb `enable()` writes
+/// while "Set as default microphone" holds the default) — lets --doctor,
+/// which runs outside the tray process, judge the capture feeder in
+/// set-default configurations.
+pub fn persisted_prior_default() -> Option<String> {
+    read_persisted_prior_default()
+}
+
 fn read_persisted_prior_default() -> Option<String> {
     let s = std::fs::read_to_string(prior_default_path()).ok()?;
     let s = s.trim();
@@ -490,6 +498,13 @@ impl Controller {
         self.active_mic.as_deref()
     }
 
+    /// The default source remembered before "Set as default microphone"
+    /// took over — what the chain actually follows while our own node is
+    /// the default, and therefore the capture-repin expectation there.
+    pub fn prior_default(&self) -> Option<&str> {
+        self.prior_default.as_deref()
+    }
+
     /// Seconds since the current child was spawned (None = no child). The
     /// watchdog/status use this as a startup grace period: a freshly spawned
     /// host needs a moment before `hushmic_source` registers, and judging it
@@ -713,7 +728,14 @@ impl Controller {
             // device for good.
             self.prior_default = match pipewire::get_default_source() {
                 Some(name) if name == "hushmic_source" => read_persisted_prior_default(),
-                None => read_persisted_prior_default(),
+                // No CONFIGURED default is common (a session that never had
+                // one set explicitly) — the EFFECTIVE default the session
+                // manager computed is the device the user actually used,
+                // and a far better restore/repin target than nothing.
+                None => pipewire::pw_dump()
+                    .and_then(|d| pipewire::parse_default_source(&d))
+                    .filter(|n| n != "hushmic_source")
+                    .or_else(read_persisted_prior_default),
                 other => other,
             };
             // Survive a crash while the takeover is active.

@@ -49,10 +49,20 @@ pub struct Timeline {
     pub time: String,
 }
 
+/// How long a missing input reads as "connecting" before it becomes the
+/// hard "No microphone input" error. Covers a cold launch's chain spawn
+/// and the watchdog healing a re-routed capture stream (both normally
+/// resolve within a few seconds).
+pub const SETTLE_SECS: u64 = 8;
+
 pub struct WindowState {
     pub mode: Mode,
     pub has_sample: bool,
     pub device_ok: bool,
+    /// When the settle window ends (set once at window open): a missing
+    /// input before this instant is presented as "connecting", after it
+    /// as the hard error.
+    pub settle_deadline: std::time::Instant,
     pub device_name: String,
     pub metrics: Option<SampleMetrics>,
     pub toast: Option<(String, f32)>, // message + seconds remaining
@@ -71,6 +81,8 @@ impl WindowState {
             mode: Mode::Sample,
             has_sample: false,
             device_ok: true,
+            settle_deadline: std::time::Instant::now()
+                + std::time::Duration::from_secs(SETTLE_SECS),
             device_name: String::new(),
             metrics: None,
             toast: None,
@@ -212,6 +224,13 @@ impl WindowState {
         }
     }
 
+    /// Whether a missing input is still in its settle window (chain
+    /// starting, or the watchdog healing a re-routed capture stream) and
+    /// should read as "connecting" rather than as the hard error.
+    pub fn settling(&self, now: std::time::Instant) -> bool {
+        !self.device_ok && now < self.settle_deadline
+    }
+
     pub fn status(&self) -> Status {
         if !self.device_ok {
             return Status::NoInput;
@@ -316,6 +335,28 @@ mod tests {
         s.has_sample = has_sample;
         s.device_ok = device_ok;
         s
+    }
+
+    #[test]
+    fn no_input_settles_before_it_alarms() {
+        use std::time::{Duration, Instant};
+        // A cold launch has seconds where the chain is still coming up (or
+        // being healed after a re-route) — the window must read as
+        // "connecting", not as a hard error, until the settle window ends.
+        let s = state(Mode::Sample, false, false);
+        let opened = Instant::now();
+        assert!(s.settling(opened), "no input right after opening settles");
+        assert!(
+            s.settling(opened + Duration::from_secs(SETTLE_SECS - 2)),
+            "still settling shortly before the deadline"
+        );
+        assert!(
+            !s.settling(opened + Duration::from_secs(SETTLE_SECS + 2)),
+            "past the settle window the hard error shows"
+        );
+        // A working device never reports settling.
+        let ok = state(Mode::Sample, false, true);
+        assert!(!ok.settling(opened));
     }
 
     fn assert_pct(t: &Timeline, want: f32) {

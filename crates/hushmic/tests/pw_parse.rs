@@ -382,3 +382,164 @@ fn strict_version_probe_is_pessimistic_on_junk() {
     assert_eq!(parsed_version_at_least("no version here", (1, 6, 0)), None);
     assert_eq!(parsed_version_at_least("", (1, 6, 0)), None);
 }
+
+// --- capture-stream self-heal (issue #5: EasyEffects re-routes the chain) ---
+
+/// Minimal pw-dump shape: nodes of several classes plus the links wiring
+/// the mic (42) and a foreign virtual source (77) into hushmic_input (90).
+const LINK_DUMP: &str = r#"[
+  { "type": "PipeWire:Interface:Node", "id": 42,
+    "info": { "props": { "node.name": "alsa_input.usb-mic", "object.serial": 542,
+                         "media.class": "Audio/Source" } } },
+  { "type": "PipeWire:Interface:Node", "id": 77,
+    "info": { "props": { "node.name": "easyeffects_source", "object.serial": 577,
+                         "media.class": "Audio/Source/Virtual" } } },
+  { "type": "PipeWire:Interface:Node", "id": 90,
+    "info": { "props": { "node.name": "hushmic_input", "object.serial": 590,
+                         "media.class": "Stream/Input/Audio" } } },
+  { "type": "PipeWire:Interface:Link", "id": 300,
+    "info": { "output-node-id": 77, "input-node-id": 90 } },
+  { "type": "PipeWire:Interface:Link", "id": 301,
+    "info": { "output-node-id": 77, "input-node-id": 90 } },
+  { "type": "PipeWire:Interface:Link", "id": 302,
+    "info": { "output-node-id": 42, "input-node-id": 91 } }
+]"#;
+
+#[test]
+fn feeders_come_from_the_link_graph_across_all_node_classes() {
+    use hushmic::pipewire::parse_feeders;
+    // Two links from the same node (stereo) report the feeder once; the
+    // feeder may be ANY class (a virtual source, a sink monitor), so the
+    // node map must not be limited to Audio/Source.
+    assert_eq!(
+        parse_feeders(LINK_DUMP, "hushmic_input"),
+        ["easyeffects_source"]
+    );
+    // No links into an unknown node.
+    assert!(parse_feeders(LINK_DUMP, "hushmic_source").is_empty());
+    // Garbage stays empty, never panics.
+    assert!(parse_feeders("not json", "hushmic_input").is_empty());
+}
+
+#[test]
+fn node_serial_resolves_by_name() {
+    use hushmic::pipewire::parse_node_serial;
+    assert_eq!(
+        parse_node_serial(LINK_DUMP, "alsa_input.usb-mic"),
+        Some(542)
+    );
+    assert_eq!(parse_node_serial(LINK_DUMP, "absent"), None);
+    assert_eq!(parse_node_serial("not json", "x"), None);
+}
+
+#[test]
+fn capture_stolen_only_when_fed_exclusively_by_foreign_nodes() {
+    use hushmic::pipewire::capture_stolen;
+    let s = String::from;
+    // The theft case (issue #5): linked, but not to the wanted mic.
+    assert!(capture_stolen(
+        &[s("easyeffects_source")],
+        "alsa_input.usb-mic"
+    ));
+    // Healthy: the wanted mic feeds us (alone or alongside anything else).
+    assert!(!capture_stolen(
+        &[s("alsa_input.usb-mic")],
+        "alsa_input.usb-mic"
+    ));
+    assert!(!capture_stolen(
+        &[s("easyeffects_source"), s("alsa_input.usb-mic")],
+        "alsa_input.usb-mic"
+    ));
+    // No links yet (startup, WirePlumber still linking): not a theft —
+    // re-pinning during link setup would race the session manager.
+    assert!(!capture_stolen(&[], "alsa_input.usb-mic"));
+}
+
+const META_DUMP: &str = r#"[
+  { "type": "PipeWire:Interface:Metadata", "id": 30,
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      { "subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON",
+        "value": { "name": "alsa_output.hdmi" } },
+      { "subject": 0, "key": "default.configured.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "stale_configured" } },
+      { "subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "hushmic_source" } }
+    ] },
+  { "type": "PipeWire:Interface:Metadata", "id": 31,
+    "props": { "metadata.name": "route-settings" }, "metadata": [] }
+]"#;
+
+const META_DUMP_CONFIGURED_ONLY: &str = r#"[
+  { "type": "PipeWire:Interface:Metadata", "id": 30,
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      { "subject": 0, "key": "default.configured.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "alsa_input.usb-mic" } }
+    ] }
+]"#;
+
+#[test]
+fn default_source_parses_from_the_dump_metadata() {
+    use hushmic::pipewire::parse_default_source;
+    // The EFFECTIVE default (what the session manager links streams to)
+    // wins; the configured key is only a fallback — live dumps can carry
+    // either one alone.
+    assert_eq!(
+        parse_default_source(META_DUMP),
+        Some("hushmic_source".to_string())
+    );
+    assert_eq!(
+        parse_default_source(META_DUMP_CONFIGURED_ONLY),
+        Some("alsa_input.usb-mic".to_string())
+    );
+    assert_eq!(parse_default_source("[]"), None);
+    assert_eq!(parse_default_source("not json"), None);
+}
+
+#[test]
+fn repin_expectation_never_resolves_to_our_own_node() {
+    use hushmic::pipewire::repin_want;
+    let s = |v: &str| Some(v.to_string());
+    // Pinned mic: the pin is the expectation.
+    assert_eq!(
+        repin_want(Some("alsa_input.usb-mic"), s("hushmic_source"), Some("x")),
+        s("alsa_input.usb-mic")
+    );
+    // Follow-default: the default is the expectation…
+    assert_eq!(
+        repin_want(None, s("alsa_input.usb-mic"), None),
+        s("alsa_input.usb-mic")
+    );
+    // …EXCEPT when the default is our own output ("Set as default" on):
+    // the chain follows the pre-takeover default, which the controller
+    // remembers as its restore target.
+    assert_eq!(
+        repin_want(None, s("hushmic_source"), Some("alsa_input.usb-mic")),
+        s("alsa_input.usb-mic")
+    );
+    // No restore target known: no expectation, no re-pin — never heal a
+    // chain toward its own output.
+    assert_eq!(repin_want(None, s("hushmic_source"), None), None);
+    assert_eq!(repin_want(None, None, None), None);
+    // A restore target that is itself stale-hushmic (crash artifacts) is
+    // equally unusable.
+    assert_eq!(
+        repin_want(None, s("hushmic_source"), Some("hushmic_source")),
+        None
+    );
+}
+
+#[test]
+fn repin_backs_off_against_a_live_adversary() {
+    use hushmic::pipewire::repin_allowed;
+    // First observations of a stolen stream: heal immediately.
+    assert!(repin_allowed(0, 0));
+    assert!(repin_allowed(2, 1));
+    // A tool that re-asserts its route after every correction would turn
+    // the healer into a mic-flapper — after three losses, retry gently.
+    assert!(!repin_allowed(3, 5));
+    assert!(!repin_allowed(10, 59));
+    assert!(repin_allowed(3, 60));
+    assert!(repin_allowed(50, 3600));
+}

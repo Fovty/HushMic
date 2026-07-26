@@ -85,6 +85,193 @@ pub fn parse_node_id(stdout: &str, name: &str) -> Option<u32> {
     None
 }
 
+/// Resolve a node NAME to its `object.serial` from a `pw-dump` snapshot.
+/// Pure — no I/O. The serial is what routing metadata (`target.object` as
+/// `Spa:Id`) identifies nodes by; unlike the global id it is never reused.
+pub fn parse_node_serial(stdout: &str, name: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    for o in v.as_array()? {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let props = o.get("info").and_then(|i| i.get("props"))?;
+        if props.get("node.name").and_then(|n| n.as_str()) == Some(name) {
+            return props.get("object.serial").and_then(|s| s.as_u64());
+        }
+    }
+    None
+}
+
+/// The node names with LINKS into `node_name`, deduplicated, from a
+/// `pw-dump` snapshot. Pure — no I/O. The feeder map covers EVERY node
+/// class (a stolen capture stream is typically fed by a virtual source or
+/// a sink monitor, never an `Audio/Source`). Unparseable JSON is an empty
+/// list, never a panic.
+pub fn parse_feeders(stdout: &str, node_name: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut names = std::collections::HashMap::new();
+    for o in arr {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let (Some(id), Some(name)) = (
+            o.get("id").and_then(|i| i.as_u64()),
+            o.get("info")
+                .and_then(|i| i.get("props"))
+                .and_then(|p| p.get("node.name"))
+                .and_then(|n| n.as_str()),
+        ) else {
+            continue;
+        };
+        names.insert(id, name.to_string());
+    }
+    let target_ids: Vec<u64> = names
+        .iter()
+        .filter(|(_, n)| n.as_str() == node_name)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for o in arr {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Link") {
+            continue;
+        }
+        let info = o.get("info");
+        let (Some(from), Some(to)) = (
+            info.and_then(|i| i.get("output-node-id"))
+                .and_then(|n| n.as_u64()),
+            info.and_then(|i| i.get("input-node-id"))
+                .and_then(|n| n.as_u64()),
+        ) else {
+            continue;
+        };
+        if !target_ids.contains(&to) {
+            continue;
+        }
+        if let Some(name) = names.get(&from) {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The default audio source from a `pw-dump` snapshot's `default`
+/// metadata object, snapshot-consistent with the dump's link graph (no
+/// extra subprocess per tick, no dump-vs-now race). Prefers the EFFECTIVE
+/// `default.audio.source` — what the session manager actually links
+/// streams to — over the `configured` preference: live dumps can carry
+/// either key alone. Pure — no I/O.
+pub fn parse_default_source(stdout: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let mut configured = None;
+    for o in v.as_array()? {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Metadata") {
+            continue;
+        }
+        if o.get("props")
+            .and_then(|p| p.get("metadata.name"))
+            .and_then(|n| n.as_str())
+            != Some("default")
+        {
+            continue;
+        }
+        let Some(entries) = o.get("metadata").and_then(|m| m.as_array()) else {
+            continue;
+        };
+        for e in entries {
+            let name = e
+                .get("value")
+                .and_then(|v| v.get("name"))
+                .and_then(|n| n.as_str());
+            match e.get("key").and_then(|k| k.as_str()) {
+                Some("default.audio.source") => {
+                    if let Some(n) = name {
+                        return Some(n.to_string());
+                    }
+                }
+                Some("default.configured.audio.source") => {
+                    configured = name.map(str::to_string);
+                }
+                _ => {}
+            }
+        }
+    }
+    configured
+}
+
+/// The mic the capture stream is EXPECTED to be fed by: the pinned mic,
+/// else the default source — except when the default is our own output
+/// ("Set as default microphone" on), where the chain follows the
+/// pre-takeover default (the controller's restore target). `None` = no
+/// safe expectation, so no re-pin: a healer must never point the chain at
+/// its own output (that is issue #5's silent loop, self-inflicted).
+pub fn repin_want(
+    active_mic: Option<&str>,
+    default_source: Option<String>,
+    restore_target: Option<&str>,
+) -> Option<String> {
+    if let Some(m) = active_mic {
+        return Some(m.to_string());
+    }
+    let d = default_source?;
+    let want = if d == "hushmic_source" {
+        restore_target?.to_string()
+    } else {
+        d
+    };
+    (want != "hushmic_source").then_some(want)
+}
+
+/// Whether a re-pin attempt is due, given how many consecutive stolen
+/// observations preceded it and the seconds since the last attempt. The
+/// first few heal immediately (one-shot re-routes: stale persisted
+/// targets, a mixer-app misclick, leftovers of a quit EasyEffects). A
+/// stream that is STILL stolen after three corrections has an active
+/// adversary re-asserting its route after each one — endless fighting
+/// would flap the user's mic every tick, so retry only gently; the slow
+/// cadence still heals within a minute once the adversary exits.
+pub fn repin_allowed(stolen_streak: u32, secs_since_last_attempt: u64) -> bool {
+    stolen_streak < 3 || secs_since_last_attempt >= 60
+}
+
+/// Whether the capture stream has been re-routed away from the mic we
+/// declared (issue #5: EasyEffects' "process all input streams" adopts
+/// every new capture stream onto `easyeffects_source`, silencing the
+/// chain — in the reported setup as a closed hushmic->EE->hushmic loop).
+/// Only an EXCLUSIVELY-foreign feed counts: an empty list means the
+/// session manager is still linking (re-pinning then would race it), and
+/// any link from the wanted mic means audio flows.
+pub fn capture_stolen(feeders: &[String], want: &str) -> bool {
+    !feeders.is_empty() && !feeders.iter().any(|f| f == want)
+}
+
+/// Point the routing metadata for node `id` back at `target_serial`
+/// (`target.object` as `Spa:Id`) — the same write a session GUI or
+/// EasyEffects does, so it cleanly overrides theirs; the session manager
+/// relinks within a tick. A tool that re-asserts its route after every
+/// correction turns this into a tug-of-war — [`repin_allowed`] is the
+/// caller's armistice.
+pub fn repin_capture(id: u32, target_serial: u64) -> bool {
+    std::process::Command::new("pw-metadata")
+        .args([
+            "-n",
+            "default",
+            &id.to_string(),
+            "target.object",
+            &target_serial.to_string(),
+            "Spa:Id",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Resolve a node name to its numeric PipeWire id via `pw-dump`, for
 /// `pw-record --target`. `None` if the probe fails or the node is absent — the
 /// caller then falls back to passing the name (accepted by modern pw-cat).
