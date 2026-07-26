@@ -49,6 +49,18 @@
   </screenshots>
 
   <releases>
+    <release version="0.5.1" date="2026-07-26">
+      <description>
+        <p>
+          HushMic now notices when another audio tool (such as EasyEffects)
+          re-routes its microphone input and repairs the connection on its
+          own — or tells you exactly which setting is fighting it. The
+          diagnostics report shows what actually feeds the chain, and the
+          mic-test window opens with a calm connecting state instead of a
+          brief error while everything starts up.
+        </p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-07-24">
       <description>
         <p>
