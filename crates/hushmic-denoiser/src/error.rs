@@ -14,7 +14,7 @@ pub enum Error {
     /// The model file/bytes could not be loaded into a session.
     Model(String),
     /// A single inference step failed; output was still produced (near-silence)
-    /// and the stream stays aligned, so processing can simply continue.
+    /// and the stream stays aligned, so processing can continue.
     Inference(String),
 }
 

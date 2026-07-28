@@ -26,7 +26,7 @@ release tag:
 
 ```toml
 [dependencies]
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.5.1" }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.6.0" }
 ```
 
 ## What you need at runtime
@@ -58,7 +58,7 @@ feature and configure [`ort`](https://crates.io/crates/ort) yourself; cargo
 merges the features:
 
 ```toml
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.5.1", default-features = false }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.6.0", default-features = false }
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 ```
 

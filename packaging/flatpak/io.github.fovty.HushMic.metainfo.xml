@@ -49,6 +49,15 @@
   </screenshots>
 
   <releases>
+    <release version="0.6.0" date="2026-07-28">
+      <description>
+        <p>
+          The noise suppression engine is now available as a standalone Rust
+          library (hushmic-denoiser), so other applications can embed the
+          same denoiser. The HushMic app itself behaves exactly as before.
+        </p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-07-26">
       <description>
         <p>
