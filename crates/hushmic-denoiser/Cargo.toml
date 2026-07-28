@@ -1,0 +1,54 @@
+[package]
+name = "hushmic-denoiser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.88" # floor inherited from ort
+description = "Real-time DPDFNet noise suppression for voice: 48 kHz mono frames in, cleaned frames out"
+repository = "https://github.com/Fovty/HushMic"
+readme = "README.md"
+keywords = ["noise-suppression", "denoise", "audio", "dsp", "voice"]
+categories = ["multimedia::audio"]
+
+[features]
+# load-dynamic is a forwarded feature (not hard-enabled) so consumers can opt
+# for ort's other linking strategies with `default-features = false` — cargo
+# features are additive and could never subtract it.
+default = ["load-dynamic"]
+load-dynamic = ["ort/load-dynamic", "dep:libloading"]
+
+[dependencies]
+rustfft = "6"
+# Exact pre-release pin: fine for the git-dependency phase, but it MUST be
+# relaxed to a compatible range before any crates.io publish (an exact
+# pre-release pin makes consumers' dependency resolution unmergeable). No ort
+# types leak into the public API, so relaxing it later is not a breaking change.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-18"] }
+# For the pre-flight dylib check (see runtime.rs): ort rc.12's own failure
+# path deadlocks, so the library must be validated before ort touches it.
+libloading = { version = "0.9", optional = true }
+
+[dev-dependencies]
+hound = "3.5"
+claxon = "0.4" # FLAC decode for the committed public parity fixtures
+
+# The asset-driven integration suites bring the runtime up through
+# init_runtime, which only exists under load-dynamic.
+[[test]]
+name = "api"
+required-features = ["load-dynamic"]
+
+[[test]]
+name = "latency"
+required-features = ["load-dynamic"]
+
+[[test]]
+name = "parity"
+required-features = ["load-dynamic"]
+
+# Self-exec harness: the ONNX Runtime environment commit is process-global and
+# first-wins, so each lifecycle sequence needs a fresh subprocess.
+[[test]]
+name = "runtime_lifecycle"
+harness = false
+required-features = ["load-dynamic"]

@@ -49,7 +49,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test
+        # ASSERT_ASSETS: on CI a missing asset or an unexpectedly dlopen-able
+        # system ONNX Runtime must FAIL the asset-gated tests, never skip them.
         run: cargo test --workspace
+        env:
+          HUSHMIC_ASSERT_ASSETS: "1"
+
+      - name: consumer smoke (hushmic-denoiser as an external dependency)
+        run: bash scripts/consumer-smoke.sh
+        env:
+          HUSHMIC_ASSERT_ASSETS: "1"
 
   # Green fmt/clippy/test says nothing about the tag-time release: this job
   # runs the ACTUAL release pipeline (build-release.sh: tarball, .deb,

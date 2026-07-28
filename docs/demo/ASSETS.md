@@ -65,7 +65,7 @@ documented levels, runs the real HushMic enhancer, renders the videos).
 3. `before_<noise>.wav` = voice + noise summed in float, then flat-gain peak-normalized
    to −1 dBFS (flat gain preserves the +3 dB SNR; no clipping).
 4. `after_<noise>.wav` = `before` run through hushmic's offline enhancer
-   (`crates/dpdfnet-ladspa/examples/enhance.rs`, DPDFNet-8 ONNX model).
+   (`crates/hushmic-denoiser/examples/enhance.rs`, DPDFNet-8 ONNX model).
 5. Videos: 1280×420 H.264 + AAC, ~21.5 s each — the BEFORE waveform with a moving
    playhead, then the same passage AFTER enhancement.
 

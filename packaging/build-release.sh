@@ -206,10 +206,20 @@ rm -rf "$APPDIR"
 echo "  -> dist/hushmic-${ARCH}.AppImage"
 
 # ---------------------------------------------------------------------------
-# 4. Checksums
+# 4. Standalone model files (for hushmic-denoiser library consumers)
+# ---------------------------------------------------------------------------
+# The DPDFNet models (Apache-2.0, Ceva) already ship inside the .deb/AppImage;
+# publishing them as raw release assets is what lets Rust apps embedding the
+# hushmic-denoiser crate download a model without installing HushMic.
+log "Copying model assets"
+cp "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.onnx" \
+   "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.onnx" "$DIST/"
+
+# ---------------------------------------------------------------------------
+# 5. Checksums
 # ---------------------------------------------------------------------------
 log "Computing checksums"
-( cd "$DIST" && sha256sum ./*.tar.gz ./*.deb ./*.AppImage > sha256sums.txt )
+( cd "$DIST" && sha256sum ./*.tar.gz ./*.deb ./*.AppImage ./*.onnx > sha256sums.txt )
 cat "$DIST/sha256sums.txt"
 
 log "Done. Artifacts in dist/:"

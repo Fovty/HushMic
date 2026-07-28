@@ -224,10 +224,11 @@ Produces `target/release/hushmic` (tray app) and `target/release/libdpdfnet_lads
 
 ## How it works
 
-Two parts:
+Three parts:
 
-1. **`dpdfnet-ladspa`** — a LADSPA plugin (Rust) that runs DPDFNet's ONNX model in real time, hop-by-hop, at 48 kHz mono, via [`ort`](https://github.com/pykeio/ort) (ONNX Runtime).
-2. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed; the mic's lifetime is tied to the app, and quitting tears it down cleanly (restoring your previous default input).
+1. **[`hushmic-denoiser`](crates/hushmic-denoiser)** — the DSP engine as a reusable Rust library: 48 kHz mono frames in, cleaned frames out, running DPDFNet's ONNX model via [`ort`](https://github.com/pykeio/ort) (ONNX Runtime). Embedding the denoiser in your own app? See its [README](crates/hushmic-denoiser/README.md).
+2. **`dpdfnet-ladspa`** — a thin LADSPA plugin wrapping that engine for PipeWire, hop-by-hop in real time.
+3. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed; the mic's lifetime is tied to the app, and quitting tears it down cleanly (restoring your previous default input).
 
 ## Support
 

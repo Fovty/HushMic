@@ -1,30 +1,15 @@
-//! Measured latency pins: the chain's algorithmic
-//! latency is a structural constant — 480 samples of STFT framing plus the
-//! model's 4-hop group delay (1920), with the plugin's one-hop output
-//! prefill (480) on top, declared to PipeWire as 2880 total. These tests
-//! MEASURE the DSP rather than trusting arithmetic; if a model or DSP
-//! change shifts the real latency, they fail and force the declared
-//! constant (controller::LATENCY_SAMPLES) to be re-derived.
+//! Measured latency pins: the declared latency is a structural constant —
+//! 480 samples of STFT framing plus the models' 4-hop group delay (1920).
+//! These tests MEASURE the DSP rather than trusting arithmetic; if a model or
+//! DSP change shifts the real latency, they fail and force LATENCY_SAMPLES to
+//! be re-derived. (The framing half alone is pinned by the STFT unit tests;
+//! the plugin's one-hop output prefill on top is asserted via the hushmic
+//! crate's conf-test constant, 2880 = 2400 + 480.)
 
-use dpdfnet_ladspa::engine::Engine;
-use dpdfnet_ladspa::mode::Mode;
-use dpdfnet_ladspa::stft::{Analysis, Synthesis, HOP, SPEC_LEN};
-use std::path::PathBuf;
+mod common;
 
-/// Engine-level algorithmic latency in samples (framing + model group
-/// delay). The plugin's declared total is this + one hop of output
-/// prefill — asserted against the hushmic crate's constant in its conf
-/// tests (the crates share no code; the tests pin the agreement).
-const ENGINE_LATENCY: usize = 5 * HOP; // 2400
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn model_path(name: &str) -> Option<PathBuf> {
-    let p = repo_root().join("assets/models").join(name);
-    p.exists().then_some(p)
-}
+use common::{dev_denoiser, repo_root};
+use hushmic_denoiser::{Mode, HOP, LATENCY_SAMPLES};
 
 fn argmax(out: &[f32]) -> (usize, f32) {
     let mut best = (0usize, 0f32);
@@ -36,49 +21,19 @@ fn argmax(out: &[f32]) -> (usize, f32) {
     best
 }
 
-/// The STFT analysis/synthesis round trip alone delays by exactly one hop
-/// and reconstructs the impulse bit-perfectly (COLA).
-#[test]
-fn stft_roundtrip_delay_is_one_hop() {
-    let mut a = Analysis::new();
-    let mut s = Synthesis::new();
-    let total = 40 * HOP;
-    let impulse_at = 20 * HOP + 123; // deliberately mid-hop
-    let mut out = Vec::with_capacity(total);
-    let mut spec = [0f32; SPEC_LEN];
-    for h in 0..(total / HOP) {
-        let mut hop_in = [0f32; HOP];
-        for (j, v) in hop_in.iter_mut().enumerate() {
-            if h * HOP + j == impulse_at {
-                *v = 1.0;
-            }
-        }
-        let mut hop_out = [0f32; HOP];
-        a.push_hop(&hop_in, &mut spec);
-        s.add_frame(&spec, &mut hop_out);
-        out.extend_from_slice(&hop_out);
-    }
-    let (peak, amp) = argmax(&out);
-    assert_eq!(peak - impulse_at, HOP, "STFT round trip must delay one hop");
-    assert!(
-        (amp - 1.0).abs() < 1e-4,
-        "COLA reconstruction must be transparent, got peak amp {amp}"
-    );
-}
-
 /// The bypass path (delayed-noisy ring through the same synthesis) is a
 /// deterministic delay line: an impulse comes out bit-strength intact,
-/// exactly ENGINE_LATENCY later. This is also the time-domain proof that
+/// exactly LATENCY_SAMPLES later. This is also the time-domain proof that
 /// the ring alignment matches the framing.
 #[test]
 fn bypass_path_delay_is_exact() {
     for model in ["dpdfnet8_48khz_hr.onnx", "dpdfnet2_48khz_hr.onnx"] {
-        let Some(mp) = model_path(model) else {
+        let Some(mut den) = dev_denoiser(model) else {
             eprintln!("skipping bypass_path_delay_is_exact: {model} not provisioned");
             continue;
         };
-        let mut eng = Engine::new(&mp).expect("engine");
-        eng.set_mode(Mode::Bypass);
+        assert_eq!(den.latency_samples(), LATENCY_SAMPLES);
+        den.set_mode(Mode::Bypass);
         let total = 80 * HOP;
         let impulse_at = 40 * HOP + 123;
         let mut out = Vec::with_capacity(total);
@@ -90,14 +45,14 @@ fn bypass_path_delay_is_exact() {
                 }
             }
             let mut hop_out = [0f32; HOP];
-            let _ = eng.process_hop(&hop_in, &mut hop_out);
+            let _ = den.process_hop(&hop_in, &mut hop_out);
             out.extend_from_slice(&hop_out);
         }
         let (peak, amp) = argmax(&out);
         assert_eq!(
             peak - impulse_at,
-            ENGINE_LATENCY,
-            "{model}: bypass delay must be exactly {ENGINE_LATENCY} samples"
+            LATENCY_SAMPLES,
+            "{model}: bypass delay must be exactly {LATENCY_SAMPLES} samples"
         );
         assert!(
             (amp - 1.0).abs() < 1e-3,
@@ -115,25 +70,24 @@ fn read_flac_mono_f32(p: &std::path::Path) -> Vec<f32> {
 
 /// The neural path's group delay, measured with REAL noisy speech (a
 /// synthetic probe gets eaten by the suppressor): the cleaned output must
-/// cross-correlate with the input within a few samples of ENGINE_LATENCY.
+/// cross-correlate with the input within a few samples of LATENCY_SAMPLES.
 /// This is what makes the declared constant a measurement, not arithmetic.
 #[test]
 fn enhanced_path_group_delay_matches_bypass() {
     let fixture = repo_root().join("tests/fixtures/noisy_public_48k.flac");
     for model in ["dpdfnet8_48khz_hr.onnx", "dpdfnet2_48khz_hr.onnx"] {
-        let Some(mp) = model_path(model) else {
+        let Some(mut den) = dev_denoiser(model) else {
             eprintln!("skipping enhanced_path_group_delay: {model} not provisioned");
             continue;
         };
         let input = read_flac_mono_f32(&fixture);
-        let mut eng = Engine::new(&mp).expect("engine");
         let total = (input.len() / HOP) * HOP;
         let mut out = vec![0f32; total];
         for h in 0..(total / HOP) {
             let mut hop_in = [0f32; HOP];
             hop_in.copy_from_slice(&input[h * HOP..(h + 1) * HOP]);
             let mut hop_out = [0f32; HOP];
-            let _ = eng.process_hop(&hop_in, &mut hop_out);
+            let _ = den.process_hop(&hop_in, &mut hop_out);
             out[h * HOP..(h + 1) * HOP].copy_from_slice(&hop_out);
         }
         // bounded window keeps debug-mode runtime sane; 8 s of speech is
@@ -160,8 +114,8 @@ fn enhanced_path_group_delay_matches_bypass() {
         );
         let lag = best.0 as isize;
         assert!(
-            (lag - ENGINE_LATENCY as isize).abs() <= 8,
-            "{model}: enhanced-path group delay {lag} drifted from {ENGINE_LATENCY}"
+            (lag - LATENCY_SAMPLES as isize).abs() <= 8,
+            "{model}: enhanced-path group delay {lag} drifted from {LATENCY_SAMPLES}"
         );
     }
 }

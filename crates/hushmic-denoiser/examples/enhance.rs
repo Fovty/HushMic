@@ -1,17 +1,18 @@
-//! Offline file enhancer: run a 48 kHz mono WAV through the DPDFNet engine.
+//! Repo-internal offline enhancer: run a 48 kHz mono WAV through the engine.
 //!
-//!   cargo run --release --example enhance -p dpdfnet-ladspa -- in.wav out.wav
+//!   cargo run --release --example enhance -p hushmic-denoiser -- in.wav out.wav
 //!
-//! Reads a 48 kHz mono WAV, streams it through `dpdfnet_ladspa::engine::Engine`
-//! hop-by-hop (480-sample hops, mirroring tests/parity.rs), and writes the
-//! enhanced result as a 48 kHz mono WAV.
+//! Streams hop-by-hop with NO latency alignment — the raw engine output
+//! framing that scripts/gen-parity-fixtures.py and docs/demo/make-demos.py
+//! depend on (the committed goldens are byte-comparable to this output).
+//! Application-style, latency-aligned file denoising is what the
+//! `denoise_wav` example shows instead.
 //!
 //! Model path:   $HUSHMIC_MODEL_PATH  (else <repo>/assets/models/dpdfnet8_48khz_hr.onnx)
-//! ORT runtime:  $ORT_DYLIB_PATH      (else baked-in <repo>/assets/lib/libonnxruntime.so)
+//! ORT runtime:  $ORT_DYLIB_PATH      (else <repo>/assets/lib/libonnxruntime.so)
 
-use dpdfnet_ladspa::engine::Engine;
-use dpdfnet_ladspa::stft::HOP;
-use std::path::{Path, PathBuf};
+use hushmic_denoiser::{Denoiser, HOP};
+use std::path::PathBuf;
 
 fn read_wav_mono_f32(p: &str) -> (Vec<f32>, u32) {
     let mut r = hound::WavReader::open(p).expect("open input wav");
@@ -41,17 +42,28 @@ fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / x.len() as f64).sqrt() as f32
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 fn model_path() -> PathBuf {
     if let Ok(p) = std::env::var("HUSHMIC_MODEL_PATH") {
         return PathBuf::from(p);
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    root.join("assets/models/dpdfnet8_48khz_hr.onnx")
+    repo_root().join("assets/models/dpdfnet8_48khz_hr.onnx")
+}
+
+/// Dev-tree runtime bring-up: honor ORT_DYLIB_PATH, else the repo's bundled
+/// runtime (the library's own fallback would try the system soname, which a
+/// development checkout should not depend on).
+fn init_dev_runtime() {
+    if std::env::var("ORT_DYLIB_PATH").is_err() {
+        let bundled = repo_root().join("assets/lib/libonnxruntime.so");
+        if bundled.exists() {
+            hushmic_denoiser::init_runtime(&bundled)
+                .unwrap_or_else(|e| panic!("bundled runtime: {e}"));
+        }
+    }
 }
 
 fn main() {
@@ -71,8 +83,9 @@ fn main() {
         );
     }
 
+    init_dev_runtime();
     let model = model_path();
-    let mut eng = Engine::new(Path::new(&model))
+    let mut eng = Denoiser::from_file(&model)
         .unwrap_or_else(|e| panic!("engine init ({}): {e}", model.display()));
 
     let mut out = Vec::with_capacity(noisy.len());

@@ -41,7 +41,7 @@ fn latency_node_rendered_only_when_supported() {
 fn latency_constant_and_rendered_seconds_agree() {
     // 2880 samples @ 48 kHz = 0.06 s; the render derives one from the
     // other so they cannot drift apart. The 2880 itself is pinned against
-    // the MEASURED DSP by dpdfnet-ladspa's latency_probe tests
+    // the MEASURED DSP by the hushmic-denoiser crate's latency tests
     // (engine 2400 + one-hop output prefill 480).
     assert_eq!(LATENCY_SAMPLES, 2880);
     let secs = LATENCY_SAMPLES as f64 / 48_000.0;

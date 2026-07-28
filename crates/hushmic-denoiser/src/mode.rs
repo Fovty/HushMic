@@ -5,26 +5,20 @@ use crate::stft::HOP;
 /// Samples the mute gain ramp spans: one hop = 10 ms @48 kHz.
 pub const MUTE_RAMP_SAMPLES: usize = HOP;
 
+/// What leaves the denoiser. The engine keeps running in every mode (its
+/// recurrent state stays warm, so transitions are instant and glitch-free).
+///
+/// `non_exhaustive`: modes have been added before (`Mute` arrived after
+/// `Bypass`); downstream matches need a catch-all arm.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
+    /// Denoised output (the default).
     Process,
+    /// The unprocessed input, latency-aligned with the denoised path.
     Bypass,
+    /// Exact digital silence, entered/left through a short fade.
     Mute,
-}
-
-impl Mode {
-    /// LADSPA control value -> mode: round to nearest, clamp to 0..=2.
-    /// Non-finite values fall back to Process (the safe default).
-    pub fn from_control(v: f32) -> Mode {
-        if !v.is_finite() {
-            return Mode::Process;
-        }
-        match v.round().clamp(0.0, 2.0) as u8 {
-            1 => Mode::Bypass,
-            2 => Mode::Mute,
-            _ => Mode::Process,
-        }
-    }
 }
 
 /// Time-domain output gain with a linear per-sample ramp. The first target
@@ -54,11 +48,13 @@ impl GainRamp {
         }
     }
 
-    /// Reset to the unprimed state (fresh session): the next `set_muted`
-    /// snaps again.
-    pub fn reset(&mut self) {
-        self.gain = 1.0;
-        self.target = 1.0;
+    /// Reset directly INTO a mute state, still unprimed: the gain lands on
+    /// the target instantly (a reset-while-muted stream must not leak even
+    /// one sample) and the next `set_muted` still snaps.
+    pub fn reset_to(&mut self, muted: bool) {
+        let g = if muted { 0.0 } else { 1.0 };
+        self.gain = g;
+        self.target = g;
         self.primed = false;
     }
 
@@ -82,19 +78,6 @@ impl GainRamp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn from_control_rounds_and_clamps() {
-        assert_eq!(Mode::from_control(0.0), Mode::Process);
-        assert_eq!(Mode::from_control(0.4), Mode::Process);
-        assert_eq!(Mode::from_control(0.6), Mode::Bypass);
-        assert_eq!(Mode::from_control(1.0), Mode::Bypass);
-        assert_eq!(Mode::from_control(2.0), Mode::Mute);
-        assert_eq!(Mode::from_control(2.7), Mode::Mute);
-        assert_eq!(Mode::from_control(-3.0), Mode::Process);
-        assert_eq!(Mode::from_control(7.0), Mode::Mute);
-        assert_eq!(Mode::from_control(f32::NAN), Mode::Process);
-    }
 
     #[test]
     fn first_set_snaps_born_muted_leaks_nothing() {
@@ -150,10 +133,27 @@ mod tests {
     }
 
     #[test]
-    fn reset_unprimes_so_next_set_snaps() {
+    fn reset_to_muted_is_silent_and_still_snaps() {
+        let mut g = GainRamp::new();
+        g.set_muted(false); // primed at unity mid-session
+        g.reset_to(true);
+        let mut hop = [1.0f32; MUTE_RAMP_SAMPLES];
+        g.process(&mut hop);
+        assert!(
+            hop.iter().all(|&s| s == 0.0),
+            "reset into mute must not leak a fade"
+        );
+        g.set_muted(false); // next set after reset_to must snap, not ramp
+        let mut hop = [1.0f32; MUTE_RAMP_SAMPLES];
+        g.process(&mut hop);
+        assert!(hop.iter().all(|&s| s == 1.0), "post-reset_to set must snap");
+    }
+
+    #[test]
+    fn reset_to_unmuted_unprimes_so_next_set_snaps() {
         let mut g = GainRamp::new();
         g.set_muted(false); // primed at unity
-        g.reset();
+        g.reset_to(false);
         g.set_muted(true); // must snap, not ramp
         let mut hop = [1.0f32; MUTE_RAMP_SAMPLES];
         g.process(&mut hop);

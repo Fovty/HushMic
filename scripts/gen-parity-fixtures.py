@@ -100,7 +100,7 @@ def main():
         noisy_wav = os.path.join(tmp, "noisy.wav")
         write_wav_f32(noisy_wav, noisy_i16.astype(np.float32) / 32768.0)
         golden_wav = os.path.join(tmp, "golden.wav")
-        run("cargo", "run", "--release", "-q", "--example", "enhance", "-p", "dpdfnet-ladspa",
+        run("cargo", "run", "--release", "-q", "--example", "enhance", "-p", "hushmic-denoiser",
             "--", noisy_wav, golden_wav, cwd=REPO)
         golden = load_f32(golden_wav)
         golden_i16 = to_i16(np.clip(golden, -1.0, 1.0))

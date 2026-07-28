@@ -414,7 +414,7 @@ context.modules = [
 /// The chain's algorithmic latency in samples at 48 kHz: 480 (STFT
 /// framing) + 1920 (the model's 4-hop group delay) + 480 (the plugin's
 /// one-hop output prefill) = 2880 = 60 ms. MEASURED, not derived — the
-/// dpdfnet-ladspa `latency_probe` tests push impulses and real speech
+/// hushmic-denoiser crate's latency tests push impulses and real speech
 /// through the actual DSP and pin the engine part at exactly 2400 for
 /// both models; change the DSP and those tests force this constant to be
 /// re-derived. PipeWire adds its own quantum/device buffering on top.

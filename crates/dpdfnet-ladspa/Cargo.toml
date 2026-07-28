@@ -5,13 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib so tests can link the engine
+crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the descriptor tests
 
 [dependencies]
 ladspa = "0.3.4"
-rustfft = "6"
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-18"] }
-
-[dev-dependencies]
-hound = "3.5"
-claxon = "0.4" # FLAC decode for the committed public parity fixtures
+hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.5.1" }

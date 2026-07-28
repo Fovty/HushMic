@@ -1,19 +1,15 @@
-//! hushmic DPDFNet LADSPA plugin.
-pub mod attn;
-pub mod engine;
-pub mod mode;
-pub mod model;
-pub mod stft;
-
-use engine::Engine;
+//! hushmic DPDFNet LADSPA plugin: a thin PipeWire-facing wrapper around the
+//! `hushmic-denoiser` engine crate. Everything here is host plumbing —
+//! control-port mapping, buffering to the host's quantum, and the bundled
+//! ONNX Runtime's baked default paths.
+use hushmic_denoiser::{Denoiser, Mode, RuntimeInit, HOP};
 use ladspa::{DefaultValue, Plugin, PluginDescriptor, Port, PortConnection, PortDescriptor};
-use mode::Mode;
 use std::path::PathBuf;
-use stft::HOP;
 
 const LABEL: &str = "dpdfnet_mono";
 const UNIQUE_ID: u64 = 0x68736D31; // "hsm1"
 const DEFAULT_MODEL: &str = env!("HUSHMIC_DEFAULT_MODEL");
+const DEFAULT_DYLIB: &str = env!("HUSHMIC_DEFAULT_DYLIB");
 
 fn model_path() -> PathBuf {
     std::env::var("HUSHMIC_MODEL_PATH")
@@ -21,12 +17,58 @@ fn model_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_MODEL))
 }
 
+/// LADSPA control value -> mode: round to nearest, clamp to 0..=2.
+/// Non-finite values fall back to Process (the safe default).
+fn mode_from_control(v: f32) -> Mode {
+    if !v.is_finite() {
+        return Mode::Process;
+    }
+    match v.round().clamp(0.0, 2.0) as u8 {
+        1 => Mode::Bypass,
+        2 => Mode::Mute,
+        _ => Mode::Process,
+    }
+}
+
+/// Bring up the pinned bundled runtime and load the model. On any failure the
+/// plugin runs engine-less (working-but-silent node). The runtime commit is
+/// gated on OUR resolved path — a failed init must never fall through to a
+/// random system libonnxruntime replacing the pinned bundled one, so no
+/// `Denoiser` constructor (whose implicit resolution would try exactly that)
+/// is ever reached on the error path.
+fn init_engine() -> Option<Denoiser> {
+    let dylib = std::env::var("ORT_DYLIB_PATH")
+        .ok()
+        .filter(|s| !s.is_empty()) // empty counts as unset, as in ort itself
+        .unwrap_or_else(|| DEFAULT_DYLIB.to_string());
+    match hushmic_denoiser::init_runtime(&dylib) {
+        Err(e) => {
+            eprintln!("[dpdfnet-ladspa] {e}");
+            return None;
+        }
+        Ok(RuntimeInit::AlreadyInitialized) => eprintln!(
+            "[dpdfnet-ladspa] note: an ONNX Runtime environment was already committed in \
+             this process; the bundled runtime at {dylib} may not be the one in use"
+        ),
+        // RuntimeInit is non_exhaustive: any future variant still means "a
+        // runtime is committed", so proceeding is the right default.
+        Ok(_) => {}
+    }
+    match Denoiser::from_file(model_path()) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("[dpdfnet-ladspa] engine init failed: {e}");
+            None
+        }
+    }
+}
+
 /// Largest PipeWire quantum we pre-reserve buffer space for, so `run()` never
 /// reallocates on the audio thread once `activate()` has been called.
 const MAX_EXPECTED_QUANTUM: usize = 8192;
 
 struct DpdfnetPlugin {
-    engine: Option<Engine>,
+    engine: Option<Denoiser>,
     in_buf: Vec<f32>,
     out_buf: Vec<f32>, // committed enhanced samples waiting to be emitted
     last_db: f32,
@@ -47,13 +89,7 @@ impl DpdfnetPlugin {
             );
             None
         } else {
-            match Engine::new(&model_path()) {
-                Ok(e) => Some(e),
-                Err(e) => {
-                    eprintln!("[dpdfnet-ladspa] engine init failed: {e}");
-                    None
-                }
-            }
+            init_engine()
         };
         DpdfnetPlugin {
             engine,
@@ -96,12 +132,12 @@ impl Plugin for DpdfnetPlugin {
             } // passthrough-silence on failure
         };
         if db != self.last_db {
-            engine.set_attn_db(db);
+            engine.set_attenuation_limit_db(db);
             self.last_db = db;
         }
         let mode_ctl = *ports[3].unwrap_control();
         if mode_ctl != self.last_mode {
-            engine.set_mode(Mode::from_control(mode_ctl));
+            engine.set_mode(mode_from_control(mode_ctl));
             self.last_mode = mode_ctl;
         }
 
@@ -214,6 +250,19 @@ mod tests {
         assert_eq!(p.upper_bound, Some(2.0));
         assert!(matches!(p.default, Some(DefaultValue::Minimum)));
         assert_eq!(p.hint, Some(ladspa::HINT_INTEGER), "integer-valued mode");
+    }
+
+    #[test]
+    fn from_control_rounds_and_clamps() {
+        assert_eq!(mode_from_control(0.0), Mode::Process);
+        assert_eq!(mode_from_control(0.4), Mode::Process);
+        assert_eq!(mode_from_control(0.6), Mode::Bypass);
+        assert_eq!(mode_from_control(1.0), Mode::Bypass);
+        assert_eq!(mode_from_control(2.0), Mode::Mute);
+        assert_eq!(mode_from_control(2.7), Mode::Mute);
+        assert_eq!(mode_from_control(-3.0), Mode::Process);
+        assert_eq!(mode_from_control(7.0), Mode::Mute);
+        assert_eq!(mode_from_control(f32::NAN), Mode::Process);
     }
 
     #[test]

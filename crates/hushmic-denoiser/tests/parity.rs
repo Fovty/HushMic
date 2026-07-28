@@ -1,6 +1,7 @@
-use dpdfnet_ladspa::engine::Engine;
-use dpdfnet_ladspa::stft::HOP;
-use std::path::PathBuf;
+mod common;
+
+use common::{dev_denoiser, repo_root};
+use hushmic_denoiser::HOP;
 
 fn read_wav_mono_f32(p: &str) -> Vec<f32> {
     let mut r = hound::WavReader::open(p).expect("open wav");
@@ -60,28 +61,21 @@ fn read_flac_mono_f32(p: &std::path::Path) -> Vec<f32> {
 /// cross-CPU float differences in ORT.
 #[test]
 fn matches_committed_public_golden() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let model = root.join("assets/models/dpdfnet8_48khz_hr.onnx");
-    if !model.exists() {
+    let Some(mut den) = dev_denoiser("dpdfnet8_48khz_hr.onnx") else {
         // bare checkout without scripts/setup-assets.sh; CI always provisions
         eprintln!("skipping matches_committed_public_golden: model not provisioned");
         return;
-    }
+    };
+    let root = repo_root();
     let noisy = read_flac_mono_f32(&root.join("tests/fixtures/noisy_public_48k.flac"));
     let golden = read_flac_mono_f32(&root.join("tests/fixtures/golden_public_dpdfnet8.flac"));
 
-    let mut eng = Engine::new(&model).expect("engine");
     let mut out = Vec::with_capacity(noisy.len());
     let mut hop_in = [0f32; HOP];
     let mut hop_out = [0f32; HOP];
     for h in 0..noisy.len() / HOP {
         hop_in.copy_from_slice(&noisy[h * HOP..(h + 1) * HOP]);
-        eng.process_hop(&hop_in, &mut hop_out).expect("process");
+        den.process_hop(&hop_in, &mut hop_out).expect("process");
         out.extend_from_slice(&hop_out);
     }
     let skip = 4 * HOP; // STFT/OLA + model-state warm-up
@@ -95,13 +89,7 @@ fn matches_committed_public_golden() {
 
 #[test]
 fn matches_golden_reference() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let model = root.join("assets/models/dpdfnet8_48khz_hr.onnx");
+    let root = repo_root();
     let noisy_path = root.join("tests/fixtures/noisy_fan_48k.wav");
     let golden_path = root.join("tests/fixtures/golden_fan_dpdfnet8.wav");
 
@@ -110,32 +98,33 @@ fn matches_golden_reference() {
     // so a clean checkout (e.g. CI) has neither. Skip rather than fail there: the
     // engine-load + ONNX inference path is still covered by model::tests in CI, and
     // this golden-correlation check runs wherever the fixtures are provisioned.
-    if !model.exists() || !noisy_path.exists() || !golden_path.exists() {
+    let den = dev_denoiser("dpdfnet8_48khz_hr.onnx");
+    if den.is_none() || !noisy_path.exists() || !golden_path.exists() {
         eprintln!(
             "skipping matches_golden_reference: model/fixtures not provisioned \
              (local-only golden-parity test)"
         );
         return;
     }
+    let mut den = den.unwrap();
 
     let noisy = read_wav_mono_f32(noisy_path.to_str().unwrap());
     let golden = read_wav_mono_f32(golden_path.to_str().unwrap());
 
-    let mut eng = Engine::new(&model).expect("engine");
     let mut out = Vec::with_capacity(noisy.len());
     let mut hop_in = [0f32; HOP];
     let mut hop_out = [0f32; HOP];
     let hops = noisy.len() / HOP;
     for h in 0..hops {
         hop_in.copy_from_slice(&noisy[h * HOP..(h + 1) * HOP]);
-        eng.process_hop(&hop_in, &mut hop_out).expect("process");
+        den.process_hop(&hop_in, &mut hop_out).expect("process");
         out.extend_from_slice(&hop_out);
     }
     // Skip the first 4 hops on both streams for STFT/OLA warm-up. The causal engine
-    // uses an N_FFT/2 leading-pad analysis (center=True equivalent, verified by
-    // stft_cola.rs as exactly one hop of pass-through delay); the *offline* golden
-    // reference's istft trims that pad, so the engine output lags the golden by
-    // exactly one hop. Advance the engine stream by that one-hop latency before
+    // uses an N_FFT/2 leading-pad analysis (center=True equivalent, verified by the
+    // STFT unit tests as exactly one hop of pass-through delay); the *offline*
+    // golden reference's istft trims that pad, so the engine output lags the golden
+    // by exactly one hop. Advance the engine stream by that one-hop latency before
     // correlating. Expect near-identical output (rustfft vs numpy fft only).
     let skip = 4 * HOP;
     let latency = HOP; // causal STFT center-pad vs the offline (trimmed) golden

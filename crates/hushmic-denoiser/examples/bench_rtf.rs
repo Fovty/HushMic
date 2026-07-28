@@ -1,10 +1,21 @@
-use dpdfnet_ladspa::engine::Engine;
-use dpdfnet_ladspa::stft::HOP;
+//! Real-time-factor probe: p95 per-hop inference cost against the 10 ms
+//! budget. Dev tool; set HUSHMIC_MODEL_PATH (and ORT_DYLIB_PATH unless the
+//! repo's bundled runtime is provisioned).
+
+use hushmic_denoiser::{Denoiser, HOP};
+use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() {
+    if std::env::var("ORT_DYLIB_PATH").is_err() {
+        let bundled =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/lib/libonnxruntime.so");
+        if bundled.exists() {
+            hushmic_denoiser::init_runtime(&bundled).unwrap();
+        }
+    }
     let model = std::env::var("HUSHMIC_MODEL_PATH").unwrap();
-    let mut eng = Engine::new(std::path::Path::new(&model)).unwrap();
+    let mut eng = Denoiser::from_file(&model).unwrap();
     let zero = [0f32; HOP];
     let mut out = [0f32; HOP];
     for _ in 0..50 {

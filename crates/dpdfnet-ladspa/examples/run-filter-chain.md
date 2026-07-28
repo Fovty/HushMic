@@ -107,7 +107,7 @@ Expect a non-empty WAV and no xrun/underrun lines.
 cd ~/hushmic
 HUSHMIC_MODEL_PATH=$HOME/hushmic-rt/models/dpdfnet8_48khz_hr.onnx \
 ORT_DYLIB_PATH=$HOME/hushmic-rt/lib/libonnxruntime.so \
-  cargo run --release --example bench_rtf -p dpdfnet-ladspa
+  cargo run --release --example bench_rtf -p hushmic-denoiser
 ```
 
 Per-hop budget is 10 ms (480 samples @ 48 kHz). Target `RTF_p95 < 0.6`. If it

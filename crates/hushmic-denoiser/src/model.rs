@@ -1,6 +1,6 @@
 //! ONNX model wrapper for DPDFNet (single-thread CPU via the `ort` crate).
 //!
-//! Loads the `dpdfnet8_48khz_hr.onnx` graph, seeds the recurrent state from the
+//! Loads a DPDFNet graph (file or bytes), seeds the recurrent state from the
 //! model's custom metadata (`erb_norm_init` + `spec_norm_init`), and runs one hop:
 //!   inputs : `spec` `[1,1,481,2]` (f32 interleaved re/im) + `state_in` `[state_size]`
 //!   outputs: `spec_e` `[1,1,481,2]` + `state_out` `[state_size]`
@@ -9,33 +9,6 @@ use crate::stft::{FREQ_BINS, SPEC_LEN};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::TensorRef;
 use std::path::Path;
-use std::sync::Once;
-
-const DEFAULT_DYLIB: &str = env!("HUSHMIC_DEFAULT_DYLIB");
-static RUNTIME_INIT: Once = Once::new();
-static RUNTIME_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Point ort at the bundled libonnxruntime and commit the environment.
-/// Idempotent; returns whether the runtime dylib actually loaded. Callers must
-/// not touch `Session::builder()` on `false`: without a committed environment
-/// ort's API bootstrap would retry the load itself and PANIC on failure,
-/// bypassing the engine=None graceful-silence path a missing dylib should hit.
-pub fn ensure_runtime() -> bool {
-    RUNTIME_INIT.call_once(|| {
-        let dylib = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| DEFAULT_DYLIB.to_string());
-        // init_from dlopens the dylib and runs ort's version check; commit() installs the env.
-        // NB: in rc.12 `init_from` returns `Result<EnvironmentBuilder>` and `commit()` returns
-        // `bool` (true if installed, false if an env was already committed) -- it is not a Result.
-        match ort::init_from(&dylib) {
-            Ok(builder) => {
-                let _ = builder.commit();
-                RUNTIME_OK.store(true, std::sync::atomic::Ordering::Release);
-            }
-            Err(e) => eprintln!("[dpdfnet-ladspa] ort init_from({dylib}) failed: {e}"),
-        }
-    });
-    RUNTIME_OK.load(std::sync::atomic::Ordering::Acquire)
-}
 
 pub struct Model {
     session: Session,
@@ -49,26 +22,39 @@ fn parse_csv_f32(s: &str) -> Vec<f32> {
         .collect()
 }
 
+/// Deterministic single-thread CPU session options; callers must have a
+/// committed runtime environment before touching `Session::builder()` (ort's
+/// API bootstrap would otherwise retry the dylib load itself and PANIC on
+/// failure) — `crate::runtime::ensure_runtime` guarantees that.
+fn session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
+    Session::builder()
+        .map_err(|e| e.to_string())?
+        .with_execution_providers([ort::ep::CPU::default().build()])
+        .map_err(|e| e.to_string())?
+        .with_intra_threads(1)
+        .map_err(|e| e.to_string())?
+        .with_inter_threads(1)
+        .map_err(|e| e.to_string())?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| e.to_string())
+}
+
 impl Model {
     pub fn load(model_path: &Path) -> Result<Model, String> {
-        if !ensure_runtime() {
-            return Err("ONNX Runtime unavailable (libonnxruntime failed to load; \
-                        see ORT_DYLIB_PATH)"
-                .to_string());
-        }
-        let session = Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(1)
-            .map_err(|e| e.to_string())?
-            .with_inter_threads(1)
-            .map_err(|e| e.to_string())?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| e.to_string())?
+        let session = session_builder()?
             .commit_from_file(model_path)
             .map_err(|e| format!("commit_from_file({}): {e}", model_path.display()))?;
+        Model::from_session(session)
+    }
 
+    pub fn from_memory(model_bytes: &[u8]) -> Result<Model, String> {
+        let session = session_builder()?
+            .commit_from_memory(model_bytes)
+            .map_err(|e| format!("commit_from_memory: {e}"))?;
+        Model::from_session(session)
+    }
+
+    fn from_session(session: Session) -> Result<Model, String> {
         let meta = session.metadata().map_err(|e| e.to_string())?;
 
         // state_size: the model exports it as authoritative custom metadata. We prefer this over
@@ -166,20 +152,36 @@ impl Model {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "load-dynamic"))]
 mod tests {
     use super::*;
     use crate::stft::SPEC_LEN;
     use std::path::PathBuf;
 
-    fn model_path() -> PathBuf {
-        PathBuf::from(env!("HUSHMIC_DEFAULT_MODEL"))
+    /// Development assets provisioned by the repo's asset setup; self-skip
+    /// when absent so the suite runs on bare checkouts.
+    fn dev_asset(rel: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel);
+        if !p.exists() && std::env::var("HUSHMIC_ASSERT_ASSETS").as_deref() == Ok("1") {
+            panic!("{} missing but HUSHMIC_ASSERT_ASSETS=1", p.display());
+        }
+        p.exists().then_some(p)
     }
 
     #[test]
     fn loads_and_runs_one_frame() {
-        ensure_runtime();
-        let mut m = Model::load(&model_path()).expect("load model");
+        let (Some(mp), Some(rt)) = (
+            dev_asset("assets/models/dpdfnet8_48khz_hr.onnx"),
+            dev_asset("assets/lib/libonnxruntime.so"),
+        ) else {
+            eprintln!("skipping loads_and_runs_one_frame: assets not provisioned");
+            return;
+        };
+        // AlreadyInitialized is fine — some other test may have won the commit.
+        crate::runtime::init_runtime(rt).expect("runtime");
+        let mut m = Model::load(&mp).expect("load model");
         // dpdfnet8 state size
         assert_eq!(m.state_size, 90228, "unexpected state size");
         // init_state has exactly 577 nonzero leading elements

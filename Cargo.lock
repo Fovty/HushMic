@@ -766,11 +766,8 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 name = "dpdfnet-ladspa"
 version = "0.5.1"
 dependencies = [
- "claxon",
- "hound",
+ "hushmic-denoiser",
  "ladspa",
- "ort",
- "rustfft",
 ]
 
 [[package]]
@@ -1366,6 +1363,17 @@ dependencies = [
  "toml",
  "winit",
  "zbus",
+]
+
+[[package]]
+name = "hushmic-denoiser"
+version = "0.5.1"
+dependencies = [
+ "claxon",
+ "hound",
+ "libloading 0.9.0",
+ "ort",
+ "rustfft",
 ]
 
 [[package]]

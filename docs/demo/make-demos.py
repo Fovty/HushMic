@@ -112,7 +112,7 @@ def main():
         write_wav(before, mix)
 
         print("enhancing", name)
-        run("cargo", "run", "--release", "-q", "--example", "enhance", "-p", "dpdfnet-ladspa",
+        run("cargo", "run", "--release", "-q", "--example", "enhance", "-p", "hushmic-denoiser",
             "--", before, after, cwd=REPO)
 
         bg_b = os.path.join(OUT, f"bg_before_{name}.png")
