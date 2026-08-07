@@ -5,6 +5,7 @@
 //! current mode (e.g. a stale `PlaybackProgress` after Stop) are ignored.
 
 use crate::abtest::types::{Channel, Command, Frame, SampleMetrics, RECORD_SECS};
+use crate::tr;
 
 /// Toast auto-dismiss time.
 // Long enough to READ the longest diagnosis toast (~100 chars at ~15
@@ -252,7 +253,7 @@ impl WindowState {
     pub fn timeline(&self) -> Timeline {
         if !self.device_ok {
             return Timeline {
-                label: "Input unavailable".into(),
+                label: tr!("ab-timeline-input-unavailable"),
                 pct: 0.0,
                 time: "\u{2014}".into(),
             };
@@ -260,22 +261,22 @@ impl WindowState {
         match self.mode {
             // Live shows no fill and no 10 s wrap — elapsed is text only.
             Mode::Live => Timeline {
-                label: "Live monitoring".into(),
+                label: tr!("ab-timeline-live"),
                 pct: 0.0,
                 time: fmt_time(self.elapsed),
             },
             Mode::Recording => {
                 let left = (RECORD_SECS - self.rec_secs_done).max(0.0);
                 Timeline {
-                    label: format!("Recording sample \u{2014} {left:.1} s left"),
+                    label: tr!("ab-timeline-recording", secs = format!("{left:.1}")),
                     pct: (RECORD_SECS - left) * 10.0,
                     time: format!("{} / 0:10.0", fmt_time(self.rec_secs_done)),
                 }
             }
             Mode::Playback(ch) => Timeline {
                 label: match ch {
-                    Channel::Raw => "Playing raw sample".into(),
-                    Channel::Filtered => "Playing filtered sample".into(),
+                    Channel::Raw => tr!("ab-timeline-playing-raw"),
+                    Channel::Filtered => tr!("ab-timeline-playing-filtered"),
                 },
                 pct: self.play_pos * 10.0,
                 time: format!("{} / 0:10.0", fmt_time(self.play_pos)),
@@ -283,13 +284,13 @@ impl WindowState {
             Mode::Sample => {
                 if self.has_sample {
                     Timeline {
-                        label: "Sample ready".into(),
+                        label: tr!("ab-sample-ready"),
                         pct: 100.0,
                         time: "0:10.0".into(),
                     }
                 } else {
                     Timeline {
-                        label: "Not monitoring".into(),
+                        label: tr!("ab-not-monitoring"),
                         pct: 0.0,
                         time: "\u{2014}".into(),
                     }
@@ -330,6 +331,9 @@ mod tests {
     use super::*;
 
     fn state(mode: Mode, has_sample: bool, device_ok: bool) -> WindowState {
+        // Labels are asserted in English; pin the catalog before the
+        // process-global loader initializes lazily.
+        crate::i18n::pin_english();
         let mut s = WindowState::new();
         s.mode = mode;
         s.has_sample = has_sample;
@@ -800,7 +804,10 @@ mod tests {
     // it informs.
     #[test]
     fn toast_duration_covers_reading_the_longest_hint() {
-        let longest = crate::abtest::audio::SILENT_MIC_HINT.len() as f32;
+        // Calibrated against the English catalog; a language whose longest
+        // hint outgrows it materially would need TOAST_SECS revisited.
+        crate::i18n::pin_english();
+        let longest = crate::abtest::audio::silent_mic_hint().len() as f32;
         assert!(
             TOAST_SECS >= longest / 15.0,
             "TOAST_SECS {TOAST_SECS} too short for a {longest}-char hint"
@@ -973,6 +980,7 @@ mod tests {
 
     #[test]
     fn full_session_flow() {
+        crate::i18n::pin_english();
         let mut s = WindowState::new();
         assert_eq!(s.mode, Mode::Sample);
         assert!(s.stopped_hint());

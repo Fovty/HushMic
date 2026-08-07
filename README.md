@@ -230,6 +230,10 @@ Three parts:
 2. **`dpdfnet-ladspa`** — a thin LADSPA plugin wrapping that engine for PipeWire, hop-by-hop in real time.
 3. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed; the mic's lifetime is tied to the app, and quitting tears it down cleanly (restoring your previous default input).
 
+## Translations
+
+HushMic is being translated on [Hosted Weblate](https://hosted.weblate.org/projects/hushmic/) — contributions welcome, no tooling needed. Details in [TRANSLATING.md](TRANSLATING.md).
+
 ## Support
 
 HushMic is free, open source, and makes zero network calls — no ads, no telemetry, no accounts. If it saved you a Krisp subscription, a coffee on **[Ko-fi](https://ko-fi.com/fovty)** is genuinely appreciated and helps keep it maintained. Starring the repo helps too.

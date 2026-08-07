@@ -11,6 +11,7 @@
 //! wedge forever.
 
 use crate::notify::{self, Slot};
+use crate::tr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,12 +21,37 @@ pub const RECORD_SECS: u64 = 5;
 
 /// The worker's result when the test was aborted because the filter-chain
 /// was reconfigured/restarted mid-test (any chain mutation invalidates the
-/// cleaned leg). Compared by the main loop to soften the notification.
+/// cleaned leg). Compared BY VALUE by the main loop as a sentinel — the
+/// user-visible text is the `notify-mictest-cancelled-body` catalog key at
+/// the display site; folding this constant into a translation would break
+/// the equality match under a non-English locale.
 pub const CANCELLED_MSG: &str = "Stopped — the audio settings changed during the test.";
 
 const ICON: &str = "audio-input-microphone";
 const RAW_NAME: &str = "mictest-raw.wav";
 const CLEAN_NAME: &str = "mictest-cleaned.wav";
+
+/// Why a mic test cannot start right now. [`Blocked::message`] is the
+/// localized notification body; logs print the variant name (`{:?}`) so
+/// journals stay English.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocked {
+    AlreadyRunning,
+    SuppressionOff,
+    NodeMissing,
+    ProbeFailed,
+}
+
+impl Blocked {
+    pub fn message(&self) -> String {
+        match self {
+            Blocked::AlreadyRunning => crate::tr!("notify-mictest-blocked-running"),
+            Blocked::SuppressionOff => crate::tr!("notify-mictest-blocked-disabled"),
+            Blocked::NodeMissing => crate::tr!("notify-mictest-blocked-no-node"),
+            Blocked::ProbeFailed => crate::tr!("notify-mictest-blocked-no-probe"),
+        }
+    }
+}
 
 /// Whether a mic test can start right now; the error is user-facing
 /// (surfaced as a notification). Requires the chain to be up: the point of
@@ -35,22 +61,17 @@ pub fn precondition(
     enabled: bool,
     node_present: Option<bool>,
     already_running: bool,
-) -> Result<(), &'static str> {
+) -> Result<(), Blocked> {
     if already_running {
-        Err("A mic test is already running.")
+        Err(Blocked::AlreadyRunning)
     } else if !enabled {
-        Err(
-            "Turn on noise suppression first — the test compares the raw microphone \
-             with the cleaned HushMic output.",
-        )
+        Err(Blocked::SuppressionOff)
     } else {
         // None = the pw-dump probe itself failed: unknown, NOT "node gone".
         match node_present {
             Some(true) => Ok(()),
-            Some(false) => {
-                Err("The HushMic virtual microphone is not up yet — try again in a few seconds.")
-            }
-            None => Err("Could not query PipeWire for the microphones — is PipeWire running?"),
+            Some(false) => Err(Blocked::NodeMissing),
+            None => Err(Blocked::ProbeFailed),
         }
     }
 }
@@ -349,8 +370,8 @@ fn record_and_play(
     notify::send_transient(
         Slot::MicTest,
         ICON,
-        "Mic test",
-        &format!("Recording {RECORD_SECS} seconds — speak into your microphone…"),
+        &tr!("notify-mictest-title"),
+        &tr!("notify-mictest-recording-body", secs = RECORD_SECS),
     );
     let started = Instant::now();
     // pw-cat < 0.3.64 (e.g. Ubuntu 22.04's 0.3.48) rejects a node NAME as
@@ -415,22 +436,22 @@ fn record_and_play(
     notify::send_transient(
         Slot::MicTest,
         ICON,
-        "Mic test",
-        "Playing the raw recording (without HushMic)…",
+        &tr!("notify-mictest-title"),
+        &tr!("notify-mictest-playing-raw-body"),
     );
     play(raw_wav, cancel)?;
     notify::send_transient(
         Slot::MicTest,
         ICON,
-        "Mic test",
-        "Playing the cleaned recording (what your apps hear)…",
+        &tr!("notify-mictest-title"),
+        &tr!("notify-mictest-playing-clean-body"),
     );
     play(clean_wav, cancel)?;
     notify::send_transient(
         Slot::MicTest,
         ICON,
-        "Mic test",
-        "Mic test finished — the second playback should have had much less background noise.",
+        &tr!("notify-mictest-title"),
+        &tr!("notify-mictest-finished-body"),
     );
     Ok(())
 }
@@ -453,11 +474,14 @@ mod tests {
         // None = pw-dump itself failed: the message must not claim the node
         // is down (None-means-unknown invariant), and the two cases need
         // different advice.
+        crate::i18n::pin_english();
         let probe_failed = precondition(true, None, false).unwrap_err();
         let node_absent = precondition(true, Some(false), false).unwrap_err();
-        assert_ne!(probe_failed, node_absent);
-        assert!(probe_failed.contains("PipeWire"), "{probe_failed}");
-        assert!(!probe_failed.contains("not up yet"), "{probe_failed}");
+        assert_eq!(probe_failed, Blocked::ProbeFailed);
+        assert_eq!(node_absent, Blocked::NodeMissing);
+        let msg = probe_failed.message();
+        assert!(msg.contains("PipeWire"), "{msg}");
+        assert!(!msg.contains("not up yet"), "{msg}");
     }
 
     // Shape mirrors real pw-dump output: Node objects carry node.name under

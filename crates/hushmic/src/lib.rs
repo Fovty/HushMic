@@ -7,6 +7,7 @@ pub mod control;
 pub mod controller;
 pub mod diagnostics;
 pub mod fsutil;
+pub mod i18n;
 pub mod lock;
 pub mod mictest;
 pub mod notify;

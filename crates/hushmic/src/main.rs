@@ -3,6 +3,7 @@ use hushmic::control;
 use hushmic::controller::{self, Controller, Paths, RunMode};
 use hushmic::notify::{self, FailureGate, Slot};
 use hushmic::pipewire;
+use hushmic::tr;
 use hushmic::tray::{HushMicTray, TrayCmd, TrayStatus};
 use hushmic::{autostart, lock, mictest, shortcuts, watchdog};
 use ksni::blocking::TrayMethods;
@@ -32,16 +33,11 @@ enum Event {
     Shutdown,
 }
 
-/// Notification text for enable/watchdog failures (the body carries the
+/// Notification summary for enable/watchdog failures (the body carries the
 /// actionable enable() error).
-const FAIL_SUMMARY: &str = "HushMic could not start the virtual microphone";
-const STUCK_SUMMARY: &str = "HushMic keeps losing the virtual microphone";
-const STUCK_BODY: &str = "Re-creating it keeps failing — is PipeWire running? \
-                          Run `hushmic --tray` from a terminal for details.";
-const FLAP_SUMMARY: &str = "HushMic keeps restarting the virtual microphone";
-const FLAP_BODY: &str = "It went down and was re-created several times in the last few \
-                         minutes — the audio setup may be unstable. Run `hushmic --tray` \
-                         from a terminal for details.";
+fn fail_summary() -> String {
+    tr!("notify-chain-failed-summary")
+}
 
 /// How long a freshly spawned filter-chain host gets to register its node
 /// before an absent `hushmic_source` counts as "down". Registration normally
@@ -243,16 +239,21 @@ fn start_fallback_mictest(
             .any(|s| s.name == "hushmic_source")
     });
     let start = mictest::precondition(cfg.enabled, node_present, *testing)
-        .map_err(String::from)
+        .map_err(|b| b.message())
         .and_then(|()| {
             let traced = dump
                 .as_deref()
                 .and_then(|d| mictest::find_feeding_node(d, "hushmic_input"));
             mictest::raw_target(traced, cfg.mic.as_deref())
-                .ok_or_else(|| "Could not find the microphone feeding HushMic.".to_string())
+                .ok_or_else(|| tr!("notify-no-feeder-body"))
         });
     match start {
-        Err(msg) => notify::send(Slot::MicTest, "audio-input-microphone", "Mic test", &msg),
+        Err(msg) => notify::send(
+            Slot::MicTest,
+            "audio-input-microphone",
+            &tr!("notify-mictest-title"),
+            &msg,
+        ),
         Ok(raw) => {
             *testing = true;
             let flag = Arc::new(AtomicBool::new(false));
@@ -404,16 +405,15 @@ fn main() {
         // file fine on every version), reusing the same path as the no-GL
         // fallback. Standalone `--test-window` just prints the reason and exits.
         if !pipewire::supports_pipe_capture() {
-            let reason = "The live A/B view needs a newer PipeWire on this system.";
-            eprintln!("hushmic: {reason}");
+            eprintln!("hushmic: The live A/B view needs a newer PipeWire on this system.");
             // Bounded wait, not fire-and-forget: the detached send worker dies
             // with the process on the exit below and the notification would be
             // lost (same reason main()'s could-not-start path uses this).
             notify::send_and_wait(
                 Slot::MicTest,
                 "audio-input-microphone",
-                "Mic test",
-                reason,
+                &tr!("notify-mictest-title"),
+                &tr!("notify-old-pipewire-body"),
                 Duration::from_secs(2),
             );
             std::process::exit(1);
@@ -573,8 +573,8 @@ fn main() {
                 notify::send_and_wait(
                     Slot::Status,
                     "dialog-error",
-                    "HushMic could not start",
-                    &msg,
+                    &tr!("notify-tray-failed-title"),
+                    &tr!("notify-tray-failed-body", error = e.to_string()),
                     Duration::from_secs(2),
                 );
                 std::process::exit(1);
@@ -677,7 +677,12 @@ fn main() {
                 // .desktop/autostart starts — surface it (launch counts as
                 // user-initiated).
                 if gate.on_enable_error(&e.to_string(), true) {
-                    notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, &e.to_string());
+                    notify::send(
+                        Slot::Status,
+                        "dialog-error",
+                        &fail_summary(),
+                        &e.to_string(),
+                    );
                 }
             }
         }
@@ -871,10 +876,8 @@ fn main() {
                         notify::send(
                             Slot::Status,
                             "preferences-desktop-keyboard",
-                            "HushMic shortcuts",
-                            "This desktop cannot open the shortcut editor from \
-                             here. Look for HushMic in your system's keyboard \
-                             shortcut settings to change the keys.",
+                            &tr!("notify-shortcuts-title"),
+                            &tr!("notify-shortcuts-body"),
                         );
                         continue;
                     }
@@ -1019,13 +1022,18 @@ fn main() {
                             notify::send(
                                 Slot::MicTest,
                                 "audio-input-microphone",
-                                "Mic test",
-                                "The A/B test window is already open.",
+                                &tr!("notify-mictest-title"),
+                                &tr!("notify-window-open-body"),
                             );
-                        } else if let Err(msg) =
+                        } else if let Err(blocked) =
                             mictest::precondition(cfg.enabled, node_present, testing)
                         {
-                            notify::send(Slot::MicTest, "audio-input-microphone", "Mic test", msg);
+                            notify::send(
+                                Slot::MicTest,
+                                "audio-input-microphone",
+                                &tr!("notify-mictest-title"),
+                                &blocked.message(),
+                            );
                         } else {
                             match spawn_child_window("--test-window") {
                                 Ok(child) => ab_window = Some((child, Instant::now(), true)),
@@ -1077,7 +1085,7 @@ fn main() {
                 if let Err(e) = &applied {
                     eprintln!("hushmic: enable failed: {e}");
                     if gate.on_enable_error(e, true) {
-                        notify::send(Slot::Status, "dialog-error", FAIL_SUMMARY, e);
+                        notify::send(Slot::Status, "dialog-error", &fail_summary(), e);
                     }
                 } else if !cfg.enabled {
                     // user turned it off: stale failure state must not
@@ -1154,11 +1162,16 @@ fn main() {
                 // Same gate as a tray-menu mic test: a disabled chain or a
                 // missing node gets the actionable notification, not a
                 // window whose device overlay misdiagnoses it.
-                if let Err(msg) = mictest::precondition(cfg.enabled, node_present, testing) {
+                if let Err(blocked) = mictest::precondition(cfg.enabled, node_present, testing) {
                     // Journal breadcrumb: without it, a declined reopen is
                     // indistinguishable from a spawn that died instantly.
-                    eprintln!("[hushmic] not reopening the A/B window: {msg}");
-                    notify::send(Slot::MicTest, "audio-input-microphone", "HushMic", msg);
+                    eprintln!("[hushmic] not reopening the A/B window: {blocked:?}");
+                    notify::send(
+                        Slot::MicTest,
+                        "audio-input-microphone",
+                        "HushMic",
+                        &blocked.message(),
+                    );
                 } else {
                     match spawn_child_window("--test-window") {
                         // Not user_initiated: never escalate a launch into
@@ -1182,13 +1195,18 @@ fn main() {
                         notify::send_transient(
                             Slot::MicTest,
                             "audio-input-microphone",
-                            "Mic test",
-                            &e,
+                            &tr!("notify-mictest-title"),
+                            &tr!("notify-mictest-cancelled-body"),
                         );
                     }
                     Err(e) => {
                         eprintln!("hushmic: mic test failed: {e}");
-                        notify::send(Slot::MicTest, "dialog-error", "Mic test failed", &e);
+                        notify::send(
+                            Slot::MicTest,
+                            "dialog-error",
+                            &tr!("notify-mictest-failed-title"),
+                            &e,
+                        );
                     }
                 }
                 let _ = handle.update(move |t: &mut HushMicTray| {
@@ -1239,9 +1257,8 @@ fn main() {
                         notify::send(
                             Slot::MicTest,
                             "audio-input-microphone",
-                            "Mic test",
-                            "The test window could not start — running the audio-only \
-                             mic test instead.",
+                            &tr!("notify-mictest-title"),
+                            &tr!("notify-window-fallback-body"),
                         );
                         start_fallback_mictest(&cfg, &mut testing, &mut mictest_cancel, &tx);
                     }
@@ -1306,12 +1323,8 @@ fn main() {
                                         notify::send(
                                             Slot::Status,
                                             "audio-input-microphone",
-                                            "Another app is re-routing HushMic's microphone",
-                                            "A running audio tool (EasyEffects?) keeps \
-                                             redirecting HushMic's input to itself. In \
-                                             EasyEffects, disable \"Process All Input \
-                                             Streams\" (or exclude hushmic_input), then \
-                                             restart HushMic.",
+                                            &tr!("notify-reroute-summary"),
+                                            &tr!("notify-reroute-body"),
                                         );
                                     }
                                     let since = repin_last
@@ -1399,8 +1412,8 @@ fn main() {
                                     notify::send(
                                         Slot::Status,
                                         "dialog-error",
-                                        STUCK_SUMMARY,
-                                        STUCK_BODY,
+                                        &tr!("notify-chain-stuck-summary"),
+                                        &tr!("notify-chain-stuck-body"),
                                     );
                                 }
                                 up
@@ -1411,7 +1424,7 @@ fn main() {
                                     notify::send(
                                         Slot::Status,
                                         "dialog-error",
-                                        FAIL_SUMMARY,
+                                        &fail_summary(),
                                         &e.to_string(),
                                     );
                                 }
@@ -1429,7 +1442,12 @@ fn main() {
                             // What quick respawn cycles DO prove is
                             // instability — surface that pattern.
                             if gate.on_respawn() {
-                                notify::send(Slot::Status, "dialog-error", FLAP_SUMMARY, FLAP_BODY);
+                                notify::send(
+                                    Slot::Status,
+                                    "dialog-error",
+                                    &tr!("notify-chain-flapping-summary"),
+                                    &tr!("notify-chain-flapping-body"),
+                                );
                             }
                         }
                     }
@@ -1444,8 +1462,8 @@ fn main() {
                             notify::send(
                                 Slot::Status,
                                 "audio-input-microphone",
-                                "HushMic is running again",
-                                "The virtual microphone is back up.",
+                                &tr!("notify-running-again-summary"),
+                                &tr!("notify-running-again-body"),
                             );
                         }
                     } else if !cfg.enabled {
@@ -1480,13 +1498,11 @@ fn main() {
                         let (log_what, body) = match switch {
                             watchdog::Switch::Fallback => (
                                 "preferred microphone disconnected",
-                                "Your microphone was disconnected — HushMic is \
-                                 following the system default for now.",
+                                tr!("notify-mic-fallback-body"),
                             ),
                             watchdog::Switch::Return => (
                                 "preferred microphone reconnected",
-                                "Your microphone is back — HushMic switched back \
-                                 to it.",
+                                tr!("notify-mic-return-body"),
                             ),
                         };
                         eprintln!("[hushmic] {log_what}; restarting the chain");
@@ -1504,7 +1520,7 @@ fn main() {
                                     Slot::Status,
                                     "audio-input-microphone",
                                     "HushMic",
-                                    body,
+                                    &body,
                                 );
                             }
                             Err(e) => {
@@ -1513,7 +1529,7 @@ fn main() {
                                     notify::send(
                                         Slot::Status,
                                         "dialog-error",
-                                        FAIL_SUMMARY,
+                                        &fail_summary(),
                                         &e.to_string(),
                                     );
                                 }

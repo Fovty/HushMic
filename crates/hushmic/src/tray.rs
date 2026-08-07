@@ -5,6 +5,7 @@
 use crate::config::Config;
 use crate::controller::RunMode;
 use crate::pipewire::Source;
+use crate::tr;
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{MenuItem, Tray};
 use std::sync::mpsc::Sender;
@@ -51,14 +52,6 @@ impl TrayStatus {
             TrayStatus::Error => "hushmic-tray-error",
         }
     }
-    pub fn title_suffix(&self) -> &'static str {
-        match self {
-            TrayStatus::Bypass => " (bypass)",
-            TrayStatus::Mute => " (muted)",
-            TrayStatus::Error => " (error)",
-            _ => "",
-        }
-    }
 }
 
 pub struct HushMicTray {
@@ -83,23 +76,41 @@ pub struct HushMicTray {
     pub shortcuts_available: bool,
 }
 
-const MODELS: &[(&str, &str)] = &[
-    ("dpdfnet8_48khz_hr", "High quality (dpdfnet8)"),
-    ("dpdfnet2_48khz_hr", "Light / low-CPU (dpdfnet2)"),
-];
-const ATTN_PRESETS: &[(f32, &str)] = &[
-    (100.0, "Maximum"),
-    (24.0, "Strong (24 dB)"),
-    (12.0, "Medium (12 dB)"),
-    (6.0, "Light (6 dB)"),
-];
+// The option tables hold ids/values only; labels come from the catalog via
+// the match functions below (the message lookup needs literal keys).
+const MODELS: &[&str] = &["dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr"];
+const ATTN_PRESETS: &[f32] = &[100.0, 24.0, 12.0, 6.0];
+
+fn model_label(id: &str) -> String {
+    match id {
+        "dpdfnet2_48khz_hr" => tr!("tray-model-dpdfnet2"),
+        _ => tr!("tray-model-dpdfnet8"),
+    }
+}
+
+fn attn_label(v: f32) -> String {
+    if (v - 24.0).abs() < 0.5 {
+        tr!("tray-attn-strong")
+    } else if (v - 12.0).abs() < 0.5 {
+        tr!("tray-attn-medium")
+    } else if (v - 6.0).abs() < 0.5 {
+        tr!("tray-attn-light")
+    } else {
+        tr!("tray-attn-maximum")
+    }
+}
 
 impl Tray for HushMicTray {
     fn id(&self) -> String {
         "hushmic".into()
     }
     fn title(&self) -> String {
-        format!("HushMic{}", self.status.title_suffix())
+        match self.status {
+            TrayStatus::Bypass => tr!("tray-title-bypass"),
+            TrayStatus::Mute => tr!("tray-title-muted"),
+            TrayStatus::Error => tr!("tray-title-error"),
+            _ => tr!("tray-title"),
+        }
     }
     fn icon_name(&self) -> String {
         // Inside a Flatpak only app-ID-prefixed icon names are exported to
@@ -151,7 +162,7 @@ impl Tray for HushMicTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         // mic radio: index 0 = "System default", then each real source
         let mut mic_opts = vec![RadioItem {
-            label: "System default".into(),
+            label: tr!("tray-system-default"),
             ..Default::default()
         }];
         mic_opts.extend(self.mics.iter().map(|m| RadioItem {
@@ -169,9 +180,9 @@ impl Tray for HushMicTray {
             // Once recovery has switched the chain, say what it is actually
             // doing; before that (or when recovery can't run), plain truth.
             let suffix = if self.fallback_active {
-                "(unplugged — using system default)"
+                tr!("tray-mic-unplugged")
             } else {
-                "(unavailable)"
+                tr!("tray-mic-unavailable")
             };
             mic_opts.push(RadioItem {
                 label: format!("{name} {suffix}"),
@@ -191,11 +202,11 @@ impl Tray for HushMicTray {
 
         let model_selected = MODELS
             .iter()
-            .position(|(id, _)| *id == self.cfg.model)
+            .position(|id| *id == self.cfg.model)
             .unwrap_or(0);
         let attn_selected = ATTN_PRESETS
             .iter()
-            .position(|(v, _)| (*v - self.cfg.attn_limit).abs() < 0.5)
+            .position(|v| (*v - self.cfg.attn_limit).abs() < 0.5)
             .unwrap_or(0);
 
         let mode_selected = if !self.cfg.enabled {
@@ -211,9 +222,9 @@ impl Tray for HushMicTray {
         vec![
             StandardItem {
                 label: if self.testing {
-                    "Mic test running…".into()
+                    tr!("tray-test-running")
                 } else {
-                    "Test my mic…".into()
+                    tr!("tray-test-mic")
                 },
                 icon_name: "audio-input-microphone".into(),
                 enabled: !self.testing,
@@ -224,7 +235,7 @@ impl Tray for HushMicTray {
             }
             .into(),
             SubMenu {
-                label: "Mode".into(),
+                label: tr!("tray-mode"),
                 submenu: vec![RadioGroup {
                     selected: mode_selected,
                     select: Box::new(|t: &mut Self, idx| {
@@ -245,13 +256,18 @@ impl Tray for HushMicTray {
                         }
                         let _ = t.cmd_tx.send(TrayCmd::SetMode(sel));
                     }),
-                    options: ["Noise suppression", "Bypass", "Mute", "Off"]
-                        .iter()
-                        .map(|l| RadioItem {
-                            label: (*l).into(),
-                            ..Default::default()
-                        })
-                        .collect(),
+                    options: [
+                        tr!("tray-mode-suppress"),
+                        tr!("tray-mode-bypass"),
+                        tr!("tray-mode-mute"),
+                        tr!("tray-mode-off"),
+                    ]
+                    .into_iter()
+                    .map(|label| RadioItem {
+                        label,
+                        ..Default::default()
+                    })
+                    .collect(),
                     ..Default::default()
                 }
                 .into()],
@@ -260,7 +276,7 @@ impl Tray for HushMicTray {
             .into(),
             MenuItem::Separator,
             SubMenu {
-                label: "Microphone".into(),
+                label: tr!("tray-microphone"),
                 submenu: vec![RadioGroup {
                     selected: mic_selected,
                     select: Box::new(move |t: &mut Self, idx| {
@@ -285,18 +301,18 @@ impl Tray for HushMicTray {
             }
             .into(),
             SubMenu {
-                label: "Model".into(),
+                label: tr!("tray-model"),
                 submenu: vec![RadioGroup {
                     selected: model_selected,
                     select: Box::new(|t: &mut Self, idx| {
-                        let id = MODELS[idx].0.to_string();
+                        let id = MODELS[idx].to_string();
                         t.cfg.model = id.clone();
                         let _ = t.cmd_tx.send(TrayCmd::SelectModel(id));
                     }),
                     options: MODELS
                         .iter()
-                        .map(|(_, label)| RadioItem {
-                            label: (*label).into(),
+                        .map(|id| RadioItem {
+                            label: model_label(id),
                             ..Default::default()
                         })
                         .collect(),
@@ -307,18 +323,18 @@ impl Tray for HushMicTray {
             }
             .into(),
             SubMenu {
-                label: "Suppression strength".into(),
+                label: tr!("tray-strength"),
                 submenu: vec![RadioGroup {
                     selected: attn_selected,
                     select: Box::new(|t: &mut Self, idx| {
-                        let v = ATTN_PRESETS[idx].0;
+                        let v = ATTN_PRESETS[idx];
                         t.cfg.attn_limit = v;
                         let _ = t.cmd_tx.send(TrayCmd::SetAttn(v));
                     }),
                     options: ATTN_PRESETS
                         .iter()
-                        .map(|(_, label)| RadioItem {
-                            label: (*label).into(),
+                        .map(|v| RadioItem {
+                            label: attn_label(*v),
                             ..Default::default()
                         })
                         .collect(),
@@ -329,7 +345,7 @@ impl Tray for HushMicTray {
             }
             .into(),
             CheckmarkItem {
-                label: "Set as default microphone".into(),
+                label: tr!("tray-set-default"),
                 checked: self.cfg.set_default,
                 // Hidden where changing the system default is impossible (a
                 // sandbox without Manager access — see
@@ -349,11 +365,10 @@ impl Tray for HushMicTray {
                 // only ever shows for unconfigured shortcuts, so the label
                 // must promise what the click actually does.
                 label: if self.cfg.shortcuts_setup {
-                    "Change shortcuts…"
+                    tr!("tray-shortcuts-change")
                 } else {
-                    "Set up shortcuts…"
-                }
-                .into(),
+                    tr!("tray-shortcuts-setup")
+                },
                 // The compositor owns the keys and the dialog; this entry
                 // only opens it. Hidden while the portal has not answered
                 // (no GlobalShortcuts on this desktop, or it is down).
@@ -366,7 +381,7 @@ impl Tray for HushMicTray {
             .into(),
             MenuItem::Separator,
             CheckmarkItem {
-                label: "Start on login".into(),
+                label: tr!("tray-autostart"),
                 checked: self.cfg.autostart,
                 activate: Box::new(|t: &mut Self| {
                     t.cfg.autostart = !t.cfg.autostart;
@@ -376,7 +391,7 @@ impl Tray for HushMicTray {
             }
             .into(),
             StandardItem {
-                label: "About HushMic…".into(),
+                label: tr!("tray-about"),
                 icon_name: "help-about".into(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.cmd_tx.send(TrayCmd::About);
@@ -385,7 +400,7 @@ impl Tray for HushMicTray {
             }
             .into(),
             StandardItem {
-                label: "Quit".into(),
+                label: tr!("tray-quit"),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.cmd_tx.send(TrayCmd::Quit);
@@ -421,9 +436,21 @@ mod tests {
                 "{a:?} icon must come from the shipped hushmic-tray set"
             );
         }
-        assert_eq!(Error.title_suffix(), " (error)");
-        assert_eq!(Bypass.title_suffix(), " (bypass)");
-        assert_eq!(Mute.title_suffix(), " (muted)");
+    }
+
+    #[test]
+    fn title_reflects_status() {
+        let mut tray = test_tray(false);
+        for (status, want) in [
+            (TrayStatus::Active, "HushMic"),
+            (TrayStatus::Off, "HushMic"),
+            (TrayStatus::Bypass, "HushMic (bypass)"),
+            (TrayStatus::Mute, "HushMic (muted)"),
+            (TrayStatus::Error, "HushMic (error)"),
+        ] {
+            tray.status = status;
+            assert_eq!(tray.title(), want, "{status:?}");
+        }
     }
 
     fn mode_radio(menu: &[MenuItem<HushMicTray>]) -> &RadioGroup<HushMicTray> {
@@ -460,6 +487,7 @@ mod tests {
 
     #[test]
     fn mode_radio_select_sends_commands() {
+        crate::i18n::pin_english();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),
@@ -510,6 +538,9 @@ mod tests {
     }
 
     fn test_tray(testing: bool) -> HushMicTray {
+        // Labels are asserted in English; pin the catalog before the
+        // process-global loader initializes lazily.
+        crate::i18n::pin_english();
         let (tx, _rx) = std::sync::mpsc::channel();
         HushMicTray {
             cfg: Config::default(),
@@ -607,6 +638,7 @@ mod tests {
 
     #[test]
     fn mic_test_item_activate_sends_the_command() {
+        crate::i18n::pin_english();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),
@@ -630,6 +662,7 @@ mod tests {
 
     #[test]
     fn about_item_sits_above_quit_and_sends_the_command() {
+        crate::i18n::pin_english();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),

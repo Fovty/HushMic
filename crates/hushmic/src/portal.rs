@@ -64,10 +64,8 @@ fn queue() -> &'static Mutex<mpsc::Sender<bool>> {
                             crate::notify::send(
                                 crate::notify::Slot::Status,
                                 "dialog-warning",
-                                "Autostart was not allowed",
-                                "The desktop denied HushMic's autostart request. You can \
-                                 allow it in your system settings under application \
-                                 permissions / background apps.",
+                                &crate::tr!("notify-autostart-denied-title"),
+                                &crate::tr!("notify-autostart-denied-body"),
                             );
                         }
                     }

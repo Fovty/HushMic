@@ -1,0 +1,6 @@
+# cargo-i18n convention file: i18n-embed-fl's fl!() macro reads this to find
+# the fallback catalog it compile-checks message keys against.
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"

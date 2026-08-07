@@ -284,15 +284,13 @@ fn run_backend(b: Backend, repaint: Arc<dyn Fn() + Send + Sync>) {
             let was_recording = shared.rec.lock().unwrap().is_some();
             stop_monitors(&mut monitors, &shared);
             if was_recording {
-                emit(Frame::Warn(
-                    "recording aborted — the capture stream ended unexpectedly".into(),
-                ));
+                emit(Frame::Warn(crate::tr!("ab-toast-abort-stream")));
             }
             // Live-monitoring death used to be silent — the window just
             // went blank. Say what happened (the off-but-listed-device
             // case never trips the existence overlay).
             if let Some(msg) = capture_death_warning(was_recording, raw_died) {
-                emit(Frame::Warn(msg.into()));
+                emit(Frame::Warn(msg));
             }
             emit(Frame::MonitorStopped);
             last_device_poll = Instant::now() - DEVICE_POLL;
@@ -411,9 +409,7 @@ fn run_backend(b: Backend, repaint: Arc<dyn Fn() + Send + Sync>) {
                 let was_recording = shared.rec.lock().unwrap().is_some();
                 stop_monitors(&mut monitors, &shared);
                 if was_recording {
-                    emit(Frame::Warn(
-                        "recording aborted — the microphone changed".into(),
-                    ));
+                    emit(Frame::Warn(crate::tr!("ab-toast-abort-mic-changed")));
                 }
                 emit(Frame::MonitorStopped);
                 raw_node = fresh;
@@ -465,8 +461,9 @@ const DEVICE_POLL: Duration = Duration::from_millis(1500);
 
 /// The "your mic is delivering nothing" hint, shared by the two guards
 /// that can conclude it (leg death, sustained exact-zero stream).
-pub const SILENT_MIC_HINT: &str = "No audio is arriving from the microphone — if it's a \
-     wireless headset, make sure it's switched on.";
+pub fn silent_mic_hint() -> String {
+    crate::tr!("ab-toast-silent-mic")
+}
 
 /// Consecutive-exact-zero tracker for the RAW leg. A switched-off (or
 /// hardware-muted) device that stays in the node list — measured live
@@ -519,15 +516,14 @@ impl Default for ZeroWatch {
 /// The toast for an UNEXPECTED capture death while live-monitoring (a
 /// device that vanishes mid-capture, pw-record dying). While recording,
 /// the existing recording-abort warning covers it — no second toast. Pure.
-pub fn capture_death_warning(was_recording: bool, raw_leg_died: bool) -> Option<&'static str> {
+pub fn capture_death_warning(was_recording: bool, raw_leg_died: bool) -> Option<String> {
     if was_recording {
         return None;
     }
     Some(if raw_leg_died {
-        SILENT_MIC_HINT
+        silent_mic_hint()
     } else {
-        "The processed stream ended unexpectedly — HushMic may be \
-         restarting it; try Go live in a moment."
+        crate::tr!("ab-toast-processed-died")
     })
 }
 
@@ -711,7 +707,7 @@ fn capture_loop(
 
         if let Some(w) = zero_watch.as_mut() {
             if w.feed(&samples) {
-                let _ = frame_tx.send(Frame::Warn(SILENT_MIC_HINT.into()));
+                let _ = frame_tx.send(Frame::Warn(silent_mic_hint()));
                 repaint();
             }
         }
@@ -902,6 +898,7 @@ mod tests {
 
     #[test]
     fn live_capture_death_names_the_silent_mic() {
+        crate::i18n::pin_english();
         // The raw leg produced nothing (off-but-listed device): say so.
         let msg = capture_death_warning(false, true).unwrap();
         assert!(msg.contains("microphone"), "{msg}");
@@ -910,6 +907,7 @@ mod tests {
 
     #[test]
     fn live_capture_death_of_the_filtered_leg_says_so() {
+        crate::i18n::pin_english();
         let msg = capture_death_warning(false, false).unwrap();
         assert!(msg.contains("processed"), "{msg}");
         assert!(!msg.contains("switched on"), "{msg}");

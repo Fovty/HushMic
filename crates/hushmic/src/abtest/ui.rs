@@ -6,6 +6,7 @@ use crate::abtest::audio::Backend;
 use crate::abtest::dsp;
 use crate::abtest::state::{Controls, Mode, Status, WindowState};
 use crate::abtest::types::{Channel, Command, Frame, DB_FLOOR, FREQ_HI, FREQ_LO, RECORD_SECS};
+use crate::tr;
 use eframe::egui::{
     self, pos2, text::LayoutJob, vec2, Align, Align2, Button, Color32, ColorImage, FontId, Id,
     Label, LayerId, Layout, Margin, Mesh, Order, Pos2, Rect, RichText, Sense, Shape, Stroke,
@@ -541,17 +542,9 @@ impl AbApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("HushMic").size(14.0).color(TEXT).strong());
                     ui.label(RichText::new("\u{2022}").size(11.0).color(IDLE_GRAY));
-                    ui.label(
-                        RichText::new("Live A/B Mic Test")
-                            .size(13.0)
-                            .color(TEXT_SOFT),
-                    );
+                    ui.label(RichText::new(tr!("ab-heading")).size(13.0).color(TEXT_SOFT));
                 });
-                ui.label(
-                    RichText::new("Compare raw microphone input with HushMic filtered output")
-                        .size(11.5)
-                        .color(MUTED),
-                );
+                ui.label(RichText::new(tr!("ab-subheading")).size(11.5).color(MUTED));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 status_pill(ui, self.state.status());
@@ -598,15 +591,15 @@ impl AbApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let title = match ch {
-                        Channel::Raw => "Raw microphone",
-                        Channel::Filtered => "Filtered by HushMic",
+                        Channel::Raw => tr!("ab-channel-raw"),
+                        Channel::Filtered => tr!("ab-channel-filtered"),
                     };
                     ui.label(RichText::new(title).size(12.5).color(TEXT).strong());
                     if self.state.playing() == Some(ch) {
                         let t = ui.input(|i| i.time) as f32;
                         let a = 0.55 + 0.45 * (t * 4.4).sin();
                         ui.label(
-                            RichText::new("PLAYING")
+                            RichText::new(tr!("ab-playing-badge"))
                                 .font(FontId::monospace(9.5))
                                 .color(with_alpha(ACCENT, a)),
                         );
@@ -725,8 +718,8 @@ impl AbApp {
 
                 ui.add_space(8.0);
                 let caption = match ch {
-                    Channel::Raw => "Unprocessed input straight from your device",
-                    Channel::Filtered => "What other applications receive",
+                    Channel::Raw => tr!("ab-channel-raw-desc"),
+                    Channel::Filtered => tr!("ab-channel-filtered-desc"),
                 };
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new(caption).size(11.0).color(MUTED));
@@ -786,16 +779,16 @@ impl AbApp {
             // default (heights stay 32 via min_size).
             ui.spacing_mut().button_padding = vec2(14.0, 7.0);
             let record_label = if self.state.mode == Mode::Sample && self.state.has_sample {
-                "Record new sample"
+                tr!("ab-record-new")
             } else {
-                "Record 10 s sample"
+                tr!("ab-record-10s")
             };
-            if record_button(ui, record_label, c.record, ic_rec).clicked() {
+            if record_button(ui, &record_label, c.record, ic_rec).clicked() {
                 self.send(Command::Record);
             }
             if secondary_button(
                 ui,
-                "Play raw",
+                &tr!("ab-play-raw"),
                 c.play,
                 playing == Some(Channel::Raw),
                 Some(ic_play),
@@ -806,7 +799,7 @@ impl AbApp {
             }
             if secondary_button(
                 ui,
-                "Play filtered",
+                &tr!("ab-play-filtered"),
                 c.play,
                 playing == Some(Channel::Filtered),
                 Some(ic_play),
@@ -818,7 +811,7 @@ impl AbApp {
             if self.state.mode == Mode::Sample
                 && secondary_button(
                     ui,
-                    "Go live",
+                    &tr!("ab-go-live"),
                     c.go_live && self.go_live_cooldown <= 0.0,
                     false,
                     None,
@@ -830,12 +823,12 @@ impl AbApp {
             // Contextual stop: a recording take is cancelled (monitors keep
             // running), playback stops into the sample view.
             let stop_label = match self.state.mode {
-                Mode::Recording => Some("Cancel"),
-                Mode::Playback(_) => Some("Stop"),
+                Mode::Recording => Some(tr!("ab-cancel")),
+                Mode::Playback(_) => Some(tr!("ab-stop")),
                 _ => None,
             };
             if let Some(label) = stop_label {
-                if secondary_button(ui, label, c.stop, false, Some(ic_stop)).clicked() {
+                if secondary_button(ui, &label, c.stop, false, Some(ic_stop)).clicked() {
                     self.send(Command::Stop);
                 }
             }
@@ -854,12 +847,9 @@ impl AbApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space((SUMMARY_CARD_INNER_H - 14.0) / 2.0);
                     ui.label(
-                        RichText::new(
-                            "Record a 10 s sample to measure background \
-                             reduction and voice retention",
-                        )
-                        .size(11.0)
-                        .color(MUTED),
+                        RichText::new(tr!("ab-summary-hint"))
+                            .size(11.0)
+                            .color(MUTED),
                     );
                 });
             });
@@ -900,20 +890,20 @@ impl AbApp {
         ui.columns(2, |cols| {
             cols[0].scope(|ui| {
                 card_frame(ui, |ui| {
-                    header(ui, "BACKGROUND NOISE");
+                    header(ui, &tr!("ab-card-background"));
                     // The model gates pauses below our measurement floor:
                     // show "silent" and a "≥" reduction rather than the
                     // literal clamp value, which reads as a magic number.
                     let silent =
                         m.filtered_floor_dbfs <= crate::abtest::metrics::SILENT_FLOOR_DBFS + 0.05;
                     let filtered_label = if silent {
-                        "silent".to_string()
+                        tr!("ab-silent")
                     } else {
-                        format!("Filtered {}", dbfs(m.filtered_floor_dbfs))
+                        tr!("ab-filtered-db", db = dbfs(m.filtered_floor_dbfs))
                     };
                     arrow_line(
                         ui,
-                        format!("Raw {}", dbfs(m.raw_floor_dbfs)),
+                        tr!("ab-raw-db", db = dbfs(m.raw_floor_dbfs)),
                         filtered_label,
                     );
                     // Reduction is clamped ≥ 0 in metrics; accent it only
@@ -924,16 +914,16 @@ impl AbApp {
                         TEXT
                     };
                     let value = if silent {
-                        format!("\u{2265} {}", db1(m.background_reduction_db))
+                        tr!("ab-reduction-at-least", db = db1(m.background_reduction_db))
                     } else {
                         db1(m.background_reduction_db)
                     };
-                    big_line(ui, value, "quieter", color);
+                    big_line(ui, value, &tr!("ab-quieter"), color);
                 });
             });
             cols[1].scope(|ui| {
                 card_frame(ui, |ui| {
-                    header(ui, "VOICE");
+                    header(ui, &tr!("ab-card-voice"));
                     if !m.voice_measurable {
                         // Never fabricate a voice number: say so instead. Two
                         // rows (hint at the arrow-line slot + "——" at the
@@ -942,7 +932,7 @@ impl AbApp {
                         // grow past the fixed window, when a no-speech sample
                         // arrives.
                         ui.label(
-                            RichText::new("add clear speech to measure")
+                            RichText::new(tr!("ab-voice-unmeasurable"))
                                 .font(FontId::monospace(10.0))
                                 .color(MUTED),
                         );
@@ -956,14 +946,19 @@ impl AbApp {
                     }
                     arrow_line(
                         ui,
-                        format!("Raw {}", dbfs(m.raw_speech_dbfs)),
-                        format!("Filtered {}", dbfs(m.filtered_speech_dbfs)),
+                        tr!("ab-raw-db", db = dbfs(m.raw_speech_dbfs)),
+                        tr!("ab-filtered-db", db = dbfs(m.filtered_speech_dbfs)),
                     );
                     // Kept (allow a touch of make-up either way) vs ducked.
                     if m.voice_retention_db >= -3.0 {
-                        big_line(ui, "Preserved".to_string(), "", ACCENT);
+                        big_line(ui, tr!("ab-preserved"), "", ACCENT);
                     } else {
-                        big_line(ui, db1(m.voice_retention_db.abs()), "quieter", TEXT);
+                        big_line(
+                            ui,
+                            db1(m.voice_retention_db.abs()),
+                            &tr!("ab-quieter"),
+                            TEXT,
+                        );
                     }
                 });
             });
@@ -998,22 +993,15 @@ impl AbApp {
                     draw_mic_glyph(p, rect.center(), 22.0, ACCENT, false);
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new("Connecting to your microphone…")
+                        RichText::new(tr!("ab-settle-title"))
                             .size(14.5)
                             .color(TEXT)
                             .strong(),
                     );
                     ui.add_space(6.0);
                     ui.add(
-                        Label::new(
-                            RichText::new(
-                                "HushMic is bringing up its audio chain. This takes a \
-                                 few seconds.",
-                            )
-                            .size(12.0)
-                            .color(MUTED),
-                        )
-                        .wrap(),
+                        Label::new(RichText::new(tr!("ab-settle-body")).size(12.0).color(MUTED))
+                            .wrap(),
                     );
                 });
             });
@@ -1042,7 +1030,7 @@ impl AbApp {
                     draw_mic_glyph(p, rect.center(), 22.0, DANGER, true);
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new("No microphone input")
+                        RichText::new(tr!("ab-no-input-title"))
                             .size(14.5)
                             .color(TEXT)
                             .strong(),
@@ -1050,13 +1038,9 @@ impl AbApp {
                     ui.add_space(6.0);
                     ui.add(
                         Label::new(
-                            RichText::new(
-                                "HushMic isn't receiving audio from a microphone. Pick your mic \
-                                 from the tray's Microphone menu (and check it's connected and \
-                                 PipeWire is running), then retry.",
-                            )
-                            .size(12.0)
-                            .color(MUTED),
+                            RichText::new(tr!("ab-no-input-body"))
+                                .size(12.0)
+                                .color(MUTED),
                         )
                         .wrap(),
                     );
@@ -1076,7 +1060,7 @@ impl AbApp {
                     ui.add_space(12.0);
                     // Same breathing room as the transport buttons.
                     ui.spacing_mut().button_padding = vec2(14.0, 7.0);
-                    if primary_button(ui, "Retry detection", true).clicked() {
+                    if primary_button(ui, &tr!("ab-retry-detection"), true).clicked() {
                         self.send(Command::RetryDevice);
                     }
                 });
@@ -1092,16 +1076,16 @@ impl eframe::App for AbApp {
 
 fn status_pill(ui: &mut Ui, status: Status) {
     let (label, color) = match status {
-        Status::Listening => ("Listening", ACCENT),
-        Status::Recording => ("Recording", DANGER),
-        Status::Playback => ("Playback", PLAYBACK_BLUE),
-        Status::Sample => ("Sample ready", PLAYBACK_BLUE),
-        Status::Stopped => ("Stopped", IDLE_GRAY),
-        Status::NoInput => ("No input", DANGER),
+        Status::Listening => (tr!("ab-status-listening"), ACCENT),
+        Status::Recording => (tr!("ab-status-recording"), DANGER),
+        Status::Playback => (tr!("ab-status-playback"), PLAYBACK_BLUE),
+        Status::Sample => (tr!("ab-sample-ready"), PLAYBACK_BLUE),
+        Status::Stopped => (tr!("ab-status-stopped"), IDLE_GRAY),
+        Status::NoInput => (tr!("ab-status-no-input"), DANGER),
     };
     let galley = ui
         .painter()
-        .layout_no_wrap(label.to_string(), FontId::monospace(11.0), color);
+        .layout_no_wrap(label, FontId::monospace(11.0), color);
     let w = 12.0 + 7.0 + 7.0 + galley.size().x + 12.0;
     let (rect, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
     let p = ui.painter();
@@ -1184,7 +1168,7 @@ fn stopped_hint_overlay(ui: &mut Ui, rect: Rect) {
     p.text(
         pos2(c.x, c.y - 16.0),
         Align2::CENTER_CENTER,
-        "Not monitoring",
+        tr!("ab-not-monitoring"),
         FontId::proportional(13.0),
         TEXT,
     );
@@ -1193,7 +1177,7 @@ fn stopped_hint_overlay(ui: &mut Ui, rect: Rect) {
     job.halign = Align::Center;
     let body = FontId::proportional(11.5);
     job.append(
-        "Press ",
+        &tr!("ab-press-prefix"),
         0.0,
         TextFormat {
             font_id: body.clone(),
@@ -1202,7 +1186,7 @@ fn stopped_hint_overlay(ui: &mut Ui, rect: Rect) {
         },
     );
     job.append(
-        "Go live",
+        &tr!("ab-go-live"),
         0.0,
         TextFormat {
             font_id: body.clone(),
@@ -1211,7 +1195,7 @@ fn stopped_hint_overlay(ui: &mut Ui, rect: Rect) {
         },
     );
     job.append(
-        " to resume the split view. Nothing is stored until you record a sample.",
+        &tr!("ab-press-suffix"),
         0.0,
         TextFormat {
             font_id: body,
@@ -1433,8 +1417,9 @@ pub fn run(
     cmd_tx: Sender<Command>,
     frame_rx: Receiver<Frame>,
 ) -> Result<(), String> {
+    let window_title = tr!("ab-window-title");
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("HushMic \u{2014} Test Microphone")
+        .with_title(window_title)
         .with_app_id("hushmic")
         .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size(WINDOW_SIZE)
@@ -1448,8 +1433,11 @@ pub fn run(
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+    // app_name is eframe's storage identity, not the visible title (the
+    // viewport sets that): keep it fixed so remembered window state could
+    // never become per-language.
     eframe::run_native(
-        "HushMic \u{2014} Test Microphone",
+        "hushmic-abtest",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -1668,7 +1656,14 @@ mod tests {
         assert!(img.pixels.iter().all(|&px| px == palette[0]));
     }
 
+    /// Labels are asserted in English; pin the catalog before the
+    /// process-global loader initializes lazily.
+    fn pin_english() {
+        crate::i18n::pin_english();
+    }
+
     fn test_app() -> (AbApp, Receiver<Command>) {
+        pin_english();
         let (cmd_tx, cmd_rx) = channel();
         let (frame_tx, frame_rx) = channel();
         // The frame sender stays alive for the app's lifetime in production;
@@ -1842,6 +1837,7 @@ mod tests {
     // animations.
     #[test]
     fn go_live_click_emits_start_monitor() {
+        pin_english();
         let (cmd_tx, cmd_rx) = channel();
         let (_frame_tx, frame_rx) = channel();
         let mut app = AbApp::new(cmd_tx, frame_rx);
@@ -1861,6 +1857,7 @@ mod tests {
     // which card_frame pins to the same height so the row never jumps.
     #[test]
     fn window_fits_content_height() {
+        pin_english();
         let measure = |metrics: Option<SampleMetrics>| -> f32 {
             let (cmd_tx, _cmd_rx) = channel();
             let (_frame_tx, frame_rx) = channel();
@@ -1918,6 +1915,7 @@ mod tests {
 
     #[test]
     fn frame_stream_updates_levels_and_spectrogram() {
+        pin_english();
         let (cmd_tx, _cmd_rx) = channel();
         let (frame_tx, frame_rx) = channel();
         let mut app = AbApp::new(cmd_tx, frame_rx);

@@ -38,6 +38,9 @@ winit = { version = "0.30", default-features = false, features = ["wayland-dlope
 hound = "3.5.1"
 rustfft = "6.4.1"
 png = "0.18.1"
+i18n-embed = { version = "0.16.0", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10.1"
+rust-embed = "8.12.0"
 
 [dev-dependencies]
 # UI harness tests for the A/B window (Tier-A: queries + clicks only, no
@@ -46,6 +49,9 @@ png = "0.18.1"
 # see the eframe dependency note).
 egui_kittest = "0.33"
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit"] }
+# Direct .ftl parsing for the catalog sanity test (already in the tree via
+# fluent-bundle).
+fluent-syntax = "0.12"
 
 # .deb BUILD PROCEDURE (must match the AUR PKGBUILD's path-bake): the packaged
 # plugin .so bakes its compile-time default model/dylib paths from the build env,

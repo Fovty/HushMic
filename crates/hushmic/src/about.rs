@@ -2,6 +2,7 @@
 //! fixed-size brand card built like the A/B window's egui layer (eframe
 //! 0.33, glow) — same visual tokens, no audio, no tray, no instance lock.
 
+use crate::tr;
 use eframe::egui::{
     self, pos2, vec2, Button, Color32, Margin, Rect, RichText, Sense, Stroke, TextureHandle,
     TextureId, TextureOptions, Ui,
@@ -208,13 +209,13 @@ impl AboutApp {
         ui.add_space(14.0);
         ui.label(RichText::new("HushMic").size(22.0).color(TEXT).strong());
         ui.label(
-            RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+            RichText::new(tr!("about-version", version = env!("CARGO_PKG_VERSION")))
                 .size(12.0)
                 .color(MUTED),
         );
         ui.add_space(10.0);
         ui.label(
-            RichText::new("Real-time noise suppression for Linux")
+            RichText::new(tr!("about-tagline"))
                 .size(12.5)
                 .color(TEXT_SOFT),
         );
@@ -226,7 +227,7 @@ impl AboutApp {
             "https://github.com/Fovty/hushmic",
         );
         ui.hyperlink_to(
-            RichText::new("Noise model: DPDFNet").size(11.5),
+            RichText::new(tr!("about-model")).size(11.5),
             "https://github.com/ceva-ip/DPDFNet",
         );
         ui.add_space(16.0);
@@ -236,9 +237,9 @@ impl AboutApp {
         // egui's bundled fonts lack coverage); the confirmation reads in
         // the accent color instead.
         let (copy_label, copy_color) = match self.copy_state {
-            CopyState::Idle => ("Copy diagnostics", TEXT),
-            CopyState::Collecting(_) => ("Collecting…", TEXT),
-            CopyState::Copied(_) => ("Copied", ACCENT),
+            CopyState::Idle => (tr!("about-copy-diagnostics"), TEXT),
+            CopyState::Collecting(_) => (tr!("about-collecting"), TEXT),
+            CopyState::Copied(_) => (tr!("about-copied"), ACCENT),
         };
         let copy = ui.add_enabled(
             matches!(self.copy_state, CopyState::Idle),
@@ -268,8 +269,9 @@ impl eframe::App for AboutApp {
 
 /// Open the About window and block until it closes.
 pub fn run() -> Result<(), String> {
+    let window_title = tr!("about-window-title");
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("About HushMic")
+        .with_title(window_title)
         .with_app_id("hushmic")
         .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size(WINDOW_SIZE)
@@ -283,8 +285,11 @@ pub fn run() -> Result<(), String> {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+    // app_name is eframe's storage identity, not the visible title (the
+    // viewport sets that): keep it fixed so remembered window state could
+    // never become per-language.
     eframe::run_native(
-        "About HushMic",
+        "hushmic-about",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -300,6 +305,9 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     fn harness(size: egui::Vec2) -> egui_kittest::Harness<'static> {
+        // Labels are asserted in English; pin the catalog before the
+        // process-global loader initializes lazily.
+        crate::i18n::pin_english();
         let mut app = AboutApp::new();
         egui_kittest::Harness::builder()
             .with_size(size)
@@ -350,6 +358,7 @@ mod tests {
     }
 
     fn harness_with_collector(collector: fn() -> String) -> egui_kittest::Harness<'static> {
+        crate::i18n::pin_english();
         let mut app = AboutApp::with_collector(collector);
         egui_kittest::Harness::builder()
             .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
