@@ -147,7 +147,7 @@ impl Tray for HushMicTray {
             .into_iter()
             .map(|(w, h, mut data)| {
                 // RGBA -> the SNI spec's network-order ARGB32.
-                for px in data.chunks_exact_mut(4) {
+                for px in data.as_chunks_mut::<4>().0.iter_mut() {
                     px.rotate_right(1);
                 }
                 ksni::Icon {

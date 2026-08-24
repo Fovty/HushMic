@@ -102,7 +102,10 @@ mod tests {
                 assert_eq!(w, h);
                 assert_eq!(rgba.len(), (*w as usize) * (*h as usize) * 4);
                 // A real glyph, not a blank canvas.
-                assert!(rgba.chunks_exact(4).any(|px| px[3] > 200), "{name}");
+                assert!(
+                    rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 200),
+                    "{name}"
+                );
             }
         }
         assert!(tray_icon_rgba("no-such-icon").is_empty());

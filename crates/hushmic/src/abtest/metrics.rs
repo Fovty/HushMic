@@ -134,7 +134,9 @@ fn analyze(samples: &[f32], fft: &dyn Fft<f32>) -> Vec<FrameDb> {
     let mut buf = vec![Complex::new(0.0f32, 0.0); FFT_LEN];
     let mut scratch = vec![Complex::new(0.0f32, 0.0); fft.get_inplace_scratch_len()];
     samples
-        .chunks_exact(FRAME_LEN)
+        .as_chunks::<FRAME_LEN>()
+        .0
+        .iter()
         .map(|frame| {
             let sum_sq: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
             let full = power_db(sum_sq / FRAME_LEN as f64);

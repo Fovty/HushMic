@@ -194,8 +194,8 @@ impl<R: Read> F32Reader<R> {
         let total = self.carry + n;
         let whole = total - (total % 4);
         out.reserve(whole / 4);
-        for q in self.buf[..whole].chunks_exact(4) {
-            let b = [q[0], q[1], q[2], q[3]];
+        for q in self.buf[..whole].as_chunks::<4>().0 {
+            let b = *q;
             out.push(match self.endian {
                 SampleEndian::Le => f32::from_le_bytes(b),
                 SampleEndian::Be => f32::from_be_bytes(b),
