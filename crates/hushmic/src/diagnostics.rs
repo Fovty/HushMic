@@ -58,6 +58,12 @@ pub struct Report {
     /// The persisted pre-takeover default: the feeder expectation while
     /// "Set as default microphone" makes our own node the default.
     pub prior_default: Option<String>,
+    /// Whether the running chain's source node pins the graph quantum
+    /// (issue #10). None = chain not visible in the dump.
+    pub chain_quantum_pin: Option<bool>,
+    /// System-wide `clock.force-quantum` from the settings metadata (the
+    /// manual override); None = not forced.
+    pub forced_quantum: Option<u32>,
 }
 
 /// Gather every fact — the I/O half. Never panics: anything un-probeable
@@ -140,6 +146,10 @@ pub fn collect() -> Report {
         capture_feeders: crate::pipewire::pw_dump()
             .map(|d| crate::pipewire::parse_feeders(&d, "hushmic_input")),
         prior_default: crate::controller::persisted_prior_default(),
+        chain_quantum_pin: dump
+            .as_deref()
+            .and_then(crate::pipewire::chain_pins_quantum),
+        forced_quantum: crate::pipewire::settings_force_quantum(),
     }
 }
 
@@ -259,6 +269,30 @@ pub fn render(r: &Report) -> (String, usize) {
             }
         };
         line(&mut out, bad, s);
+    }
+    // Issue #10: the chain must pin the graph quantum, or call apps
+    // requesting tiny quantums drag the DSP below sustainable per-cycle
+    // deadlines (chopped audio). Judged only for a visible chain.
+    {
+        use crate::controller::PINNED_QUANTUM;
+        let (bad, s) = match (r.hushmic_present == Some(true), r.chain_quantum_pin) {
+            (true, Some(true)) => (false, format!("quantum pin: yes ({PINNED_QUANTUM})")),
+            (true, Some(false)) => (
+                true,
+                "quantum pin: missing (chain from an older hushmic — restart HushMic)".to_string(),
+            ),
+            _ => (false, "quantum pin: (chain not running)".to_string()),
+        };
+        line(&mut out, bad, s);
+        if let Some(q) = r.forced_quantum {
+            // The manual system-wide force wins over the node pin; a tiny
+            // value re-opens the issue-#10 chopping.
+            line(
+                &mut out,
+                q < PINNED_QUANTUM,
+                format!("  clock.force-quantum: {q} (system-wide manual override)"),
+            );
+        }
     }
     // The link-graph fact: who actually feeds the capture stream. Judged
     // only for a running chain with a known expectation — a mismatch there
@@ -514,6 +548,8 @@ mod tests {
             latency_reported: Some(2880),
             capture_feeders: Some(vec!["alsa_input.usb-mic".into()]),
             prior_default: Some("alsa_input.usb-mic".into()),
+            chain_quantum_pin: Some(true),
+            forced_quantum: None,
         }
     }
 
@@ -529,6 +565,31 @@ mod tests {
             text.contains("capture fed by: alsa_input.usb-mic"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn missing_quantum_pin_on_a_running_chain_is_a_problem() {
+        // Issue #10: a pre-pin chain still running after an upgrade.
+        let mut r = healthy();
+        r.chain_quantum_pin = Some(false);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(text.contains("quantum pin: missing"), "{text}");
+    }
+
+    #[test]
+    fn small_manual_force_quantum_is_a_problem_large_is_a_fact() {
+        let mut r = healthy();
+        r.forced_quantum = Some(256);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(text.contains("clock.force-quantum: 256"), "{text}");
+
+        let mut r = healthy();
+        r.forced_quantum = Some(2048);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("clock.force-quantum: 2048"), "{text}");
     }
 
     #[test]

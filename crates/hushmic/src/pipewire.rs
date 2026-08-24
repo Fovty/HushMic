@@ -57,6 +57,37 @@ pub fn parse_pwdump_nodes(stdout: &str) -> Vec<Source> {
     out
 }
 
+/// Whether the RUNNING chain's source node carries the issue-#10 quantum
+/// pin (a positive `node.force-quantum`). `None` = no `hushmic_source`
+/// node in the dump (chain down) or unparseable dump; `Some(false)` = a
+/// node from a pre-pin hushmic is still up (restart applies the pin).
+/// Pure function — no I/O.
+pub fn chain_pins_quantum(stdout: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    for o in v.as_array()? {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let Some(props) = o.get("info").and_then(|i| i.get("props")) else {
+            continue;
+        };
+        if props.get("node.name").and_then(|n| n.as_str()) != Some("hushmic_source") {
+            continue;
+        }
+        // SPA props round-trip through pw-dump as numbers or strings
+        // depending on the host version; accept both. 0 means unforced.
+        let quantum = match props.get("node.force-quantum") {
+            Some(x) => x
+                .as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse().ok()))
+                .unwrap_or(0),
+            None => 0,
+        };
+        return Some(quantum > 0);
+    }
+    None
+}
+
 /// Resolve a node NAME to its numeric PipeWire global id from a `pw-dump`
 /// snapshot. Pure — no I/O. `None` if the JSON is unparseable or no
 /// `Audio` node carries that `node.name`.
@@ -394,6 +425,27 @@ pub fn parse_metadata_value(stdout: &str) -> Option<String> {
     };
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     Some(v.get("name")?.as_str()?.to_string())
+}
+
+/// Extract a plain numeric value from a pw-metadata line: value:'1024'.
+pub fn parse_metadata_number(stdout: &str) -> Option<u32> {
+    let after = stdout.split("value:'").nth(1)?;
+    let raw = match after.rfind("' type:") {
+        Some(i) => &after[..i],
+        None => after.split('\'').next()?,
+    };
+    raw.trim().parse().ok()
+}
+
+/// The system-wide `clock.force-quantum` from the settings metadata — the
+/// manual override knob (`pw-metadata -n settings 0 clock.force-quantum`).
+/// `None` = unset, zero (unforced), or probe failure.
+pub fn settings_force_quantum() -> Option<u32> {
+    let out = Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-quantum"])
+        .output()
+        .ok()?;
+    parse_metadata_number(&String::from_utf8_lossy(&out.stdout)).filter(|&q| q > 0)
 }
 
 /// Run `pw-dump`. `None` means the PROBE failed (binary missing, daemon

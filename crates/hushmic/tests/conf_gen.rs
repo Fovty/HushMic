@@ -106,6 +106,14 @@ fn conf_contains_required_fields() {
     assert!(c.contains("audio.rate     = 48000"));
     assert!(c.contains("node.name        = \"hushmic_source\""));
 
+    // Issue #10: the source node must pin the graph quantum so call apps
+    // requesting tiny quantums cannot drag the chain below what per-cycle
+    // inference can sustain.
+    assert!(
+        c.contains("node.force-quantum = 1024"),
+        "quantum pin missing from playback props"
+    );
+
     // CRITICAL: `pipewire -c <conf>` needs the core base modules,
     // otherwise it fails with "can't find protocol 'PipeWire:Protocol:Native'".
     // render_conf MUST emit a SELF-CONTAINED config, not a bare filter-chain

@@ -397,6 +397,13 @@ context.modules = [
         audio.rate       = 48000
         audio.channels   = 1
         audio.position   = [ MONO ]
+        # Pin the graph quantum while the chain runs (issue #10): call apps
+        # request 10 ms or smaller quantums, and per-cycle inference cannot
+        # reliably make sub-quantum deadlines on throttled/misscheduled CPUs
+        # — PipeWire then emits silence for every missed cycle (chopped
+        # audio). Hosts without the property ignore it. The pw-metadata
+        # clock.force-quantum setting remains the manual override.
+        node.force-quantum = 1024
       }}
     }}
   }}
@@ -419,6 +426,14 @@ context.modules = [
 /// both models; change the DSP and those tests force this constant to be
 /// re-derived. PipeWire adds its own quantum/device buffering on top.
 pub const LATENCY_SAMPLES: u32 = 2880;
+
+/// The graph quantum the chain pins while it runs (issue #10): call apps
+/// request 10 ms or smaller quantums, and per-cycle inference cannot
+/// reliably make sub-quantum deadlines on throttled or misscheduled CPUs —
+/// PipeWire then emits silence for every missed cycle. The conf template
+/// renders this value as `node.force-quantum` on the source node; the
+/// doctor reports whether the pin is live on the running chain.
+pub const PINNED_QUANTUM: u32 = 1024;
 
 /// Runtime processing mode of the chain-alive states. Ephemeral by design:
 /// never serialized to config — a muted mic must not survive into the next

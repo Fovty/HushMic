@@ -1,6 +1,6 @@
 use hushmic::pipewire::{
-    parse_core_version, parse_metadata_value, parse_node_id, parse_pwdump_nodes,
-    pw_version_at_least, resolve_effective_mic,
+    chain_pins_quantum, parse_core_version, parse_metadata_number, parse_metadata_value,
+    parse_node_id, parse_pwdump_nodes, pw_version_at_least, resolve_effective_mic,
 };
 
 /// A trimmed `pw-dump` array: a Device (not a Node), our virtual source, a real
@@ -27,6 +27,39 @@ const PWDUMP: &str = r#"[
     "info": { "props": { "media.class": "Audio/Source",
       "node.name": "alsa_input.usb-Webcam", "node.nick": "Webcam Mic" } } }
 ]"#;
+
+#[test]
+fn quantum_pin_detection_covers_all_prop_shapes() {
+    // The shared fixture's hushmic_source has no node.force-quantum: a
+    // pre-pin chain reads as Some(false).
+    assert_eq!(chain_pins_quantum(PWDUMP), Some(false));
+    // No hushmic_source at all -> None (chain down).
+    assert_eq!(chain_pins_quantum("[]"), None);
+    assert_eq!(chain_pins_quantum("not json"), None);
+    // Pinned, numeric and string prop shapes; 0 counts as unforced.
+    let with = |v: &str| {
+        format!(
+            r#"[{{ "id": 39, "type": "PipeWire:Interface:Node",
+                 "info": {{ "props": {{ "media.class": "Audio/Source",
+                   "node.name": "hushmic_source", "node.force-quantum": {v} }} }} }}]"#
+        )
+    };
+    assert_eq!(chain_pins_quantum(&with("1024")), Some(true));
+    assert_eq!(chain_pins_quantum(&with("\"1024\"")), Some(true));
+    assert_eq!(chain_pins_quantum(&with("0")), Some(false));
+}
+
+#[test]
+fn metadata_number_parses_the_pw_metadata_line_format() {
+    let out = "Found \"settings\" metadata 31\nupdate: id:0 key:'clock.force-quantum' value:'1024' type:''\n";
+    assert_eq!(parse_metadata_number(out), Some(1024));
+    // Key absent: pw-metadata prints only the header line.
+    assert_eq!(
+        parse_metadata_number("Found \"settings\" metadata 31\n"),
+        None
+    );
+    assert_eq!(parse_metadata_number(""), None);
+}
 
 #[test]
 fn parses_pwdump_audio_sources_only() {
