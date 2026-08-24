@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.7.0" date="2026-08-24">
+      <description>
+        <p>
+          The interface now speaks your language: German, Spanish, Ukrainian
+          and Estonian ship in this release, with more translations underway.
+          Also fixes choppy audio during voice calls on systems where call
+          apps request very short audio cycles.
+        </p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-07-28">
       <description>
         <p>
