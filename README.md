@@ -85,13 +85,13 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu** (`.deb`):
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.7.1-1_amd64.deb
-sudo apt install ./hushmic_0.7.1-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.7.0-1_amd64.deb
+sudo apt install ./hushmic_0.7.0-1_amd64.deb
 ```
 
 > On stock **Ubuntu 22.04** apt refuses with a `pipewire-media-session`/`wireplumber`
 > conflict (22.04 still ships the deprecated session manager). Install with
-> `sudo apt install ./hushmic_0.7.1-1_amd64.deb wireplumber pipewire-media-session-`
+> `sudo apt install ./hushmic_0.7.0-1_amd64.deb wireplumber pipewire-media-session-`
 > (the trailing `-` swaps it out), then log out and back in.
 
 **Arch Linux** (AUR):
@@ -186,7 +186,7 @@ autostart   = false                        # launch on login
 
 **Does my audio go anywhere?** No. Everything runs locally on the CPU; nothing is uploaded.
 
-**How much latency does it add?** 60 ms of processing (10 ms STFT framing, 40 ms of model context — the network needs a few frames of audio before its answer for a given moment is ready — and 10 ms of output buffering), plus PipeWire's normal buffering. On PipeWire 1.6+ HushMic reports this to the graph so apps like OBS compensate automatically. Fine for calls, conferences, and gaming.
+**How much latency does it add?** 80 ms of processing: 10 ms of STFT framing, 40 ms of model context (the network needs a few frames of audio before its answer for a given moment is ready), and 30 ms of scheduling margin. Inference runs on its own thread, decoupled from the audio clock, so a busy or throttled CPU cannot chop the audio — the margin is what makes that safe. PipeWire's normal buffering comes on top; on PipeWire 1.6+ HushMic reports its latency to the graph so apps like OBS compensate automatically. Fine for calls, conferences, and gaming.
 
 **How much CPU?** Roughly a third of one core in real time (RTF ~0.3) for the quality model; switch to `dpdfnet2` in the tray if you want it lighter.
 

@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the descriptor tests
+crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the test suites
 
 [dependencies]
 ladspa = "0.3.4"
-hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.7.1" }
+hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.7.0" }
+rtrb = "0.4.0"

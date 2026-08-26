@@ -397,13 +397,15 @@ context.modules = [
         audio.rate       = 48000
         audio.channels   = 1
         audio.position   = [ MONO ]
-        # Pin the graph quantum while the chain runs (issue #10): call apps
-        # request 10 ms or smaller quantums, and per-cycle inference cannot
-        # reliably make sub-quantum deadlines on throttled/misscheduled CPUs
-        # — PipeWire then emits silence for every missed cycle (chopped
-        # audio). Hosts without the property ignore it. The pw-metadata
-        # clock.force-quantum setting remains the manual override.
-        node.force-quantum = 1024
+        # Pin the graph quantum while the chain runs (issue #10). The DSP
+        # runs on its own worker thread, so any quantum meets the RT
+        # deadline; the pin's job is to keep the quantum KNOWN and SMALL,
+        # making the async output margin (and the declared latency) exact
+        # and minimal. One 10 ms hop = WebRTC's native request. Hosts
+        # without the property ignore it. The pw-metadata
+        # clock.force-quantum setting remains the manual override (values
+        # above the pin raise real latency beyond the declared figure).
+        node.force-quantum = {pin}
       }}
     }}
   }}
@@ -415,25 +417,35 @@ context.modules = [
         target = target,
         latency_node = latency_node,
         links = links,
+        pin = PINNED_QUANTUM,
     )
 }
 
-/// The chain's algorithmic latency in samples at 48 kHz: 480 (STFT
-/// framing) + 1920 (the model's 4-hop group delay) + 480 (the plugin's
-/// one-hop output prefill) = 2880 = 60 ms. MEASURED, not derived — the
-/// hushmic-denoiser crate's latency tests push impulses and real speech
-/// through the actual DSP and pin the engine part at exactly 2400 for
-/// both models; change the DSP and those tests force this constant to be
-/// re-derived. PipeWire adds its own quantum/device buffering on top.
-pub const LATENCY_SAMPLES: u32 = 2880;
+/// The chain's algorithmic latency in samples at 48 kHz: 2400 engine
+/// latency (480 STFT framing + 1920 model group delay — MEASURED: the
+/// hushmic-denoiser latency tests push impulses and real speech through
+/// the actual DSP and pin it exactly) + 1440 async output lead (one
+/// pinned 480-sample quantum + 960 samples / 20 ms of worker stall
+/// headroom, since inference runs on its own thread — issue #10)
+/// = 3840 = 80 ms. The plugin pins the same figure as
+/// PLUGIN_LATENCY_SAMPLES (crates/dpdfnet-ladspa/src/align.rs) and its
+/// asset-gated test measures the whole plugin end to end; change either
+/// side and a test forces this constant to be re-derived. PipeWire adds
+/// its own quantum/device buffering on top.
+pub const LATENCY_SAMPLES: u32 = 3840;
 
-/// The graph quantum the chain pins while it runs (issue #10): call apps
-/// request 10 ms or smaller quantums, and per-cycle inference cannot
-/// reliably make sub-quantum deadlines on throttled or misscheduled CPUs —
-/// PipeWire then emits silence for every missed cycle. The conf template
-/// renders this value as `node.force-quantum` on the source node; the
-/// doctor reports whether the pin is live on the running chain.
-pub const PINNED_QUANTUM: u32 = 1024;
+/// The graph quantum the chain pins while it runs (issue #10). With
+/// inference decoupled onto a worker thread the RT callback is a memcpy
+/// — any quantum meets its deadline — so the pin no longer buys compute
+/// headroom: its job is to make the quantum KNOWN (the async output
+/// margin and the declared latency are sized for exactly this value)
+/// and SMALL (one 10 ms hop keeps the margin minimal). The conf
+/// template renders this value as `node.force-quantum` on the source
+/// node; the doctor reports whether the pin is live and warns when the
+/// system-wide metadata override exceeds it (audio stays clean via the
+/// plugin's adaptive lead, but real latency then exceeds the declared
+/// figure).
+pub const PINNED_QUANTUM: u32 = 480;
 
 /// Runtime processing mode of the chain-alive states. Ephemeral by design:
 /// never serialized to config — a muted mic must not survive into the next

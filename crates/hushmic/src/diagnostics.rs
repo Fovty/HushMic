@@ -58,9 +58,10 @@ pub struct Report {
     /// The persisted pre-takeover default: the feeder expectation while
     /// "Set as default microphone" makes our own node the default.
     pub prior_default: Option<String>,
-    /// Whether the running chain's source node pins the graph quantum
-    /// (issue #10). None = chain not visible in the dump.
-    pub chain_quantum_pin: Option<bool>,
+    /// The `node.force-quantum` value on the running chain's source
+    /// node (issue #10); 0 = node present but unpinned (pre-pin chain).
+    /// None = chain not visible in the dump.
+    pub chain_quantum_pin: Option<u32>,
     /// System-wide `clock.force-quantum` from the settings metadata (the
     /// manual override); None = not forced.
     pub forced_quantum: Option<u32>,
@@ -270,28 +271,43 @@ pub fn render(r: &Report) -> (String, usize) {
         };
         line(&mut out, bad, s);
     }
-    // Issue #10: the chain must pin the graph quantum, or call apps
-    // requesting tiny quantums drag the DSP below sustainable per-cycle
-    // deadlines (chopped audio). Judged only for a visible chain.
+    // Issue #10: the chain must pin the graph quantum — the async DSP's
+    // output margin and the declared latency are sized for exactly the
+    // pinned value. Judged only for a visible chain.
     {
         use crate::controller::PINNED_QUANTUM;
         let (bad, s) = match (r.hushmic_present == Some(true), r.chain_quantum_pin) {
-            (true, Some(true)) => (false, format!("quantum pin: yes ({PINNED_QUANTUM})")),
-            (true, Some(false)) => (
+            (true, Some(q)) if q == PINNED_QUANTUM => {
+                (false, format!("quantum pin: yes ({PINNED_QUANTUM})"))
+            }
+            (true, Some(0)) => (
                 true,
                 "quantum pin: missing (chain from an older hushmic — restart HushMic)".to_string(),
+            ),
+            // A live pin from a DIFFERENT hushmic version: the declared
+            // latency assumes PINNED_QUANTUM, so the figure is wrong
+            // until the chain restarts with the current pin.
+            (true, Some(q)) => (
+                true,
+                format!("quantum pin: {q} (from a different hushmic version — restart HushMic)"),
             ),
             _ => (false, "quantum pin: (chain not running)".to_string()),
         };
         line(&mut out, bad, s);
         if let Some(q) = r.forced_quantum {
-            // The manual system-wide force wins over the node pin; a tiny
-            // value re-opens the issue-#10 chopping.
-            line(
-                &mut out,
-                q < PINNED_QUANTUM,
-                format!("  clock.force-quantum: {q} (system-wide manual override)"),
-            );
+            // The manual system-wide force wins over the node pin. With
+            // the async DSP, smaller values are harmless (the RT path is
+            // a memcpy); a value ABOVE the pin outgrows the output
+            // margin, so real latency exceeds the declared figure.
+            let s = if q > PINNED_QUANTUM {
+                format!(
+                    "  clock.force-quantum: {q} (system-wide manual override; \
+                     chain latency exceeds the declared value)"
+                )
+            } else {
+                format!("  clock.force-quantum: {q} (system-wide manual override)")
+            };
+            line(&mut out, q > PINNED_QUANTUM, s);
         }
     }
     // The link-graph fact: who actually feeds the capture stream. Judged
@@ -545,10 +561,10 @@ mod tests {
             commands: vec![("pw-dump", true), ("pw-cli", true)],
             log_tail: Some("[hushmic] chain up\n".into()),
             latency_supported: true,
-            latency_reported: Some(2880),
+            latency_reported: Some(3840),
             capture_feeders: Some(vec!["alsa_input.usb-mic".into()]),
             prior_default: Some("alsa_input.usb-mic".into()),
-            chain_quantum_pin: Some(true),
+            chain_quantum_pin: Some(crate::controller::PINNED_QUANTUM),
             forced_quantum: None,
         }
     }
@@ -571,25 +587,42 @@ mod tests {
     fn missing_quantum_pin_on_a_running_chain_is_a_problem() {
         // Issue #10: a pre-pin chain still running after an upgrade.
         let mut r = healthy();
-        r.chain_quantum_pin = Some(false);
+        r.chain_quantum_pin = Some(0);
         let (text, problems) = render(&r);
         assert_eq!(problems, 1, "{text}");
         assert!(text.contains("quantum pin: missing"), "{text}");
     }
 
     #[test]
-    fn small_manual_force_quantum_is_a_problem_large_is_a_fact() {
+    fn stale_pin_value_on_a_running_chain_is_a_problem() {
+        // v0.7.0's chain pinned 1024; after an upgrade the declared
+        // latency assumes 480 — the doctor must say restart, not "yes".
         let mut r = healthy();
-        r.forced_quantum = Some(256);
+        r.chain_quantum_pin = Some(1024);
         let (text, problems) = render(&r);
         assert_eq!(problems, 1, "{text}");
-        assert!(text.contains("clock.force-quantum: 256"), "{text}");
+        assert!(text.contains("quantum pin: 1024"), "{text}");
+        assert!(text.contains("restart HushMic"), "{text}");
+    }
 
+    #[test]
+    fn large_manual_force_quantum_is_a_problem_small_is_a_fact() {
+        // Async DSP (issue #10): a small forced quantum only means more,
+        // smaller memcpys — harmless. A value above the pin outgrows the
+        // output margin: audio survives, latency exceeds the declared
+        // figure, so the doctor must flag it.
         let mut r = healthy();
         r.forced_quantum = Some(2048);
         let (text, problems) = render(&r);
-        assert_eq!(problems, 0, "{text}");
+        assert_eq!(problems, 1, "{text}");
         assert!(text.contains("clock.force-quantum: 2048"), "{text}");
+        assert!(text.contains("exceeds the declared value"), "{text}");
+
+        let mut r = healthy();
+        r.forced_quantum = Some(256);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("clock.force-quantum: 256"), "{text}");
     }
 
     #[test]
@@ -684,10 +717,10 @@ mod tests {
         let (text, problems) = render(&healthy());
         assert_eq!(problems, 0);
         assert!(
-            text.contains("chain latency: 60 ms (2880 samples @ 48 kHz)"),
+            text.contains("chain latency: 80 ms (3840 samples @ 48 kHz)"),
             "{text}"
         );
-        assert!(text.contains("reported to PipeWire: yes (2880)"), "{text}");
+        assert!(text.contains("reported to PipeWire: yes (3840)"), "{text}");
     }
 
     #[test]

@@ -57,12 +57,14 @@ pub fn parse_pwdump_nodes(stdout: &str) -> Vec<Source> {
     out
 }
 
-/// Whether the RUNNING chain's source node carries the issue-#10 quantum
-/// pin (a positive `node.force-quantum`). `None` = no `hushmic_source`
-/// node in the dump (chain down) or unparseable dump; `Some(false)` = a
-/// node from a pre-pin hushmic is still up (restart applies the pin).
+/// The `node.force-quantum` value on the RUNNING chain's source node
+/// (issue #10). `None` = no `hushmic_source` node in the dump (chain
+/// down) or unparseable dump; `Some(0)` = a node from a pre-pin hushmic
+/// is still up. Returned as a value (not a bool) so the doctor can judge
+/// it against the declared PINNED_QUANTUM — a stale pin from a different
+/// hushmic version means the declared latency is wrong until a restart.
 /// Pure function — no I/O.
-pub fn chain_pins_quantum(stdout: &str) -> Option<bool> {
+pub fn chain_pins_quantum(stdout: &str) -> Option<u32> {
     let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
     for o in v.as_array()? {
         if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
@@ -83,7 +85,7 @@ pub fn chain_pins_quantum(stdout: &str) -> Option<bool> {
                 .unwrap_or(0),
             None => 0,
         };
-        return Some(quantum > 0);
+        return Some(quantum.min(u32::MAX as u64) as u32);
     }
     None
 }

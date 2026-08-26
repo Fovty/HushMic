@@ -49,13 +49,6 @@
   </screenshots>
 
   <releases>
-    <release version="0.7.1" date="2026-09-11">
-      <description>
-        <p>
-          Adds a Catalan translation of the interface. No other changes.
-        </p>
-      </description>
-    </release>
     <release version="0.7.0" date="2026-08-24">
       <description>
         <p>

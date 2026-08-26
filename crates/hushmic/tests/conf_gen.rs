@@ -19,7 +19,7 @@ fn latency_node_rendered_only_when_supported() {
     assert!(on.contains("name   = hushmic_latency"), "{on}");
     assert!(on.contains("label  = delay"), "{on}");
     assert!(
-        on.contains("\"latency\" = 0.06"),
+        on.contains("\"latency\" = 0.08"),
         "latency must render as seconds: {on}"
     );
     assert!(
@@ -39,11 +39,12 @@ fn latency_node_rendered_only_when_supported() {
 
 #[test]
 fn latency_constant_and_rendered_seconds_agree() {
-    // 2880 samples @ 48 kHz = 0.06 s; the render derives one from the
-    // other so they cannot drift apart. The 2880 itself is pinned against
-    // the MEASURED DSP by the hushmic-denoiser crate's latency tests
-    // (engine 2400 + one-hop output prefill 480).
-    assert_eq!(LATENCY_SAMPLES, 2880);
+    // 3840 samples @ 48 kHz = 0.08 s; the render derives one from the
+    // other so they cannot drift apart. The 3840 = engine 2400 (pinned
+    // against the MEASURED DSP by the hushmic-denoiser latency tests) +
+    // 1440 async output lead (PLUGIN_LATENCY_SAMPLES in dpdfnet-ladspa,
+    // pinned end-to-end by its asset-gated latency test).
+    assert_eq!(LATENCY_SAMPLES, 3840);
     let secs = LATENCY_SAMPLES as f64 / 48_000.0;
     let on = render_conf(
         &Config::default(),
@@ -106,11 +107,11 @@ fn conf_contains_required_fields() {
     assert!(c.contains("audio.rate     = 48000"));
     assert!(c.contains("node.name        = \"hushmic_source\""));
 
-    // Issue #10: the source node must pin the graph quantum so call apps
-    // requesting tiny quantums cannot drag the chain below what per-cycle
-    // inference can sustain.
+    // Issue #10: the source node must pin the graph quantum — with the
+    // async DSP the pin's job is to make the quantum KNOWN and SMALL so
+    // the plugin's output margin (and the declared latency) is exact.
     assert!(
-        c.contains("node.force-quantum = 1024"),
+        c.contains("node.force-quantum = 480"),
         "quantum pin missing from playback props"
     );
 

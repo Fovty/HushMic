@@ -31,8 +31,8 @@ const PWDUMP: &str = r#"[
 #[test]
 fn quantum_pin_detection_covers_all_prop_shapes() {
     // The shared fixture's hushmic_source has no node.force-quantum: a
-    // pre-pin chain reads as Some(false).
-    assert_eq!(chain_pins_quantum(PWDUMP), Some(false));
+    // pre-pin chain reads as Some(0).
+    assert_eq!(chain_pins_quantum(PWDUMP), Some(0));
     // No hushmic_source at all -> None (chain down).
     assert_eq!(chain_pins_quantum("[]"), None);
     assert_eq!(chain_pins_quantum("not json"), None);
@@ -44,9 +44,9 @@ fn quantum_pin_detection_covers_all_prop_shapes() {
                    "node.name": "hushmic_source", "node.force-quantum": {v} }} }} }}]"#
         )
     };
-    assert_eq!(chain_pins_quantum(&with("1024")), Some(true));
-    assert_eq!(chain_pins_quantum(&with("\"1024\"")), Some(true));
-    assert_eq!(chain_pins_quantum(&with("0")), Some(false));
+    assert_eq!(chain_pins_quantum(&with("1024")), Some(1024));
+    assert_eq!(chain_pins_quantum(&with("\"1024\"")), Some(1024));
+    assert_eq!(chain_pins_quantum(&with("0")), Some(0));
 }
 
 #[test]
