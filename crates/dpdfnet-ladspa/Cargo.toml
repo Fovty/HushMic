@@ -9,5 +9,5 @@ crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the test
 
 [dependencies]
 ladspa = "0.3.4"
-hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.7.0" }
+hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.7.1" }
 rtrb = "0.4.0"
