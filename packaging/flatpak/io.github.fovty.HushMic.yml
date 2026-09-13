@@ -267,6 +267,6 @@ modules:
       # release tag; for the working tree use "type: dir, path: ../.." instead
       - type: git
         url: https://github.com/Fovty/hushmic.git
-        tag: v0.7.1
-        commit: b2172e586c384a363febdafdb2e4ac1f962456c3
+        tag: v0.8.0
+        commit: c1bf3b0a25fc90a2853b9f74a7e998777064f655
       - cargo-sources.json
