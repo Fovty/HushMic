@@ -105,6 +105,7 @@ DEST_LADSPA="$PREFIX/lib/ladspa"
 DEST_LIB="$PREFIX/lib/hushmic"
 DEST_MODELS="$PREFIX/share/hushmic/models"
 DEST_APPS="$PREFIX/share/applications"
+DEST_UNITS="$PREFIX/lib/systemd/user"
 DEST_ICONS="$PREFIX/share/icons/hicolor/256x256/apps"
 DEST_HICOLOR="$PREFIX/share/icons/hicolor"
 DEST_LICENSES="$PREFIX/share/licenses/hushmic"
@@ -137,6 +138,19 @@ remove_autostart_entry() {
     _as_conf="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
   fi
   [ -n "$_as_conf" ] && rm -f "$_as_conf/autostart/hushmic.desktop" 2>/dev/null
+  # Same for the systemd user unit: stop and disable it for the invoking
+  # user (best effort — no user manager in containers or plain ssh
+  # sessions), then drop the enable symlink so a later reinstall does not
+  # start a binary that is not there yet. The unit file itself goes with
+  # the prefix below.
+  if [ -n "${SUDO_USER:-}" ]; then
+    _uid="$(id -u "$SUDO_USER" 2>/dev/null)"
+    [ -n "$_uid" ] && sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$_uid" \
+      systemctl --user disable --now hushmic.service >/dev/null 2>&1
+  else
+    systemctl --user disable --now hushmic.service >/dev/null 2>&1
+  fi
+  [ -n "$_as_conf" ] && rm -f "$_as_conf/systemd/user/default.target.wants/hushmic.service" 2>/dev/null
   return 0
 }
 
@@ -147,6 +161,7 @@ do_uninstall() {
   as_root rm -rf "$DEST_LIB"
   as_root rm -rf "$PREFIX/share/hushmic"
   as_root rm -f "$DEST_APPS/hushmic.desktop"
+  as_root rm -f "$DEST_UNITS/hushmic.service"
   as_root rm -f "$DEST_ICONS/hushmic.png"
   for _s in $TRAY_SIZES; do
     for _n in $TRAY_NAMES; do
@@ -346,6 +361,19 @@ for d in "$DEST_LADSPA" "$DEST_LIB" "$PREFIX/share/hushmic" "$DEST_MODELS" "$DES
 done
 
 install_file "$PAYLOAD/share/applications/hushmic.desktop" "$DEST_APPS" 644
+# systemd only reads user units from /usr/lib and /usr/local/lib (plus
+# ~/.config); other prefixes generate one with `hushmic service install`.
+case "$PREFIX" in
+  /usr|/usr/local)
+    if [ -f "$PAYLOAD/lib/systemd/user/hushmic.service" ]; then
+      # The packaged unit names /usr/bin/hushmic; point it at this prefix.
+      _unit_tmp="$(mktemp -d)/hushmic.service"
+      sed "s|^ExecStart=/usr/bin/hushmic |ExecStart=$PREFIX/bin/hushmic |" \
+        "$PAYLOAD/lib/systemd/user/hushmic.service" > "$_unit_tmp"
+      install_file "$_unit_tmp" "$DEST_UNITS" 644
+      rm -rf "$(dirname "$_unit_tmp")"
+    fi ;;
+esac
 [ -f "$PAYLOAD/share/icons/hicolor/256x256/apps/hushmic.png" ] && install_file "$PAYLOAD/share/icons/hicolor/256x256/apps/hushmic.png" "$DEST_ICONS" 644
 
 # Tray status icons (guarded per file: pre-tray payloads simply lack them).
@@ -390,6 +418,7 @@ $SUDO rm -f "$PREFIX/lib/ladspa/libdpdfnet_ladspa.so"
 $SUDO rm -rf "$PREFIX/lib/hushmic"
 $SUDO rm -rf "$PREFIX/share/hushmic"
 $SUDO rm -f "$PREFIX/share/applications/hushmic.desktop"
+$SUDO rm -f "$PREFIX/lib/systemd/user/hushmic.service"
 $SUDO rm -f "$PREFIX/share/icons/hicolor/256x256/apps/hushmic.png"
 for _s in $TRAY_SIZES; do
   for _n in $TRAY_NAMES; do
@@ -408,6 +437,14 @@ else
   _c="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
 fi
 [ -n "$_c" ] && rm -f "$_c/autostart/hushmic.desktop" 2>/dev/null || true
+# Stop the systemd user unit if it runs (best effort), then drop its enable symlink.
+if [ -n "${SUDO_USER:-}" ]; then
+  _u="$(id -u "$SUDO_USER" 2>/dev/null)"
+  [ -n "$_u" ] && sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$_u" systemctl --user disable --now hushmic.service >/dev/null 2>&1 || true
+else
+  systemctl --user disable --now hushmic.service >/dev/null 2>&1 || true
+fi
+[ -n "$_c" ] && rm -f "$_c/systemd/user/default.target.wants/hushmic.service" 2>/dev/null || true
 echo "hushmic uninstalled from $PREFIX (config in ~/.config/hushmic left intact)."
 UNINSTALL_EOF
 } > "$uninstaller"

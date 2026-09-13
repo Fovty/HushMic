@@ -15,11 +15,11 @@
   <a href="https://ko-fi.com/fovty"><img src="https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=ko-fi&logoColor=white" alt="Support on Ko-fi"></a>
 </p>
 
-HushMic creates a virtual microphone that strips out keyboard clatter, fans, and background chatter in real time. Select **"HushMic"** as your input in any app — Discord, TeamSpeak, browsers, OBS, games — and that's it. No EasyEffects graphs to wire up, no terminal, no `setcap`.
+HushMic adds a virtual microphone to PipeWire that removes keyboard noise, fans and background chatter from your voice in real time. Pick **HushMic** as the input in Discord, TeamSpeak, OBS or your browser. The model is DPDFNet, which scored above Krisp, DeepFilterNet and RNNoise on the demo clips (see [Why DPDFNet](#why-dpdfnet)). Processing adds 80 ms of latency.
 
 ## Demo
 
-Each clip plays the **noisy input**, then the same audio **cleaned by HushMic** — a neutral public-domain voice over real background noise.
+Each clip plays the noisy input, then the same audio cleaned by HushMic.
 
 <table>
 <tr>
@@ -34,70 +34,29 @@ Each clip plays the **noisy input**, then the same audio **cleaned by HushMic** 
 </tr>
 </table>
 
-Background noise drops ~25–30 dB in the speech pauses while the voice is preserved; demo-audio credits are in [Credits](#credits).
-
-## Why
-
-I wanted Krisp-level noise suppression on Linux for TeamSpeak, and there wasn't a maintained, packaged option that _just worked_ as a virtual mic. The model quality exists in the open-source world — it just wasn't wrapped into something you install and toggle on.
-
-So I benchmarked the realistic contenders on my own recordings, picked the one that scored best (it actually edged out Krisp), and built the missing pieces around it: a real-time plugin and a tray app that manages everything.
-
-### How it compares
-
-The three demo clips above, run through each model and scored with **DNSMOS P.835** (a reference-free 1–5 MOS estimator). Indicative, not a formal benchmark — but the source audio is public ([Credits](#credits)), so it's easy to reproduce, and it's why HushMic uses DPDFNet:
-
-| Model                             | Overall (OVRL) | Background (BAK) | Speech (SIG) |
-| --------------------------------- | :------------: | :--------------: | :----------: |
-| **DPDFNet** — _HushMic's model_   |    **3.20**    |     **4.15**     |   **3.43**   |
-| DeepFilterNet 3                   |      2.97      |       3.98       |     3.26     |
-| Krisp _(v9.9.3)_                  |      2.57      |       3.96       |     2.81     |
-| khip _(older Krisp model port)_   |      2.43      |       3.78       |     2.71     |
-| GTCRN                             |      2.42      |       3.71       |     2.76     |
-| RNNoise _(EasyEffects's default)_ |      2.01      |       3.93       |     2.60     |
-| _Raw (unprocessed input)_         |    _1.49_      |     _1.48_       |    _2.01_    |
-
-_(Averaged over the three clips; higher is better, 1–5.)_ DPDFNet comes out on top on every axis — overall, background-noise removal, and voice preservation — clearly ahead of the field, and it's the only model that holds up across all three clips where the others fall off on the noisier café mix. ([DPDFNet](https://github.com/ceva-ip/DPDFNet) is a DeepFilterNet-lineage model from Ceva; [arXiv:2512.16420](https://arxiv.org/abs/2512.16420).)
-
-## Features
-
-- One virtual microphone, usable by any PipeWire- or PulseAudio-compatible app.
-- A tray menu for everything: on/off, which mic to clean, model (quality vs. light), suppression strength, set-as-default, start-on-login.
-- **Test my mic**: a live A/B window — raw vs. cleaned side by side, plus a record-and-replay sample with before/after numbers (details under [Usage](#usage)).
-- Failures show up as desktop notifications — a broken install or a virtual mic that will not come back says so on screen, not just in a terminal you never see.
-- The audio runs in a dedicated PipeWire process, so no elevated privileges (`setcap`) are needed.
-- Re-creates itself automatically after a PipeWire restart or a suspend/resume, and puts your previous default mic back when you quit (the virtual mic is tied to the app: quitting removes it cleanly).
-- ~0.3× real-time on a desktop CPU; no GPU, no network.
-
-## Requirements
-
-- Linux with **PipeWire** (+ `pipewire-pulse` for PulseAudio apps) and WirePlumber.
-- A system tray (StatusNotifierItem): native on KDE Plasma and most desktops. On **GNOME**, install the _AppIndicator and KStatusNotifierItem Support_ extension.
-- x86-64.
+Audio sources and licenses: [docs/demo/ASSETS.md](docs/demo/ASSETS.md). Measurements: [docs/comparison.md](docs/comparison.md).
 
 ## Install
 
-**Any distro** (install script, system-wide):
+Requirements: Linux on x86-64 with PipeWire and WirePlumber. PulseAudio apps need `pipewire-pulse`. A tray icon needs StatusNotifierItem support, which GNOME gets from the *AppIndicator and KStatusNotifierItem Support* extension. Without a tray, HushMic still runs and the command line controls it.
+
+**Install script** (any distro, system-wide):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.sh | sudo sh
 ```
 
-**Debian / Ubuntu** (`.deb`):
+**Debian / Ubuntu**:
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.7.1-1_amd64.deb
-sudo apt install ./hushmic_0.7.1-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.8.0-1_amd64.deb
+sudo apt install ./hushmic_0.8.0-1_amd64.deb
 ```
-
-> On stock **Ubuntu 22.04** apt refuses with a `pipewire-media-session`/`wireplumber`
-> conflict (22.04 still ships the deprecated session manager). Install with
-> `sudo apt install ./hushmic_0.7.1-1_amd64.deb wireplumber pipewire-media-session-`
-> (the trailing `-` swaps it out), then log out and back in.
 
 **Arch Linux** (AUR):
 
 ```bash
-yay -S hushmic-bin     # or: paru -S hushmic-bin
+yay -S hushmic-bin
 ```
 
 **Fedora** (COPR):
@@ -111,13 +70,9 @@ sudo dnf install hushmic
 
 ```bash
 nix run github:Fovty/hushmic-nix -- --tray
-# install for good: nix profile install github:Fovty/hushmic-nix
 ```
 
-> Needs flakes enabled — if Nix complains, prepend
-> `--extra-experimental-features 'nix-command flakes'`.
-
-**AppImage** (any distro, no install):
+**AppImage**:
 
 ```bash
 curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic-x86_64.AppImage
@@ -125,129 +80,94 @@ chmod +x hushmic-x86_64.AppImage
 ./hushmic-x86_64.AppImage --tray
 ```
 
+Ubuntu 22.04, custom prefixes, Nix flags, Flatpak and uninstalling: [docs/install.md](docs/install.md).
+
 ## Usage
 
-Launch HushMic from your desktop's application menu, or from a terminal:
+Start HushMic from your application menu. A tray icon appears and noise suppression is on. Pick your microphone in the tray menu, then choose **HushMic** as the input in your app, or turn on **Set as default microphone** so apps that follow the system default use it.
 
-```bash
-hushmic          # tray + the live A/B window (relaunching re-opens the window)
-hushmic --tray   # tray only — what autostart uses
-hushmic --doctor # print a diagnostics report (exits 1 if it finds problems)
-```
+The menu switches between noise suppression, **bypass** (your raw voice) and **mute** (silence on the virtual mic). Switching is instant and does not reconnect your call. It also holds the model choice (quality or light), the suppression strength, start on login and global shortcuts.
 
-A tray icon appears and noise suppression is already on. Pick your **Microphone** and choose **"HushMic"** as the input in your app — or flip **Set as default microphone** and everything that respects the system default uses it automatically. The **Mode** menu switches between noise suppression, **bypass** (your raw voice, mic stays connected) and **mute** (a hardware-level cutoff no app can un-mute) — switches are instant, with no reconnect in your call. The menu also has the model picker (`dpdfnet8` = quality, `dpdfnet2` = lighter), suppression strength, start-on-login, and **About**.
-
-**Global shortcuts**: click **Set up shortcuts…** in the menu and your desktop's own key-binding dialog opens — assign keys to **Toggle mute**, **Toggle bypass**, **Push to talk** (live only while the key is held) and **Push to mute** (hold-to-silence — a cough button). The compositor grabs the keys, so they work while you're in any app, and they use the same instant mode switching as the menu. Once set up, the entry becomes **Change shortcuts…** and opens your desktop's shortcut editor (the keys also appear in your system's keyboard-shortcut settings). This needs a desktop with the GlobalShortcuts portal (KDE Plasma, GNOME 45+); elsewhere the entry stays hidden — bind the CLI below in your desktop's shortcut settings instead. (Starting HushMic from a terminal additionally needs xdg-desktop-portal 1.18+ so it can identify itself to the portal; app-menu and autostart launches work regardless.)
-
-The same controls are scriptable — bind them to hotkeys (KDE custom shortcuts, sxhkd, a Stream Deck):
-
-```bash
-hushmic status [--json]  # what the running tray is doing
-hushmic mode             # print: suppress | bypass | mute | off
-hushmic mode mute        # set any of the four states
-hushmic toggle mute      # one-key toggle; returns to where you came from
-hushmic toggle bypass
-```
-
-Exit codes: `0` ok, `1` invalid usage or a failed command, `2` HushMic is not running.
-
-**Test my mic** opens the live A/B window: raw microphone and cleaned output side by side — scrolling spectrograms and level meters — plus a 10-second sample you can record and replay as _Play raw_ / _Play filtered_ with measured before/after numbers (headless or no GL: an audio-only record-and-playback test runs instead). The tray icon doubles as a status light: cyan while active, plain gray in bypass, a red struck-through mic while muted, struck-through gray when off, a warning badge on errors.
+**Test my mic** opens a window with the raw microphone and the cleaned output side by side, and records a 10-second sample you can play back both ways.
 
 <p align="center">
-  <img src="docs/img/hushmic-ab-window.png" alt="Live A/B mic test — raw microphone vs. HushMic output" width="720">
+  <img src="docs/img/hushmic-ab-window.png" alt="Live A/B mic test" width="720">
 </p>
 
-<details>
-<summary><b>More screenshots</b> — mode switcher, microphone picker, model picker, suppression strength</summary>
+The same controls work from a terminal, so any hotkey tool can drive them:
 
-<p align="center">
-  <img src="docs/img/hushmic-menu-mode.png" alt="Mode switcher" width="360">
-  <img src="docs/img/hushmic-menu-microphone.png" alt="Microphone picker" width="360">
-  <img src="docs/img/hushmic-menu-model.png" alt="Model picker" width="360">
-  <img src="docs/img/hushmic-menu-suppression.png" alt="Suppression strength" width="310">
-</p>
-
-</details>
-
-## Configuration
-
-State lives in `~/.config/hushmic/config.toml` (most of it is in the tray menu):
-
-```toml
-enabled     = true
-mic         = "alsa_input.usb-RODE..."   # source node name; omit for system default
-model       = "dpdfnet8_48khz_hr"        # or "dpdfnet2_48khz_hr" (lighter)
-attn_limit  = 100.0                        # suppression cap in dB, 0-100 (higher = stronger)
-set_default = false                        # make hushmic the system default input
-autostart   = false                        # launch on login
+```bash
+hushmic status              # what the running instance is doing
+hushmic mode mute           # suppress | bypass | mute | off
+hushmic toggle mute         # one key on, same key off
+hushmic config set attn_limit strong
+hushmic quit
 ```
+
+Menu screenshots, keyboard shortcuts, every command and every config key: [docs/usage.md](docs/usage.md).
+
+## Starting at login
+
+Turn on **Start on login** in the tray menu, or run `hushmic config set autostart true`. For a daemon without a tray icon, `hushmic --headless` and the systemd user unit are described in [docs/headless.md](docs/headless.md). Use one of the two, not both.
+
+## Why DPDFNet
+
+I wanted noise suppression on Linux that matches Krisp and installs like an app. I ran the three demo clips through the candidates and scored the output with DNSMOS P.835 (1 to 5, higher is better):
+
+| Model                             | Overall | Background | Speech |
+| --------------------------------- | :-----: | :--------: | :----: |
+| **DPDFNet** (HushMic)             | **3.20** | **4.15**  | **3.43** |
+| DeepFilterNet 3                   |  2.97   |    3.98    |  3.26  |
+| Krisp v9.9.3                      |  2.57   |    3.96    |  2.81  |
+| khip (older Krisp model port)     |  2.43   |    3.78    |  2.71  |
+| GTCRN                             |  2.42   |    3.71    |  2.76  |
+| RNNoise (EasyEffects default)     |  2.01   |    3.93    |  2.60  |
+| Unprocessed input                 |  1.49   |    1.48    |  2.01  |
+
+Three clips are not a formal benchmark, but the source audio is public. Method, per-clip numbers and CPU cost: [docs/comparison.md](docs/comparison.md). DPDFNet is a DeepFilterNet-lineage model by Ceva ([paper](https://arxiv.org/abs/2512.16420)).
+
+## How it works
+
+- [`hushmic-denoiser`](crates/hushmic-denoiser) runs the DPDFNet ONNX model on 48 kHz mono audio. It is a plain Rust library you can embed in your own app.
+- `dpdfnet-ladspa` wraps it as a LADSPA plugin.
+- `hushmic` writes a PipeWire `module-filter-chain` config and runs it as a child process. PipeWire owns the real-time scheduling, so no `setcap` is needed. A watchdog recreates the virtual mic after a PipeWire restart or suspend, and quitting restores your previous default input.
 
 ## FAQ
 
-**Does my audio go anywhere?** No. Everything runs locally on the CPU; nothing is uploaded.
+**Does my audio go anywhere?** No. Everything runs on the CPU and nothing is uploaded.
 
-**How much latency does it add?** 80 ms of processing: 10 ms of STFT framing, 40 ms of model context (the network needs a few frames of audio before its answer for a given moment is ready), and 30 ms of scheduling margin. Inference runs on its own thread, decoupled from the audio clock, so a busy or throttled CPU cannot chop the audio — the margin is what makes that safe. PipeWire's normal buffering comes on top; on PipeWire 1.6+ HushMic reports its latency to the graph so apps like OBS compensate automatically. Fine for calls, conferences, and gaming.
+**How much latency and CPU?** 80 ms of processing (10 ms framing, 40 ms model context, 30 ms scheduling margin) plus PipeWire's own buffering. On PipeWire 1.6 and later the latency is reported to the graph, so apps like OBS can compensate. The quality model takes about a third of one core; the light model is cheaper.
 
-**How much CPU?** Roughly a third of one core in real time (RTF ~0.3) for the quality model; switch to `dpdfnet2` in the tray if you want it lighter.
+**No tray icon on GNOME?** Install the *AppIndicator and KStatusNotifierItem Support* extension. HushMic keeps running without it.
 
-**The tray icon doesn't show up (GNOME).** GNOME doesn't implement the tray spec natively — install the _AppIndicator and KStatusNotifierItem Support_ extension. KDE and most other desktops work out of the box.
-
-**Is it actually doing anything?** Click **Test my mic** in the tray — see [Usage](#usage).
-
-**Does it survive sleep / a PipeWire restart?** Yes — a watchdog re-creates the virtual mic automatically. If it ever can't (or an install is broken), you get a desktop notification instead of silence.
-
-**TeamSpeak / Discord don't see it?** Make sure `pipewire-pulse` is running; HushMic exposes the mic through it so PulseAudio/ALSA-compat apps can pick it.
-
-**Recording still sounds noisy / unprocessed?** A few apps that use the **Qt Multimedia** backend (some KDE recorders, etc.) capture the hardware device directly and ignore the selected virtual mic. Switch the app to its **PulseAudio/PipeWire** backend, or enable _Set as default microphone_ in the tray so default-following apps pick HushMic.
-
-**Something's broken — what should I put in a bug report?** Run `hushmic --doctor` (or click **Copy diagnostics** in the About window) and paste the output into the issue. It's plain text — versions, paths, and device names, nothing sensitive.
+More: [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Alternatives
 
-If HushMic isn't your thing, these are the other good Linux options:
-
-- **[NoiseTorch-ng](https://github.com/noisetorch/NoiseTorch)** — popular, RNNoise-based virtual mic. Simpler model; needs `setcap`.
-- **[EasyEffects](https://github.com/wwmm/easyeffects)** — a full PipeWire effects suite (includes RNNoise denoise). More to configure.
-- **[noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice)** — RNNoise LADSPA/VST plugin; manual wiring.
-- **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** — the model lineage HushMic builds on; ships its own LADSPA plugin you can wire up by hand.
+- [NoiseTorch-ng](https://github.com/noisetorch/NoiseTorch): RNNoise-based virtual mic, needs `setcap`.
+- [EasyEffects](https://github.com/wwmm/easyeffects): full PipeWire effects suite with an RNNoise denoiser.
+- [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice): RNNoise LADSPA/VST plugin, wired by hand.
+- [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet): the model family HushMic builds on, with its own LADSPA plugin.
 
 ## Build from source
 
 ```bash
 git clone https://github.com/Fovty/hushmic
 cd hushmic
-./scripts/setup-assets.sh        # fetch the DPDFNet models + ONNX Runtime
+./scripts/setup-assets.sh        # fetch the DPDFNet models and ONNX Runtime
 cargo build --release
 ```
 
-Produces `target/release/hushmic` (tray app) and `target/release/libdpdfnet_ladspa.so` (the LADSPA plugin). See `scripts/install.sh` for the install layout and `crates/dpdfnet-ladspa/examples/run-filter-chain.md` for loading the plugin by hand.
+This produces `target/release/hushmic` and `target/release/libdpdfnet_ladspa.so`. `scripts/install.sh` shows the install layout; `crates/dpdfnet-ladspa/examples/run-filter-chain.md` shows how to load the plugin by hand.
 
-## How it works
+## Contributing
 
-Three parts:
-
-1. **[`hushmic-denoiser`](crates/hushmic-denoiser)** — the DSP engine as a reusable Rust library: 48 kHz mono frames in, cleaned frames out, running DPDFNet's ONNX model via [`ort`](https://github.com/pykeio/ort) (ONNX Runtime). Embedding the denoiser in your own app? See its [README](crates/hushmic-denoiser/README.md).
-2. **`dpdfnet-ladspa`** — a thin LADSPA plugin wrapping that engine for PipeWire, hop-by-hop in real time.
-3. **`hushmic`** — a tray app that's a _thin controller_: it generates a PipeWire `module-filter-chain` config and runs it as a managed child, exposing the plugin as a virtual capture source. PipeWire owns the real-time scheduling, which is why no `setcap` is needed; the mic's lifetime is tied to the app, and quitting tears it down cleanly (restoring your previous default input).
-
-## Translations
-
-HushMic is being translated on [Hosted Weblate](https://hosted.weblate.org/projects/hushmic/) — contributions welcome, no tooling needed. Details in [TRANSLATING.md](TRANSLATING.md).
-
-## Support
-
-HushMic is free, open source, and makes zero network calls — no ads, no telemetry, no accounts. If it saved you a Krisp subscription, a coffee on **[Ko-fi](https://ko-fi.com/fovty)** is genuinely appreciated and helps keep it maintained. Starring the repo helps too.
-
-Curious where the project is headed? See the [roadmap](ROADMAP.md).
+Translations happen on [Weblate](https://hosted.weblate.org/projects/hushmic/), see [TRANSLATING.md](TRANSLATING.md). Plans are in the [roadmap](ROADMAP.md). If HushMic is useful to you, a coffee on [Ko-fi](https://ko-fi.com/fovty) helps keep it maintained.
 
 ## License
 
-Dual-licensed under either **MIT** ([LICENSE-MIT](LICENSE-MIT)) or **Apache-2.0** ([LICENSE-APACHE](LICENSE-APACHE)), at your option.
+MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)), at your option.
 
 ## Credits
 
-- **[DPDFNet](https://github.com/ceva-ip/DPDFNet)** (Ceva, Apache-2.0; [arXiv:2512.16420](https://arxiv.org/abs/2512.16420)) — the speech-enhancement model.
-- **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** — the LADSPA real-time-inference architecture this plugin mirrors.
-- Built with [PipeWire](https://pipewire.org), [ort](https://github.com/pykeio/ort), [rustfft](https://github.com/ejmahler/RustFFT), and [ksni](https://github.com/iovxw/ksni).
-
-**Demo audio:** voice — _"After Love"_ by Sara Teasdale, read by a LibriVox volunteer (_Short Poetry Collection 266_ via [LibriVox](https://archive.org/details/spc266_2508_librivox), public domain); keyboard — [_Typing on Keychron V1 Ultra_](<https://commons.wikimedia.org/wiki/File:Typing_on_Keychron_V1_Ultra_(Red_Linear_Switch).wav>) by C40115 (CC BY 4.0); fan/AC hum — [_Air conditioner hum_](<https://commons.wikimedia.org/wiki/File:Air_conditioner_hum_(Gravity_Sound).wav>) by [Gravity Sound](https://www.gravitysound.studio/) (CC BY 4.0); café — [_Restaurant ambience_](https://commons.wikimedia.org/wiki/File:Restaurant_ambience.ogg) (public domain). Full provenance: [docs/demo/ASSETS.md](docs/demo/ASSETS.md).
+[DPDFNet](https://github.com/ceva-ip/DPDFNet) by Ceva (Apache-2.0) is the speech-enhancement model. The real-time plugin follows the architecture of [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet). Built with [PipeWire](https://pipewire.org), [ort](https://github.com/pykeio/ort), [rustfft](https://github.com/ejmahler/RustFFT) and [ksni](https://github.com/iovxw/ksni). Demo voice: "After Love" by Sara Teasdale, read by a LibriVox volunteer (public domain); keyboard by C40115 and fan hum by Gravity Sound (CC BY 4.0); café ambience public domain. Details in [docs/demo/ASSETS.md](docs/demo/ASSETS.md).

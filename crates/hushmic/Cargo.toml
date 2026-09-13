@@ -84,6 +84,9 @@ assets = [
   ["../../assets/models/dpdfnet8_48khz_hr.onnx", "usr/share/hushmic/models/", "644"],
   ["../../assets/models/dpdfnet2_48khz_hr.onnx", "usr/share/hushmic/models/", "644"],
   ["../../packaging/hushmic.desktop", "usr/share/applications/", "644"],
+  # User unit (not the `systemd-units` key: that generates SYSTEM-unit
+  # maintainer scripts). Enabled per user with `systemctl --user enable`.
+  ["../../packaging/systemd/hushmic.service", "usr/lib/systemd/user/", "644"],
   ["../../packaging/hushmic-256.png", "usr/share/icons/hicolor/256x256/apps/hushmic.png", "644"],
   # Tray status-icon ladder (five SNI names x eight sizes): explicit per-file
   # entries (no globs) so a missing size or state fails the packaging step

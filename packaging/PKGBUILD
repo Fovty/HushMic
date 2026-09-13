@@ -52,6 +52,7 @@ package() {
   install -Dm644 assets/models/dpdfnet8_48khz_hr.onnx "$pkgdir/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx"
   install -Dm644 assets/models/dpdfnet2_48khz_hr.onnx "$pkgdir/usr/share/hushmic/models/dpdfnet2_48khz_hr.onnx"
   install -Dm644 packaging/hushmic.desktop "$pkgdir/usr/share/applications/hushmic.desktop"
+  install -Dm644 packaging/systemd/hushmic.service "$pkgdir/usr/lib/systemd/user/hushmic.service"
   install -Dm644 packaging/hushmic-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/hushmic.png"
   # Tray status-icon ladder (three SNI names x eight sizes); explicit installs
   # so a missing size or state fails packaging instead of shipping incomplete.

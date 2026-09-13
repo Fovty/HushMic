@@ -18,6 +18,9 @@ fn stub_handler(req: ControlReq) {
     let reply = match req.line.as_str() {
         "mode" => control::encode_ok("suppress"),
         "mode mute" => control::encode_ok("mute"),
+        "quit" => control::encode_ok("stopping"),
+        "config get mic" => control::encode_ok("default\n"),
+        "config set attn_limit 24" => control::encode_ok("attn_limit = 24"),
         other => control::encode_err(&format!("stub: {other}")),
     };
     let _ = req.reply.send(reply);
@@ -109,4 +112,34 @@ fn a_stalled_client_does_not_wedge_the_listener() {
         "served within the stall timeout budget"
     );
     let _ = mute_peer.write_all(b"late\n");
+}
+
+#[test]
+fn quit_and_config_words_round_trip() {
+    let path = temp_sock("quit-config.sock");
+    let listener = lock::bind_control_socket(&path).expect("bind");
+    let (tx, rx) = mpsc::channel::<ControlReq>();
+    control::spawn_listener(listener, tx);
+    std::thread::spawn(move || {
+        for req in rx {
+            stub_handler(req);
+        }
+    });
+    let (code, out) = control::client_run_at(&path, &["quit".into()]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "stopping");
+    let (code, out) = control::client_run_at(&path, &["config".into(), "get".into(), "mic".into()]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "default");
+    let (code, out) = control::client_run_at(
+        &path,
+        &[
+            "config".into(),
+            "set".into(),
+            "attn_limit".into(),
+            "24".into(),
+        ],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "attn_limit = 24");
 }

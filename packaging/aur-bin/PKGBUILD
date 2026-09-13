@@ -43,6 +43,8 @@ package() {
   install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.onnx \
     "$pkgdir/usr/share/hushmic/models/dpdfnet2_48khz_hr.onnx"
 
+  install -Dm644 lib/systemd/user/hushmic.service \
+    "$pkgdir/usr/lib/systemd/user/hushmic.service"
   install -Dm644 share/applications/hushmic.desktop \
     "$pkgdir/usr/share/applications/hushmic.desktop"
 

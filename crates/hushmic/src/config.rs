@@ -32,6 +32,17 @@ pub struct Config {
     /// Skipped while false so pre-feature configs stay byte-identical.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub shortcuts_setup: bool,
+    /// Register a tray icon (`--headless` overrides this to false for one
+    /// run). Skipped while true so existing files stay byte-identical.
+    #[serde(skip_serializing_if = "is_true")]
+    pub tray: bool,
+    /// Desktop notifications (failures, mic-test progress, recovery).
+    #[serde(skip_serializing_if = "is_true")]
+    pub notifications: bool,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Default for Config {
@@ -48,6 +59,8 @@ impl Default for Config {
             autostart: false,
             mic_prefs: BTreeMap::new(),
             shortcuts_setup: false,
+            tray: true,
+            notifications: true,
         }
     }
 }
@@ -213,6 +226,27 @@ mod tests {
         let old = "enabled = true\n";
         let c: Config = toml::from_str(old).unwrap();
         assert!(!c.shortcuts_setup);
+    }
+
+    #[test]
+    fn tray_and_notifications_default_true_and_stay_absent_until_changed() {
+        let d = Config::default();
+        assert!(d.tray && d.notifications);
+        let plain = toml::to_string_pretty(&d).unwrap();
+        assert!(!plain.contains("tray"), "{plain}");
+        assert!(!plain.contains("notifications"), "{plain}");
+        let c = Config {
+            tray: false,
+            notifications: false,
+            ..Config::default()
+        };
+        let s = toml::to_string_pretty(&c).unwrap();
+        assert!(s.contains("tray = false"), "{s}");
+        assert!(s.contains("notifications = false"), "{s}");
+        let back: Config = toml::from_str(&s).unwrap();
+        assert!(!back.tray && !back.notifications);
+        let old: Config = toml::from_str("enabled = true\n").unwrap();
+        assert!(old.tray && old.notifications);
     }
 
     #[test]

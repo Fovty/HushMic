@@ -115,8 +115,6 @@ notify-old-pipewire-body = Die Live-A/B-Ansicht benötigt ein neueres PipeWire a
 notify-window-open-body = Das A/B-Testfenster ist bereits geöffnet.
 notify-window-fallback-body = Das Testfenster konnte nicht gestartet werden – stattdessen läuft der reine Audio-Mikrofontest.
 
-notify-tray-failed-title = HushMic konnte nicht starten
-notify-tray-failed-body = Es konnte kein Symbol im Systembereich registriert werden ({ $error }). Installieren Sie unter GNOME die Erweiterung „AppIndicator and KStatusNotifierItem Support“; KDE und die meisten anderen Desktops bringen das von Haus aus mit.
 
 notify-chain-failed-summary = HushMic konnte das virtuelle Mikrofon nicht starten
 notify-chain-stuck-summary = HushMic verliert das virtuelle Mikrofon immer wieder

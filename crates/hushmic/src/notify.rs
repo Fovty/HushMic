@@ -16,7 +16,7 @@
 //! wedge forever).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,19 @@ pub enum Slot {
 const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
 
 static LAST_ID: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Process-global switch for the `notifications` config key. Read at
+/// enqueue time so a `config set notifications false` silences the very
+/// next send; the `--test-window` child sets it from its own Config::load().
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
 
 struct Msg {
     slot: Slot,
@@ -63,6 +76,14 @@ fn queue() -> &'static Mutex<mpsc::Sender<Msg>> {
 }
 
 fn enqueue(msg: Msg) {
+    if !enabled() {
+        // Acknowledge a bounded wait immediately instead of letting it
+        // time out on a message that will never be sent.
+        if let Some(ack) = msg.ack {
+            let _ = ack.send(());
+        }
+        return;
+    }
     if let Ok(tx) = queue().lock() {
         let _ = tx.send(msg);
     }
@@ -302,6 +323,15 @@ impl Default for FailureGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_defaults_on_and_flips() {
+        assert!(enabled());
+        set_enabled(false);
+        assert!(!enabled());
+        set_enabled(true);
+        assert!(enabled());
+    }
 
     #[test]
     fn watchdog_retries_with_same_error_surface_once() {

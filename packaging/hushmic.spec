@@ -26,6 +26,7 @@ ExclusiveArch:  x86_64
 BuildRequires:  coreutils
 BuildRequires:  findutils
 BuildRequires:  desktop-file-utils
+BuildRequires:  systemd-rpm-macros
 
 # pipewire-utils owns every pw-* tool the tray shells out to (pw-dump,
 # pw-metadata, pw-record, pw-play). They are subprocesses, so RPM's ELF-based
@@ -76,6 +77,10 @@ install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.onnx \
 install -Dm644 share/applications/hushmic.desktop \
   %{buildroot}%{_datadir}/applications/hushmic.desktop
 
+# systemd user unit (`systemctl --user enable --now hushmic.service`)
+install -Dm644 lib/systemd/user/hushmic.service \
+  %{buildroot}%{_userunitdir}/hushmic.service
+
 # App icon + the tray status ladder (five SNI names x eight sizes); copying the
 # tree keeps every size/state the release ships.
 find share/icons -type f -name '*.png' -print0 | while IFS= read -r -d '' _icon; do
@@ -84,6 +89,15 @@ done
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/hushmic.desktop
+
+%post
+%systemd_user_post hushmic.service
+
+%preun
+%systemd_user_preun hushmic.service
+
+%postun
+%systemd_user_postun_with_restart hushmic.service
 
 %files
 %license LICENSE-MIT LICENSE-APACHE
@@ -95,6 +109,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/hushmic.desktop
 %dir %{_datadir}/hushmic
 %{_datadir}/hushmic/models/
 %{_datadir}/applications/hushmic.desktop
+%{_userunitdir}/hushmic.service
 %{_datadir}/icons/hicolor/*/*/hushmic*.png
 
 %changelog

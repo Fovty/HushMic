@@ -25,6 +25,72 @@ fn quote_exec_arg(s: &str) -> String {
     exec.replace('\\', "\\\\")
 }
 
+/// How to start THIS install from outside a login shell: the program to
+/// run (the AppImage file when running from one, else the absolute binary,
+/// else plain `hushmic`) plus the HUSHMIC_*/ORT_DYLIB_PATH overrides the
+/// current process carries. Shared by the autostart entry (`Exec=`) and
+/// the generated systemd unit (`ExecStart=` + `Environment=`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchSpec {
+    pub program: String,
+    pub env: Vec<(String, String)>,
+}
+
+pub(crate) fn launch_spec_for(
+    appimage: Option<&str>,
+    exe: Option<&str>,
+    env: &[(&str, String)],
+) -> LaunchSpec {
+    let from_appimage = appimage.is_some_and(|p| !p.is_empty());
+    let program = match (appimage, exe) {
+        (Some(p), _) if !p.is_empty() => p.to_string(),
+        (_, Some(e)) if !e.is_empty() => e.to_string(),
+        _ => "hushmic".to_string(),
+    };
+    // An AppImage's AppRun re-exports the asset vars itself.
+    let env = if from_appimage {
+        Vec::new()
+    } else {
+        env.iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    };
+    LaunchSpec { program, env }
+}
+
+/// A Nix store path pins one build: after an upgrade it points at the old
+/// version and after a garbage collection at nothing. When the profile's
+/// `bin/hushmic` symlink resolves to the running binary, use the symlink.
+fn nix_profile_alias(exe: &std::path::Path) -> Option<PathBuf> {
+    if !exe.starts_with("/nix/store") {
+        return None;
+    }
+    let home = BaseDirs::new()?.home_dir().to_path_buf();
+    [
+        home.join(".nix-profile/bin/hushmic"),
+        PathBuf::from("/run/current-system/sw/bin/hushmic"),
+        PathBuf::from("/etc/profiles/per-user")
+            .join(std::env::var("USER").ok()?)
+            .join("bin/hushmic"),
+    ]
+    .into_iter()
+    .find(|candidate| std::fs::canonicalize(candidate).ok().as_deref() == Some(exe))
+}
+
+pub fn launch_spec() -> LaunchSpec {
+    let appimage = std::env::var("APPIMAGE").ok();
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| nix_profile_alias(&p).unwrap_or(p).display().to_string());
+    let mut envs: Vec<(&str, String)> = Vec::new();
+    for k in ["HUSHMIC_PLUGIN_SO", "HUSHMIC_MODEL_DIR", "ORT_DYLIB_PATH"] {
+        if let Ok(v) = std::env::var(k) {
+            envs.push((k, v));
+        }
+    }
+    launch_spec_for(appimage.as_deref(), exe.as_deref(), &envs)
+}
+
 /// Build the `Exec=` line for the autostart entry.
 ///
 /// When running as an AppImage the live binary is at an ephemeral mount
@@ -42,24 +108,26 @@ fn quote_exec_arg(s: &str) -> String {
 /// found or can't find its assets.
 ///
 /// Pure helper so the path/env logic is unit-testable without touching the env.
+#[cfg(test)]
 fn exec_field_for(
     appimage: Option<&str>,
     exe: Option<&str>,
     env_overrides: &[(&str, String)],
 ) -> String {
-    if let Some(p) = appimage {
-        if !p.is_empty() {
-            return format!("{} --tray", quote_exec_arg(p));
-        }
-    }
-    let cmd = match exe {
-        Some(e) if !e.is_empty() => quote_exec_arg(e),
-        _ => "hushmic".to_string(),
+    exec_field_of(&launch_spec_for(appimage, exe, env_overrides))
+}
+
+fn exec_field_of(spec: &LaunchSpec) -> String {
+    let cmd = if spec.program == "hushmic" {
+        spec.program.clone()
+    } else {
+        quote_exec_arg(&spec.program)
     };
-    if env_overrides.is_empty() {
+    if spec.env.is_empty() {
         format!("{cmd} --tray")
     } else {
-        let vars = env_overrides
+        let vars = spec
+            .env
             .iter()
             .map(|(k, v)| quote_exec_arg(&format!("{k}={v}")))
             .collect::<Vec<_>>()
@@ -69,17 +137,7 @@ fn exec_field_for(
 }
 
 fn exec_field() -> String {
-    let appimage = std::env::var("APPIMAGE").ok();
-    let exe = std::env::current_exe()
-        .ok()
-        .map(|p| p.display().to_string());
-    let mut envs: Vec<(&str, String)> = Vec::new();
-    for k in ["HUSHMIC_PLUGIN_SO", "HUSHMIC_MODEL_DIR", "ORT_DYLIB_PATH"] {
-        if let Ok(v) = std::env::var(k) {
-            envs.push((k, v));
-        }
-    }
-    exec_field_for(appimage.as_deref(), exe.as_deref(), &envs)
+    exec_field_of(&launch_spec())
 }
 
 /// The full `hushmic.desktop` autostart entry, with the right `Exec=` for how
@@ -228,6 +286,30 @@ mod tests {
             exec_field_for(Some("/home/u/Apps/HushMic.AppImage"), None, &[]),
             "\"/home/u/Apps/HushMic.AppImage\" --tray"
         );
+    }
+
+    #[test]
+    fn launch_spec_prefers_the_appimage_and_drops_its_env() {
+        let envs = [("HUSHMIC_MODEL_DIR", "/x".to_string())];
+        assert_eq!(
+            launch_spec_for(
+                Some("/a/Hush.AppImage"),
+                Some("/tmp/.mount_x/usr/bin/hushmic"),
+                &envs
+            ),
+            LaunchSpec {
+                program: "/a/Hush.AppImage".into(),
+                env: vec![]
+            }
+        );
+        assert_eq!(
+            launch_spec_for(Some(""), Some("/usr/local/bin/hushmic"), &envs),
+            LaunchSpec {
+                program: "/usr/local/bin/hushmic".into(),
+                env: vec![("HUSHMIC_MODEL_DIR".into(), "/x".into())]
+            }
+        );
+        assert_eq!(launch_spec_for(None, None, &[]).program, "hushmic");
     }
 
     #[test]

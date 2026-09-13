@@ -7,22 +7,57 @@ use crate::controller::RunMode;
 
 /// A validated control request. `SetMode(None)` = Off (the persisted
 /// disable path, exactly like the tray radio).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Request {
-    Status { json: bool },
+    Status {
+        json: bool,
+    },
     GetMode,
     SetMode(Option<RunMode>),
     Toggle(RunMode), // Bypass or Mute only
+    /// Stop the daemon (orderly: the previous default mic is restored).
+    Quit,
+    /// `config` / `config get KEY`, plain or JSON.
+    ConfigGet {
+        key: Option<String>,
+        json: bool,
+    },
+    /// `config set KEY VALUE…` — the value is the rest of the line.
+    ConfigSet {
+        key: String,
+        value: String,
+    },
 }
 
 /// Parse subcommand words (CLI argv tail or a socket request line) into a
 /// `Request`. `Err` carries a one-line usage message (CLI exit 1).
 pub fn parse_request(words: &[&str]) -> Result<Request, String> {
-    const USAGE: &str =
-        "usage: hushmic status [--json] | mode [suppress|bypass|mute|off] | toggle mute|bypass";
+    const USAGE: &str = "usage: hushmic status [--json] | mode [suppress|bypass|mute|off] | \
+                         toggle mute|bypass | quit | config [get KEY|set KEY VALUE] [--json]";
     match words {
         ["status"] => Ok(Request::Status { json: false }),
         ["status", "--json"] => Ok(Request::Status { json: true }),
+        ["quit"] => Ok(Request::Quit),
+        ["config"] => Ok(Request::ConfigGet {
+            key: None,
+            json: false,
+        }),
+        ["config", "--json"] => Ok(Request::ConfigGet {
+            key: None,
+            json: true,
+        }),
+        ["config", "get", key] => Ok(Request::ConfigGet {
+            key: Some(key.to_string()),
+            json: false,
+        }),
+        ["config", "get", key, "--json"] => Ok(Request::ConfigGet {
+            key: Some(key.to_string()),
+            json: true,
+        }),
+        ["config", "set", key, rest @ ..] if !rest.is_empty() => Ok(Request::ConfigSet {
+            key: key.to_string(),
+            value: rest.join(" "),
+        }),
         ["mode"] => Ok(Request::GetMode),
         ["mode", state] => match *state {
             "suppress" => Ok(Request::SetMode(Some(RunMode::Suppress))),
@@ -38,6 +73,24 @@ pub fn parse_request(words: &[&str]) -> Result<Request, String> {
         },
         _ => Err(USAGE.to_string()),
     }
+}
+
+/// `config set KEY VALUE…`: the value exactly as typed after the key
+/// (interior whitespace kept), from the raw request line. None when the
+/// line is not a `config set` with a value.
+pub fn config_set_value(line: &str) -> Option<String> {
+    let mut rest = line.trim_start();
+    for word in ["config", "set"] {
+        rest = rest.strip_prefix(word)?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest = rest.trim_start();
+    }
+    // skip the key
+    let key_end = rest.find(char::is_whitespace)?;
+    let value = rest[key_end..].trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// The state word for a mode selection: suppress | bypass | mute | off.
@@ -99,6 +152,9 @@ pub struct Status {
     pub attn_limit: f32,
     pub chain_running: bool,
     pub node_present: Option<bool>,
+    /// A StatusNotifierItem is registered (`sni`) or the daemon runs
+    /// without an icon (`none`: --headless, tray = false, or no watcher).
+    pub tray_sni: bool,
 }
 
 pub fn render_status_human(s: &Status) -> String {
@@ -123,15 +179,24 @@ pub fn render_status_human(s: &Status) -> String {
         }
     };
     format!(
-        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\nlatency: {} ms added\nchain: {}\n",
+        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\nlatency: {} ms added\ntray: {}\nchain: {}\n",
         s.version,
         mode,
         mic,
         s.model,
         s.attn_limit,
         crate::controller::LATENCY_SAMPLES * 1000 / 48_000,
+        tray_word(s.tray_sni),
         chain
     )
+}
+
+fn tray_word(sni: bool) -> &'static str {
+    if sni {
+        "sni"
+    } else {
+        "none"
+    }
 }
 
 pub fn render_status_json(s: &Status) -> String {
@@ -147,6 +212,7 @@ pub fn render_status_json(s: &Status) -> String {
         "model": s.model,
         "attn_limit": s.attn_limit,
         "latency_samples": crate::controller::LATENCY_SAMPLES,
+        "tray": tray_word(s.tray_sni),
         "chain": {
             "running": s.chain_running,
             "node_present": s.node_present,
@@ -192,6 +258,10 @@ use std::time::Duration;
 pub struct ControlReq {
     pub line: String,
     pub reply: Sender<String>,
+    /// Fires once the listener has written the reply to the peer. Only
+    /// `quit` waits on it: the loop breaks right after answering, and the
+    /// process must not exit before the bytes are on the wire.
+    pub written: std::sync::mpsc::Receiver<()>,
 }
 
 /// Per-connection socket I/O budget. A peer that connects and stalls gets
@@ -232,13 +302,23 @@ pub fn spawn_listener(listener: UnixListener, tx: Sender<ControlReq>) {
                 continue; // stalled or empty peer: drop it, serve the next
             }
             let (rtx, rrx) = std::sync::mpsc::channel();
-            if tx.send(ControlReq { line, reply: rtx }).is_err() {
+            let (wtx, wrx) = std::sync::mpsc::channel();
+            if tx
+                .send(ControlReq {
+                    line,
+                    reply: rtx,
+                    written: wrx,
+                })
+                .is_err()
+            {
                 return; // main loop gone — tray shutting down
             }
             let reply = rrx
                 .recv_timeout(REPLY_TIMEOUT)
-                .unwrap_or_else(|_| encode_err("tray did not answer in time"));
+                .unwrap_or_else(|_| encode_err("HushMic did not answer in time"));
             let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+            let _ = wtx.send(());
         }
     });
 }
@@ -257,7 +337,8 @@ pub fn client_run_at(path: &Path, words: &[String]) -> (i32, String) {
         Err(_) => {
             return (
                 2,
-                "hushmic is not running (start the tray first)".to_string(),
+                "hushmic is not running (start it with hushmic --tray or hushmic --headless)"
+                    .to_string(),
             )
         }
     };
@@ -267,13 +348,14 @@ pub fn client_run_at(path: &Path, words: &[String]) -> (i32, String) {
     if stream.write_all(line.as_bytes()).is_err() {
         return (
             2,
-            "hushmic is not running (start the tray first)".to_string(),
+            "hushmic is not running (start it with hushmic --tray or hushmic --headless)"
+                .to_string(),
         );
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut raw = String::new();
     if stream.read_to_string(&mut raw).is_err() || raw.is_empty() {
-        return (1, "no reply from the tray".to_string());
+        return (1, "no reply from HushMic".to_string());
     }
     let (ok, payload) = decode_response(&raw);
     (if ok { 0 } else { 1 }, payload)
@@ -295,7 +377,8 @@ pub fn client_run(words: &[String]) -> (i32, String) {
             }
             return (
                 2,
-                "hushmic is not running (start the tray first)".to_string(),
+                "hushmic is not running (start it with hushmic --tray or hushmic --headless)"
+                    .to_string(),
             );
         }
     }
@@ -338,6 +421,75 @@ mod tests {
             parse_request(&["toggle", "bypass"]),
             Ok(Request::Toggle(RunMode::Bypass))
         );
+        assert_eq!(parse_request(&["quit"]), Ok(Request::Quit));
+    }
+
+    #[test]
+    fn config_set_value_keeps_the_value_as_typed() {
+        assert_eq!(
+            config_set_value("config set mic My  Mic \n"),
+            Some("My  Mic".into())
+        );
+        assert_eq!(
+            config_set_value("  config\tset attn_limit 24"),
+            Some("24".into())
+        );
+        assert_eq!(config_set_value("config set mic"), None);
+        assert_eq!(config_set_value("config set mic   "), None);
+        assert_eq!(config_set_value("configset mic x"), None);
+        assert_eq!(config_set_value("mode mute"), None);
+    }
+
+    #[test]
+    fn config_words_parse_with_rest_of_line_values() {
+        assert_eq!(
+            parse_request(&["config"]),
+            Ok(Request::ConfigGet {
+                key: None,
+                json: false
+            })
+        );
+        assert_eq!(
+            parse_request(&["config", "--json"]),
+            Ok(Request::ConfigGet {
+                key: None,
+                json: true
+            })
+        );
+        assert_eq!(
+            parse_request(&["config", "get", "mic"]),
+            Ok(Request::ConfigGet {
+                key: Some("mic".into()),
+                json: false
+            })
+        );
+        assert_eq!(
+            parse_request(&["config", "get", "mic", "--json"]),
+            Ok(Request::ConfigGet {
+                key: Some("mic".into()),
+                json: true
+            })
+        );
+        assert_eq!(
+            parse_request(&["config", "set", "mic", "My", "Mic"]),
+            Ok(Request::ConfigSet {
+                key: "mic".into(),
+                value: "My Mic".into()
+            })
+        );
+        // client-only words never parse as socket requests
+        for bad in [
+            &["config", "set"][..],
+            &["config", "set", "mic"][..],
+            &["config", "get"][..],
+            &["config", "frob"][..],
+            &["config", "path"][..],
+            &["devices"][..],
+            &["service", "install"][..],
+            &["quit", "now"][..],
+        ] {
+            assert!(parse_request(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -462,6 +614,7 @@ mod tests {
             attn_limit: 100.0,
             chain_running: true,
             node_present: Some(true),
+            tray_sni: true,
         }
     }
 
@@ -478,6 +631,7 @@ mod tests {
         assert_eq!(v["model"], "dpdfnet8_48khz_hr");
         assert_eq!(v["attn_limit"], 100.0);
         assert_eq!(v["latency_samples"], 3840);
+        assert_eq!(v["tray"], "sni");
         assert_eq!(v["chain"]["running"], true);
         assert_eq!(v["chain"]["node_present"], true);
     }
@@ -496,6 +650,15 @@ mod tests {
         assert_eq!(v["enabled"], false);
         assert!(v["mic"]["configured"].is_null());
         assert!(v["chain"]["node_present"].is_null());
+    }
+
+    #[test]
+    fn status_reports_the_tray_origin() {
+        let mut t = demo_status();
+        t.tray_sni = false;
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&t)).unwrap();
+        assert_eq!(v["tray"], "none");
+        assert!(render_status_human(&t).contains("tray: none"));
     }
 
     #[test]

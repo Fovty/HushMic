@@ -75,6 +75,8 @@ cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$STAGE/lib/hushmic/"
 chmod 755 "$STAGE/lib/hushmic/"libonnxruntime.so*
 install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$STAGE/share/hushmic/models/"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$STAGE/share/applications/hushmic.desktop"
+install -d -m 755 "$STAGE/lib/systemd/user"
+install -m 644 "$REPO_ROOT/packaging/systemd/hushmic.service" "$STAGE/lib/systemd/user/hushmic.service"
 install -m 644 "$REPO_ROOT/packaging/hushmic-256.png" "$STAGE/share/icons/hicolor/256x256/apps/hushmic.png"
 # Tray status icons: explicit per-name installs (not a glob) so a missing size
 # or state fails the build instead of silently shipping an incomplete ladder.

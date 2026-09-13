@@ -79,7 +79,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<bool>> {
 
 /// One synchronous RequestBackground round-trip. Returns whether autostart
 /// is granted. Runs on the worker thread only.
-fn request_background_blocking(autostart: bool) -> Result<bool, String> {
+pub fn request_background_blocking(autostart: bool) -> Result<bool, String> {
     // Current-thread tokio runtime: zbus is pinned tokio-mode workspace-wide
     // (see Cargo.toml), and only async zbus can bound a SIGNAL wait — the
     // blocking SignalIterator has no timeout, and a portal that never

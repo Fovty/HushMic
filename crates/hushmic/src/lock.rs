@@ -93,9 +93,38 @@ fn unlink_and_bind(path: &Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-/// Ask the running instance to open its window. A completed connect IS the
-/// whole message (no payload); false means nobody was listening — an old
-/// hushmic without the socket, or a dead leftover socket file.
+const DISPLAY_KEYS: [&str; 3] = ["WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY"];
+
+/// The one-line payload of a show request: the caller's display variables,
+/// so a daemon started by `systemd --user` (whose environment has none)
+/// can still open the A/B window on the caller's screen. Values with
+/// whitespace cannot be framed and are left out.
+pub fn display_env_line() -> String {
+    DISPLAY_KEYS
+        .iter()
+        .filter_map(|k| {
+            let v = std::env::var(k).ok()?;
+            (!v.is_empty() && !v.chars().any(char::is_whitespace)).then(|| format!("{k}={v}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Only the three display keys are accepted; anything else on the line is
+/// dropped (the socket is per-user, but env is still not a thing to take
+/// from a peer wholesale).
+pub fn parse_display_env(line: &str) -> Vec<(String, String)> {
+    line.split_whitespace()
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (DISPLAY_KEYS.contains(&k) && !v.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Ask the running instance to open its window: connect, send the display
+/// line, done. False means nobody was listening — an old hushmic without
+/// the socket, or a dead leftover socket file.
 ///
 /// Mirrors `try_lock`'s ownership check before connecting: in the /tmp
 /// fallback a squatter could pre-bind the predictable path, and connecting
@@ -110,7 +139,33 @@ pub fn request_show(path: &Path) -> bool {
         Ok(md) if md.uid() == unsafe { libc::getuid() } && md.file_type().is_socket() => {}
         _ => return false,
     }
-    UnixStream::connect(path).is_ok()
+    let Ok(mut stream) = UnixStream::connect(path) else {
+        return false;
+    };
+    // Best effort: a daemon that never reads the line (pre-0.8) still got
+    // the connect, which is the message it understands.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+    use std::io::Write;
+    let _ = stream.write_all(format!("{}\n", display_env_line()).as_bytes());
+    true
+}
+
+/// The daemon side of `request_show`: one line (bounded wait), parsed
+/// leniently — an empty or unreadable line is a plain "show".
+/// Bounded in both time (1 s per peer; the forwarding thread serves
+/// peers one at a time, so a silent peer delays the next show by at most
+/// that) and size (the three variables fit in far less than 4 KiB).
+pub fn read_show_line(stream: &UnixStream) -> Vec<(String, String)> {
+    use std::io::{BufRead, Read};
+    if stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .is_err()
+    {
+        return Vec::new(); // cannot bound the read: plain show
+    }
+    let mut line = String::new();
+    let _ = std::io::BufReader::new(stream.take(4096)).read_line(&mut line);
+    parse_display_env(&line)
 }
 
 /// Try to take the single-instance lock at `path`.
@@ -162,6 +217,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_env_line_round_trips_and_ignores_junk() {
+        let parsed = parse_display_env(
+            "WAYLAND_DISPLAY=wayland-0 DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_ABC\n",
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], ("WAYLAND_DISPLAY".into(), "wayland-0".into()));
+        assert_eq!(parsed[2].1, "/run/user/1000/xauth_ABC");
+        assert!(parse_display_env("").is_empty());
+        assert!(parse_display_env("\n").is_empty());
+        assert!(parse_display_env("PATH=/evil LD_PRELOAD=/x").is_empty());
+        assert_eq!(parse_display_env("DISPLAY=:1 garbage DISPLAY=").len(), 1);
+        for (k, _) in parse_display_env(&display_env_line()) {
+            assert!(DISPLAY_KEYS.contains(&k.as_str()));
+        }
+    }
+
+    #[test]
     fn second_lock_is_refused_until_first_releases() {
         // flock is per open-file-description, so a second attempt on the same
         // path is refused even within one process — exactly the cross-process
@@ -197,9 +269,13 @@ mod tests {
 
         let listener = bind_show_socket(&path).expect("bind");
         assert!(request_show(&path), "connect to a live listener succeeds");
-        assert!(
-            listener.accept().is_ok(),
-            "the ping arrives as one accepted connection"
+        let (conn, _) = listener
+            .accept()
+            .expect("the ping arrives as one accepted connection");
+        assert_eq!(
+            read_show_line(&conn),
+            parse_display_env(&display_env_line()),
+            "the show line carries the caller's display vars"
         );
 
         // a dead socket file (crashed instance): connect is refused, and the

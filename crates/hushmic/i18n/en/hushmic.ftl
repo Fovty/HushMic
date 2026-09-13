@@ -151,9 +151,8 @@ notify-old-pipewire-body = The live A/B view needs a newer PipeWire on this syst
 notify-window-open-body = The A/B test window is already open.
 notify-window-fallback-body = The test window could not start — running the audio-only mic test instead.
 
-notify-tray-failed-title = HushMic could not start
-# $error — the tray host's error message, passed through untranslated.
-notify-tray-failed-body = Could not register a system tray icon ({ $error }). On GNOME, install the 'AppIndicator and KStatusNotifierItem Support' extension; KDE and most other desktops provide it out of the box.
+notify-no-tray-title = HushMic is running without a tray icon
+notify-no-tray-body = No system tray was found. Control it from a terminal with hushmic status, mode and config. On GNOME, the 'AppIndicator and KStatusNotifierItem Support' extension adds a tray.
 
 notify-chain-failed-summary = HushMic could not start the virtual microphone
 notify-chain-stuck-summary = HushMic keeps losing the virtual microphone

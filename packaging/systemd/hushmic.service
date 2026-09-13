@@ -1,0 +1,16 @@
+[Unit]
+Description=HushMic noise-suppression virtual microphone
+Documentation=https://github.com/Fovty/hushmic
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/hushmic --headless
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+Slice=session.slice
+
+[Install]
+WantedBy=default.target

@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.8.0" date="2026-09-13">
+      <description>
+        <p>
+          HushMic can now run without a tray icon and be configured from the
+          terminal: hushmic --headless, hushmic config, and a systemd user
+          unit. Noise suppression runs on its own thread, so short audio
+          cycles no longer cause dropouts; processing latency is 80 ms.
+        </p>
+      </description>
+    </release>
     <release version="0.7.1" date="2026-09-11">
       <description>
         <p>

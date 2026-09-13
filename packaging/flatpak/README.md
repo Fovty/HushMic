@@ -61,9 +61,10 @@ cross-instance lock/show-socket in `$XDG_RUNTIME_DIR/app/$FLATPAK_ID`
 
 ## Limitations
 
-- GNOME needs the AppIndicator extension (verified: without it no
-  `StatusNotifierWatcher` exists on the bus and the app exits with an
-  explanatory notification after 60 s).
+- GNOME needs the AppIndicator extension for the tray icon (without it
+  no `StatusNotifierWatcher` exists on the bus). Since 0.8.0 the app keeps
+  running without an icon and says so in a notification; earlier releases
+  exit after 60 s.
 - Don't run a native install and the Flatpak simultaneously — their
   single-instance locks live in different places and both would fight over
   `hushmic_source`.
