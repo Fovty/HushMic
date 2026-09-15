@@ -15,6 +15,8 @@ tray-title = HushMic
 tray-title-bypass = HushMic (bypass)
 tray-title-muted = HushMic (muted)
 tray-title-error = HushMic (error)
+tray-title-light = HushMic (light model)
+tray-title-passthrough = HushMic (passthrough)
 
 tray-test-mic = Test my mic…
 tray-test-running = Mic test running…
@@ -35,6 +37,13 @@ tray-mic-unavailable = (unavailable)
 tray-model = Model
 tray-model-dpdfnet8 = High quality (dpdfnet8)
 tray-model-dpdfnet2 = Light / low-CPU (dpdfnet2)
+# Suffixes on the model entries while the chain runs a different tier than
+# the configured one after CPU pressure: the light model in use, or no
+# model. No "CPU tight" here: the pressure may be long gone while the
+# ladder waits out its retry. The passthrough one has to tell someone who
+# does not know the word that the microphone still works.
+tray-model-now-light = (running now)
+tray-model-now-passthrough = (paused, mic on without filtering)
 
 tray-strength = Suppression strength
 tray-attn-maximum = Maximum

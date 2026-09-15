@@ -74,7 +74,7 @@ hushmic devices [--json]       microphones you can pass as `mic`
 hushmic service install|uninstall   see headless.md
 ```
 
-`status`, `mode`, `toggle` and `quit` talk to the running instance over a socket. Exit codes: 0 ok, 1 invalid usage or a failed command, 2 HushMic is not running.
+`status`, `mode`, `toggle` and `quit` talk to the running instance over a socket. Exit codes: 0 ok, 1 invalid usage or a failed command, 2 HushMic is not running. The `engine:` line in `status` (`quality model`, `light model`, `passthrough`; the JSON field `engine`) says which engine the chain is running right now: under CPU pressure HushMic falls back to the light model or to unfiltered audio and climbs back later, see [troubleshooting.md](troubleshooting.md#latency-and-cpu).
 
 `config set` applies the change immediately while HushMic runs and writes it to the file otherwise, with the same validation either way. `config` and `config get` read the running instance's settings when there is one, else the file. `toggle mute` twice returns you to the state you came from, so one key can serve as a mute button.
 

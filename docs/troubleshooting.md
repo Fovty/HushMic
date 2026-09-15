@@ -26,9 +26,11 @@ EasyEffects with *Process All Input Streams* adopts HushMic's capture stream, wh
 
 ## Latency and CPU
 
-HushMic adds 80 ms: 10 ms of STFT framing, 40 ms of model context, and 30 ms of scheduling margin. Inference runs on its own thread, decoupled from the audio clock, so short CPU stalls do not chop the audio; a sustained overload still can. PipeWire's own buffering comes on top. On PipeWire 1.6 and later the latency is reported to the graph, so apps that compensate (OBS) line the audio up automatically. A forced quantum above 480 samples increases the effective latency; the doctor reports it.
+HushMic adds 80 ms: 10 ms of STFT framing, 40 ms of model context, and 30 ms of scheduling margin. Inference runs on its own thread, decoupled from the audio clock, so short CPU stalls do not chop the audio. PipeWire's own buffering comes on top. On PipeWire 1.6 and later the latency is reported to the graph, so apps that compensate (OBS) line the audio up automatically. A forced quantum above 480 samples increases the effective latency; the doctor reports it.
 
-The quality model takes roughly a third of one desktop core (RTF about 0.3). `hushmic config set model dpdfnet2_48khz_hr` switches to the lighter model.
+The quality model takes roughly a third of one desktop core at full clock speed, more on a throttled laptop or when the other hyperthread of its core is busy. When the CPU gets tight (a screen share, a video encoder) HushMic switches to the light model on its own, and past that to unfiltered audio; it tries the better model again a little later. A load that builds up gradually is caught before you can hear it and the switch is faded over. A sudden stall cannot be: the stream can lose a hop or two of audio and then runs unfiltered for about a tenth of a second, so you hear the room noise the model was removing, before a model takes over again. `hushmic status` shows which engine is running (`engine: light model (fallback)` or `engine: passthrough (fallback)`), and the filter-chain log in the doctor report lists every switch with the measured cost. `hushmic config set model dpdfnet2_48khz_hr` makes the light model the default when that happens often.
+
+Where the system allows it (user in the `audio` group, or rtkit or the desktop portal available) the inference thread runs with realtime priority so a busy browser cannot starve it; the log line `worker: realtime priority 10` in the doctor report confirms it, `not available` says why not. `HUSHMIC_WORKER_RT=0` turns the request off, `HUSHMIC_DSP_TIER=quality|light|passthrough` pins the engine (set them in the environment HushMic starts from).
 
 ## Ubuntu 22.04
 

@@ -464,14 +464,128 @@ pub fn log_path() -> std::path::PathBuf {
 pub fn spawn_stderr_tee(
     reader: impl std::io::Read + Send + 'static,
     log: std::path::PathBuf,
+    generation: u64,
 ) -> std::thread::JoinHandle<()> {
-    tee_with_cap(reader, log, LOG_CAP_BYTES)
+    tee_with_cap(reader, log, LOG_CAP_BYTES, generation)
+}
+
+/// The engine tier the running chain reports (issue #14). The plugin writes
+/// one contract line per transition to stderr (`[dpdfnet-ladspa] engine:
+/// <word> ...`); the tee below is the only reader, and this atomic is the
+/// only channel from a `module-filter-chain` plugin to the app.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EngineTier {
+    Quality,
+    Light,
+    Passthrough,
+}
+
+impl EngineTier {
+    pub fn word(self) -> &'static str {
+        match self {
+            EngineTier::Quality => "quality",
+            EngineTier::Light => "light",
+            EngineTier::Passthrough => "passthrough",
+        }
+    }
+}
+
+/// The reported tier and the chain generation that reported it in one
+/// word: the low 8 bits hold the tier code (0 = nothing reported), the
+/// rest the generation. Packing them means a tee left over from a killed
+/// chain cannot land its last line on top of the fresh chain's tier: its
+/// generation no longer matches and the store is dropped. Joining that tee
+/// is best effort (`Controller::disable` waits a couple of seconds), so
+/// this cannot rest on the join.
+static ENGINE_TIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tier_code(t: EngineTier) -> u64 {
+    match t {
+        EngineTier::Quality => 1,
+        EngineTier::Light => 2,
+        EngineTier::Passthrough => 3,
+    }
+}
+
+pub fn engine_tier() -> Option<EngineTier> {
+    match ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire) & 0xff {
+        1 => Some(EngineTier::Quality),
+        2 => Some(EngineTier::Light),
+        3 => Some(EngineTier::Passthrough),
+        _ => None,
+    }
+}
+
+/// Retire the current chain's reporting: the tier is forgotten and every
+/// tee started under an earlier generation is ignored from here on. Called
+/// before a chain spawn (the returned token is what that chain's tee
+/// reports under) and on disable (where the token is dropped). Only the
+/// main thread calls this, in step with enable/disable.
+pub fn new_engine_generation() -> u64 {
+    let mut cur = ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let next = ((cur >> 8) + 1) << 8;
+        match ENGINE_TIER.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return next >> 8,
+            Err(c) => cur = c,
+        }
+    }
+}
+
+/// Record a tier on behalf of `generation`. A retired tee's line is
+/// dropped: the value it carries describes a chain that is already gone.
+fn store_engine_tier(generation: u64, t: EngineTier) {
+    let want = (generation << 8) | tier_code(t);
+    let mut cur = ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire);
+    while cur >> 8 == generation {
+        match ENGINE_TIER.compare_exchange_weak(
+            cur,
+            want,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(c) => cur = c,
+        }
+    }
+}
+
+/// The contract head is `[dpdfnet-ladspa] engine: <word>` followed by a
+/// space, a newline or the end of the line; anything else (a torn line, a
+/// foreign message) is ignored.
+///
+/// The head is looked for anywhere in the line, not only at the start: the
+/// chain host and the plugin share one stderr, so a line the tee reads can
+/// begin with the tail of somebody else's write. The last occurrence wins,
+/// because a line that carries two heads carries the older report first.
+pub fn parse_engine_line(line: &[u8]) -> Option<EngineTier> {
+    const HEAD: &[u8] = b"[dpdfnet-ladspa] engine: ";
+    let head_at = (0..line.len().saturating_sub(HEAD.len()) + 1)
+        .rev()
+        .find(|&i| line[i..].starts_with(HEAD))?;
+    let rest = &line[head_at + HEAD.len()..];
+    let end = rest
+        .iter()
+        .position(|&b| b == b' ' || b == b'\n' || b == b'\r')
+        .unwrap_or(rest.len());
+    match &rest[..end] {
+        b"quality" => Some(EngineTier::Quality),
+        b"light" => Some(EngineTier::Light),
+        b"passthrough" => Some(EngineTier::Passthrough),
+        _ => None,
+    }
 }
 
 fn tee_with_cap(
     reader: impl std::io::Read + Send + 'static,
     log: std::path::PathBuf,
     cap: u64,
+    generation: u64,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader, Write};
@@ -499,6 +613,9 @@ fn tee_with_cap(
             matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0)
         } {
             let _ = std::io::stderr().write_all(&line);
+            if let Some(t) = parse_engine_line(&line) {
+                store_engine_tier(generation, t);
+            }
             if let Some(f) = file.as_mut() {
                 if written + line.len() as u64 <= cap {
                     if f.write_all(&line).is_ok() {
@@ -873,7 +990,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("tee-basic.log");
         std::fs::write(&log, "stale content from the previous spawn\n").unwrap();
-        let handle = tee_with_cap("one\ntwo\n".as_bytes(), log.clone(), LOG_CAP_BYTES);
+        let handle = tee_with_cap("one\ntwo\n".as_bytes(), log.clone(), LOG_CAP_BYTES, 0);
         handle.join().unwrap();
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
         // The log's directory is private, like the mictest recording dir.
@@ -889,7 +1006,7 @@ mod tests {
         let log = dir.join("tee-cap.log");
         // 5 lines of 11 bytes; cap 25 fits two of them.
         let input = "0123456789\n".repeat(5);
-        let handle = tee_with_cap(std::io::Cursor::new(input.into_bytes()), log.clone(), 25);
+        let handle = tee_with_cap(std::io::Cursor::new(input.into_bytes()), log.clone(), 25, 0);
         handle.join().unwrap();
         let got = std::fs::read_to_string(&log).unwrap();
         assert!(got.ends_with("[log capped]\n"), "{got:?}");
@@ -905,6 +1022,7 @@ mod tests {
             std::io::Cursor::new(vec![0xff, 0xfe, b'\n']),
             log.clone(),
             LOG_CAP_BYTES,
+            0,
         );
         handle.join().unwrap();
         assert_eq!(std::fs::read(&log).unwrap(), vec![0xff, 0xfe, b'\n']);
@@ -938,5 +1056,93 @@ mod tests {
         assert_eq!(tail("", 3), "");
         // No trailing newline on the input: preserved as-is.
         assert_eq!(tail("a\nb\nc", 2), "b\nc");
+    }
+
+    #[test]
+    fn engine_lines_parse_by_head_only() {
+        use super::{parse_engine_line, EngineTier};
+        assert_eq!(
+            parse_engine_line(
+                b"[dpdfnet-ladspa] engine: light (cpu tight, 9.2 ms per 10 ms hop)\n"
+            ),
+            Some(EngineTier::Light)
+        );
+        assert_eq!(
+            parse_engine_line(
+                b"[dpdfnet-ladspa] engine: passthrough (cpu overloaded, lag 3 hops)\n"
+            ),
+            Some(EngineTier::Passthrough)
+        );
+        assert_eq!(
+            parse_engine_line(b"[dpdfnet-ladspa] engine: quality (cost 0.42)\n"),
+            Some(EngineTier::Quality)
+        );
+        assert_eq!(
+            parse_engine_line(b"[dpdfnet-ladspa] engine: quality"),
+            Some(EngineTier::Quality)
+        );
+        // Torn by another writer, unrelated, or the worker line: ignored.
+        assert_eq!(
+            parse_engine_line(b"[dpdfnet-ladspa] engine: li[pw] xrun\n"),
+            None
+        );
+        assert_eq!(
+            parse_engine_line(b"[dpdfnet-ladspa] worker: realtime priority 10\n"),
+            None
+        );
+        assert_eq!(parse_engine_line(b"engine: light\n"), None);
+        // Another writer's unterminated line in front of an intact
+        // contract line: the report is still read.
+        assert_eq!(
+            parse_engine_line(b"[pw] xrun of 12 ms[dpdfnet-ladspa] engine: passthrough (cpu overloaded, lag 3 hops)\n"),
+            Some(EngineTier::Passthrough)
+        );
+        // Two heads in one line: the later report is the current one.
+        assert_eq!(
+            parse_engine_line(
+                b"[dpdfnet-ladspa] engine: passthrough[dpdfnet-ladspa] engine: light\n"
+            ),
+            Some(EngineTier::Light)
+        );
+        // Shorter than the head: no panic, no match.
+        assert_eq!(parse_engine_line(b"e\n"), None);
+        assert_eq!(parse_engine_line(b""), None);
+    }
+
+    #[test]
+    fn a_retired_tee_cannot_overwrite_the_next_chain() {
+        // Sequential, so it asserts the rule rather than racing on it:
+        // the generation a tee reports under is the only thing that
+        // decides, no matter when its line arrives.
+        let old_gen = new_engine_generation();
+        store_engine_tier(old_gen, EngineTier::Quality);
+        assert_eq!(engine_tier(), Some(EngineTier::Quality));
+        // The chain is replaced: a new generation, nothing reported yet.
+        let new_gen = new_engine_generation();
+        assert_ne!(old_gen, new_gen);
+        assert_eq!(engine_tier(), None);
+        // The old tee drains its last line now.
+        store_engine_tier(old_gen, EngineTier::Passthrough);
+        assert_eq!(engine_tier(), None, "a retired tee wrote the live tier");
+        // The new chain reports, and the old tee still cannot take it back.
+        store_engine_tier(new_gen, EngineTier::Light);
+        store_engine_tier(old_gen, EngineTier::Passthrough);
+        assert_eq!(engine_tier(), Some(EngineTier::Light));
+
+        // A real tee reports under the generation it was started with.
+        let dir = std::env::temp_dir().join(format!("hushmic-diag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("tee-engine.log");
+        let live = new_engine_generation();
+        let handle = tee_with_cap(
+            std::io::Cursor::new(b"[dpdfnet-ladspa] engine: quality (cost 0.42)\n".to_vec()),
+            log,
+            LOG_CAP_BYTES,
+            live,
+        );
+        handle.join().unwrap();
+        assert_eq!(engine_tier(), Some(EngineTier::Quality));
+        store_engine_tier(new_gen, EngineTier::Passthrough);
+        assert_eq!(engine_tier(), Some(EngineTier::Quality));
     }
 }

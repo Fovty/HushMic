@@ -121,6 +121,37 @@ fn bypass_impulse_reappears_at_exactly_the_declared_latency() {
     panic!("latency pin failed 3 attempts; last: {last}");
 }
 
+/// The raw tier of the adaptive engine (issue #14) must land on the same
+/// declared latency as the models: `HUSHMIC_DSP_TIER=passthrough` pins it
+/// and the impulse must surface at exactly PLUGIN_LATENCY_SAMPLES.
+#[test]
+fn passthrough_tier_keeps_the_declared_latency() {
+    let _g = LOCK.lock().unwrap();
+    if !setup_env() {
+        return;
+    }
+    std::env::set_var("HUSHMIC_DSP_TIER", "passthrough");
+    let mut last = String::new();
+    let mut ok = false;
+    for attempt in 0..3 {
+        match try_impulse() {
+            Ok(()) => {
+                ok = true;
+                break;
+            }
+            Err(e) => {
+                eprintln!("attempt {attempt}: {e} (CI stall?); retrying");
+                last = e;
+            }
+        }
+    }
+    std::env::remove_var("HUSHMIC_DSP_TIER");
+    assert!(
+        ok,
+        "passthrough latency pin failed 3 attempts; last: {last}"
+    );
+}
+
 #[test]
 fn processed_mode_streams_finite_nonsilent_audio() {
     let _g = LOCK.lock().unwrap();

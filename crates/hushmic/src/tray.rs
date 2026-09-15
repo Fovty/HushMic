@@ -4,6 +4,7 @@
 
 use crate::config::Config;
 use crate::controller::RunMode;
+use crate::diagnostics::EngineTier;
 use crate::pipewire::Source;
 use crate::tr;
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
@@ -74,12 +75,47 @@ pub struct HushMicTray {
     /// "Set up shortcuts…" entry the way can_set_default gates the
     /// default-mic checkbox — hidden, not explained.
     pub shortcuts_available: bool,
+    /// The engine tier the chain reports (issue #14); shown in the title
+    /// while suppressing, where a fallback is audible.
+    pub engine: Option<EngineTier>,
+    /// The running chain is on the light model by configuration (per-mic
+    /// profile or global), so `light` is not a degradation.
+    pub engine_light_configured: bool,
 }
 
 // The option tables hold ids/values only; labels come from the catalog via
 // the match functions below (the message lookup needs literal keys).
 const MODELS: &[&str] = &["dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr"];
 const ATTN_PRESETS: &[f32] = &[100.0, 24.0, 12.0, 6.0];
+
+impl HushMicTray {
+    /// The model radio shows the CONFIGURED model as selected; when the
+    /// chain is running a different tier right now (issue #14), the tier in
+    /// use says so on its own line, and passthrough on the selected one.
+    fn model_item_label(&self, id: &str) -> String {
+        let base = model_label(id);
+        if self.status != TrayStatus::Active {
+            return base;
+        }
+        let light_in_use = self.engine == Some(EngineTier::Light) && !self.engine_light_configured;
+        let is_light = id.starts_with("dpdfnet2");
+        // Which entry describes what the chain actually loaded. Not
+        // `cfg.model == id`: a per-mic profile can run a different model
+        // than the global setting, and then the global one would be
+        // annotated while the running one looked idle. `engine_light_
+        // configured` is the running chain's own model, so it decides.
+        let running = is_light == self.engine_light_configured;
+        match self.engine {
+            Some(EngineTier::Passthrough) if running => {
+                format!("{base} {}", tr!("tray-model-now-passthrough"))
+            }
+            Some(EngineTier::Light) if light_in_use && is_light => {
+                format!("{base} {}", tr!("tray-model-now-light"))
+            }
+            _ => base,
+        }
+    }
+}
 
 fn model_label(id: &str) -> String {
     match id {
@@ -109,7 +145,14 @@ impl Tray for HushMicTray {
             TrayStatus::Bypass => tr!("tray-title-bypass"),
             TrayStatus::Mute => tr!("tray-title-muted"),
             TrayStatus::Error => tr!("tray-title-error"),
-            _ => tr!("tray-title"),
+            TrayStatus::Active => match self.engine {
+                Some(EngineTier::Passthrough) => tr!("tray-title-passthrough"),
+                Some(EngineTier::Light) if !self.engine_light_configured => {
+                    tr!("tray-title-light")
+                }
+                _ => tr!("tray-title"),
+            },
+            TrayStatus::Off => tr!("tray-title"),
         }
     }
     fn icon_name(&self) -> String {
@@ -312,7 +355,7 @@ impl Tray for HushMicTray {
                     options: MODELS
                         .iter()
                         .map(|id| RadioItem {
-                            label: model_label(id),
+                            label: self.model_item_label(id),
                             ..Default::default()
                         })
                         .collect(),
@@ -451,6 +494,90 @@ mod tests {
             tray.status = status;
             assert_eq!(tray.title(), want, "{status:?}");
         }
+        // The engine tier shows only while suppressing, and a light tier
+        // only when the quality model was asked for.
+        tray.status = TrayStatus::Active;
+        tray.engine = Some(EngineTier::Light);
+        assert_eq!(tray.title(), "HushMic (light model)");
+        tray.engine = Some(EngineTier::Passthrough);
+        assert_eq!(tray.title(), "HushMic (passthrough)");
+        tray.status = TrayStatus::Mute;
+        assert_eq!(tray.title(), "HushMic (muted)");
+        tray.status = TrayStatus::Active;
+        tray.engine = Some(EngineTier::Light);
+        tray.engine_light_configured = true;
+        assert_eq!(tray.title(), "HushMic");
+    }
+
+    fn model_labels(tray: &HushMicTray) -> Vec<String> {
+        tray.menu()
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::SubMenu(s) if s.label == "Model" => Some(s),
+                _ => None,
+            })
+            .expect("Model submenu")
+            .submenu
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::RadioGroup(g) => {
+                    Some(g.options.iter().map(|o| o.label.clone()).collect())
+                }
+                _ => None,
+            })
+            .expect("model radio group")
+    }
+
+    #[test]
+    fn model_menu_says_which_tier_runs_now() {
+        // The selection stays on the configured model; the entry in use
+        // says so while the chain is on another tier (issue #14).
+        let mut tray = test_tray(false);
+        tray.cfg.model = "dpdfnet8_48khz_hr".into();
+        tray.status = TrayStatus::Active;
+        let plain = vec![
+            "High quality (dpdfnet8)".to_string(),
+            "Light / low-CPU (dpdfnet2)".to_string(),
+        ];
+        assert_eq!(model_labels(&tray), plain);
+        tray.engine = Some(EngineTier::Light);
+        assert_eq!(
+            model_labels(&tray),
+            vec![
+                "High quality (dpdfnet8)".to_string(),
+                "Light / low-CPU (dpdfnet2) (running now)".to_string(),
+            ]
+        );
+        tray.engine = Some(EngineTier::Passthrough);
+        assert_eq!(
+            model_labels(&tray),
+            vec![
+                "High quality (dpdfnet8) (paused, mic on without filtering)".to_string(),
+                "Light / low-CPU (dpdfnet2)".to_string(),
+            ]
+        );
+        // Off or bypassed: nothing to annotate. Light configured: plain too.
+        tray.status = TrayStatus::Bypass;
+        assert_eq!(model_labels(&tray), plain);
+        tray.status = TrayStatus::Active;
+        tray.cfg.model = "dpdfnet2_48khz_hr".into();
+        tray.engine = Some(EngineTier::Light);
+        tray.engine_light_configured = true;
+        assert_eq!(model_labels(&tray), plain);
+        // Per-mic profile: the global setting is the quality model, the
+        // chain runs the light one for this microphone. Passthrough pauses
+        // the model the chain actually loaded, so the light entry is the
+        // one that says so.
+        tray.cfg.model = "dpdfnet8_48khz_hr".into();
+        tray.engine = Some(EngineTier::Passthrough);
+        tray.engine_light_configured = true;
+        assert_eq!(
+            model_labels(&tray),
+            vec![
+                "High quality (dpdfnet8)".to_string(),
+                "Light / low-CPU (dpdfnet2) (paused, mic on without filtering)".to_string(),
+            ]
+        );
     }
 
     fn mode_radio(menu: &[MenuItem<HushMicTray>]) -> &RadioGroup<HushMicTray> {
@@ -498,6 +625,8 @@ mod tests {
             fallback_active: false,
             mode: RunMode::Suppress,
             shortcuts_available: false,
+            engine: None,
+            engine_light_configured: false,
         };
         let menu = tray.menu();
         let g = mode_radio(&menu);
@@ -554,6 +683,8 @@ mod tests {
             fallback_active: false,
             mode: RunMode::Suppress,
             shortcuts_available: false,
+            engine: None,
+            engine_light_configured: false,
         }
     }
 
@@ -649,6 +780,8 @@ mod tests {
             fallback_active: false,
             mode: RunMode::Suppress,
             shortcuts_available: false,
+            engine: None,
+            engine_light_configured: false,
         };
         let menu = tray.menu();
         let item = mic_test_item(&menu);
@@ -673,6 +806,8 @@ mod tests {
             fallback_active: false,
             mode: RunMode::Suppress,
             shortcuts_available: false,
+            engine: None,
+            engine_light_configured: false,
         };
         let menu = tray.menu();
         let pos = |label: &str| {
@@ -731,6 +866,8 @@ mod tests {
             fallback_active: false,
             mode: RunMode::Suppress,
             shortcuts_available: true,
+            engine: None,
+            engine_light_configured: false,
         };
         let menu = tray.menu();
         let item = shortcuts_item(&menu);

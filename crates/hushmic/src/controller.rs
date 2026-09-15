@@ -432,6 +432,9 @@ context.modules = [
 /// asset-gated test measures the whole plugin end to end; change either
 /// side and a test forces this constant to be re-derived. PipeWire adds
 /// its own quantum/device buffering on top.
+/// The light model's id: the plugin's fallback tier under CPU pressure.
+pub const LIGHT_MODEL: &str = "dpdfnet2_48khz_hr";
+
 pub const LATENCY_SAMPLES: u32 = 3840;
 
 /// The graph quantum the chain pins while it runs (issue #10). With
@@ -487,11 +490,18 @@ pub struct Controller {
     /// default). Set only once a child actually spawned; cleared by
     /// `disable()` — see [`Controller::active_mic`].
     active_mic: Option<String>,
+    /// The model the running child's conf names (the per-mic effective
+    /// model, not necessarily the global setting). Set on spawn, cleared by
+    /// `disable()`.
+    active_model: Option<String>,
     /// The processing mode every spawn renders into the conf. Living here
     /// (not per-`enable` argument) is what makes the mode survive automatic
     /// restarts — mic recovery re-enabling the chain must never silently
     /// unmute the mic.
     mode: RunMode,
+    /// The child's stderr tee; joined in `disable()` so a draining old tee
+    /// can never overwrite the engine tier of a freshly spawned chain.
+    tee: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Controller {
@@ -504,6 +514,8 @@ impl Controller {
             spawned_at: None,
             active_mic: None,
             mode: RunMode::default(),
+            tee: None,
+            active_model: None,
         }
     }
 
@@ -523,6 +535,18 @@ impl Controller {
     /// live child's conf pins that device.
     pub fn active_mic(&self) -> Option<&str> {
         self.active_mic.as_deref()
+    }
+
+    /// The model the running chain was started with (per-mic profiles can
+    /// differ from the global setting); None without a child.
+    pub fn active_model(&self) -> Option<&str> {
+        self.active_model.as_deref()
+    }
+
+    /// The running chain is on the light model by configuration, so a
+    /// reported `light` tier is not a degradation.
+    pub fn active_model_is_light(&self) -> bool {
+        self.active_model.as_deref() == Some(LIGHT_MODEL)
     }
 
     /// The default source remembered before "Set as default microphone"
@@ -646,6 +670,18 @@ impl Controller {
             .arg(&path)
             .env("HUSHMIC_MODEL_PATH", &model)
             .env("ORT_DYLIB_PATH", &self.paths.dylib);
+        // The light model is the plugin's fallback tier under CPU pressure
+        // (issue #14); a chain already on it, or a stripped install, gets no
+        // fallback model and the plugin degrades to raw audio instead.
+        let light = self.paths.model_dir.join(format!("{LIGHT_MODEL}.onnx"));
+        if adjusted.model != LIGHT_MODEL && light.exists() {
+            command.env("HUSHMIC_FALLBACK_MODEL_PATH", &light);
+        }
+        // Every chain reports its engine tier under its own generation:
+        // the previous chain's tee may still be draining, and its last
+        // line must not land on top of this one's (see
+        // diagnostics::new_engine_generation).
+        let generation = crate::diagnostics::new_engine_generation();
         // Bind the host's lifetime to ours: if hushmic dies ungracefully
         // (crash, SIGKILL, session logout) Drop never runs, so without this the
         // child would linger and keep advertising a dead `hushmic_source` as the
@@ -695,11 +731,16 @@ impl Controller {
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
         if let Some(stderr) = child.stderr.take() {
-            crate::diagnostics::spawn_stderr_tee(stderr, crate::diagnostics::log_path());
+            self.tee = Some(crate::diagnostics::spawn_stderr_tee(
+                stderr,
+                crate::diagnostics::log_path(),
+                generation,
+            ));
         }
         self.child = Some(child);
         self.spawned_at = Some(Instant::now());
         self.active_mic = effective_mic;
+        self.active_model = Some(adjusted.model.clone());
 
         if cfg.set_default && !pipewire::can_set_default() {
             // One line, once: the toggle is hidden in the tray when the
@@ -827,8 +868,25 @@ impl Controller {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // Forget the tier and retire this chain's generation FIRST: a tee
+        // that outlives the wait below is then writing under a generation
+        // nobody reads, so the wait is only about draining the log, never
+        // about correctness.
+        crate::diagnostics::new_engine_generation();
+        // The pipe closes with the child; give the tee a moment to drain
+        // its last lines into the log.
+        if let Some(t) = self.tee.take() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
         self.spawned_at = None;
         self.active_mic = None;
+        self.active_model = None;
         Ok(())
     }
 }

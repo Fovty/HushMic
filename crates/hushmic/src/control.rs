@@ -4,6 +4,7 @@
 //! the socket plumbing of the listener/client.
 
 use crate::controller::RunMode;
+pub use crate::diagnostics::EngineTier;
 
 /// A validated control request. `SetMode(None)` = Off (the persisted
 /// disable path, exactly like the tray radio).
@@ -155,6 +156,22 @@ pub struct Status {
     /// A StatusNotifierItem is registered (`sni`) or the daemon runs
     /// without an icon (`none`: --headless, tray = false, or no watcher).
     pub tray_sni: bool,
+    /// The engine tier the chain last reported (issue #14); None until the
+    /// plugin has said anything, or when the chain is not running.
+    pub engine: Option<EngineTier>,
+    /// The configured model is already the light one, so a `light` tier is
+    /// not a degradation.
+    pub configured_light: bool,
+}
+
+/// The human wording of the engine line.
+fn engine_words(tier: EngineTier, configured_light: bool) -> &'static str {
+    match tier {
+        EngineTier::Quality => "quality model",
+        EngineTier::Light if configured_light => "light model",
+        EngineTier::Light => "light model (fallback)",
+        EngineTier::Passthrough => "passthrough (fallback)",
+    }
 }
 
 pub fn render_status_human(s: &Status) -> String {
@@ -178,13 +195,18 @@ pub fn render_status_human(s: &Status) -> String {
             None => "running (node state unknown)",
         }
     };
+    let engine = match (s.chain_running, s.engine) {
+        (true, Some(t)) => format!("engine: {}\n", engine_words(t, s.configured_light)),
+        _ => String::new(),
+    };
     format!(
-        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\nlatency: {} ms added\ntray: {}\nchain: {}\n",
+        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\n{}latency: {} ms added\ntray: {}\nchain: {}\n",
         s.version,
         mode,
         mic,
         s.model,
         s.attn_limit,
+        engine,
         crate::controller::LATENCY_SAMPLES * 1000 / 48_000,
         tray_word(s.tray_sni),
         chain
@@ -211,6 +233,7 @@ pub fn render_status_json(s: &Status) -> String {
         },
         "model": s.model,
         "attn_limit": s.attn_limit,
+        "engine": s.chain_running.then_some(s.engine).flatten().map(EngineTier::word),
         "latency_samples": crate::controller::LATENCY_SAMPLES,
         "tray": tray_word(s.tray_sni),
         "chain": {
@@ -615,7 +638,33 @@ mod tests {
             chain_running: true,
             node_present: Some(true),
             tray_sni: true,
+            engine: Some(EngineTier::Quality),
+            configured_light: false,
         }
+    }
+
+    #[test]
+    fn status_reports_the_engine_tier() {
+        let mut s = demo_status();
+        assert!(render_status_human(&s).contains("engine: quality model\n"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert_eq!(v["engine"], "quality");
+        s.engine = Some(EngineTier::Light);
+        assert!(render_status_human(&s).contains("engine: light model (fallback)\n"));
+        s.configured_light = true;
+        assert!(render_status_human(&s).contains("engine: light model\n"));
+        s.engine = Some(EngineTier::Passthrough);
+        assert!(render_status_human(&s).contains("engine: passthrough (fallback)\n"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert_eq!(v["engine"], "passthrough");
+        // Nothing reported yet, or chain down: no line, JSON null.
+        s.engine = None;
+        assert!(!render_status_human(&s).contains("engine:"));
+        s.engine = Some(EngineTier::Light);
+        s.chain_running = false;
+        assert!(!render_status_human(&s).contains("engine:"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert!(v["engine"].is_null());
     }
 
     #[test]

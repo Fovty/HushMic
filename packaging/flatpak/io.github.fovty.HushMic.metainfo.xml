@@ -49,6 +49,17 @@
   </screenshots>
 
   <releases>
+    <release version="0.8.1" date="2026-09-15">
+      <description>
+        <p>
+          When the CPU is too busy for the quality model, HushMic now
+          switches to the light model on its own and back once there is room
+          again, so your voice keeps going during screen sharing and other
+          heavy load. If even the light model cannot keep up, the microphone
+          stays on without noise suppression instead of going silent.
+        </p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-09-13">
       <description>
         <p>

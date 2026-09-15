@@ -448,6 +448,48 @@ fn apply_config(
     }
 }
 
+/// The two engine fields the tray shows, as one value: the tier the
+/// running chain reports (None without a chain) and whether that chain is
+/// on the light model by configuration, which decides whether a reported
+/// `light` reads as a fallback. They travel together because the title and
+/// the model menu read both.
+type EngineView = (Option<hushmic::diagnostics::EngineTier>, bool);
+
+fn engine_view(controller: &mut Controller) -> EngineView {
+    if controller.is_running() {
+        (
+            hushmic::diagnostics::engine_tier(),
+            controller.active_model_is_light(),
+        )
+    } else {
+        (None, false)
+    }
+}
+
+/// What the tray is known to be displaying for the engine, or None when
+/// that is unknown: no tray registered yet, or an update that was dropped
+/// because there was none. Keeping "unknown" distinct from "nothing
+/// reported" is the point: an update the tray never received must not be
+/// remembered as delivered, or a tray that registers later shows the
+/// state from before it existed until the tier happens to change again.
+#[derive(Default)]
+struct EngineCache(Option<EngineView>);
+
+impl EngineCache {
+    /// Push the engine fields when they differ from what the tray shows.
+    /// `send` reports whether the update reached a tray.
+    fn push_changed(&mut self, now: EngineView, send: impl FnOnce(EngineView) -> bool) {
+        if self.0 == Some(now) {
+            return;
+        }
+        self.record(now, send(now));
+    }
+    /// Note what a full refresh just sent, and whether it landed.
+    fn record(&mut self, now: EngineView, landed: bool) {
+        self.0 = landed.then_some(now);
+    }
+}
+
 /// After any settings change (tray menu or `config set`): one pw-dump
 /// snapshot refreshes the mic list and the node probe, and the tray gets
 /// the full state. The one place the post-change tray closure lives.
@@ -457,6 +499,7 @@ fn refresh_tray(
     controller: &mut Controller,
     known_mics: &mut Vec<pipewire::Source>,
     last_node_present: &mut Option<bool>,
+    engine: &mut EngineCache,
     testing: bool,
 ) {
     let nodes = pipewire::sources_snapshot();
@@ -475,14 +518,23 @@ fn refresh_tray(
         && controller.is_running()
         && controller.active_mic() != cfg.mic.as_deref();
     let mode_now = controller.mode();
-    let _ = handle.update(move |t: &mut HushMicTray| {
-        t.cfg = snapshot;
-        t.mics = new_mics;
-        t.status = status;
-        t.testing = testing;
-        t.fallback_active = fallback_now;
-        t.mode = mode_now;
-    });
+    // A full refresh carries the engine fields too: a restart or a model
+    // change can move the tier and the configured-light flag at the same
+    // time, and a tray that registers here has never seen either.
+    let engine_now = engine_view(controller);
+    let landed = handle
+        .update(move |t: &mut HushMicTray| {
+            t.cfg = snapshot;
+            t.mics = new_mics;
+            t.status = status;
+            t.testing = testing;
+            t.fallback_active = fallback_now;
+            t.mode = mode_now;
+            t.engine = engine_now.0;
+            t.engine_light_configured = engine_now.1;
+        })
+        .is_some();
+    engine.record(engine_now, landed);
 }
 
 fn usage_text() -> String {
@@ -797,6 +849,8 @@ fn main() {
         fallback_active: false,
         mode: RunMode::default(),
         shortcuts_available: false,
+        engine: None,
+        engine_light_configured: false,
     };
     let mut handle = if !want_tray {
         TrayLink::Disabled
@@ -983,6 +1037,7 @@ fn main() {
     // Last hushmic_source probe verdict, refreshed by Tick and the Cmd
     // epilogue — `status` reports it instead of re-probing on the hot path.
     let mut last_node_present: Option<bool> = None;
+    let mut tray_engine = EngineCache::default();
     // Metadata stream routing (the re-pin write) exists only on modern
     // PipeWire; probed once — on legacy hosts the theft mechanism does not
     // exist either, and inert writes would just spam the log.
@@ -1036,6 +1091,11 @@ fn main() {
                             chain_running: controller.is_running(),
                             node_present: last_node_present,
                             tray_sni: handle.is_sni(),
+                            engine: controller
+                                .is_running()
+                                .then(hushmic::diagnostics::engine_tier)
+                                .flatten(),
+                            configured_light: controller.active_model_is_light(),
                         };
                         let payload = if json {
                             control::render_status_json(&s)
@@ -1122,6 +1182,7 @@ fn main() {
                             &mut controller,
                             &mut known_mics,
                             &mut last_node_present,
+                            &mut tray_engine,
                             testing,
                         );
                         continue;
@@ -1433,6 +1494,7 @@ fn main() {
                     &mut controller,
                     &mut known_mics,
                     &mut last_node_present,
+                    &mut tray_engine,
                     testing,
                 );
             }
@@ -1521,6 +1583,16 @@ fn main() {
                 });
             }
             Event::Tick => {
+                // The chain's engine tier (issue #14) reaches the tray
+                // title with up to one tick of lag; no notification.
+                tray_engine.push_changed(engine_view(&mut controller), |now| {
+                    handle
+                        .update(move |t: &mut HushMicTray| {
+                            t.engine = now.0;
+                            t.engine_light_configured = now.1;
+                        })
+                        .is_some()
+                });
                 // Late tray registration: a watcher that appears after
                 // login (Cinnamon) or an extension enabled later (GNOME)
                 // gets the icon; a desktop without one costs a rare probe.
@@ -1540,6 +1612,7 @@ fn main() {
                                     &mut controller,
                                     &mut known_mics,
                                     &mut last_node_present,
+                                    &mut tray_engine,
                                     testing,
                                 );
                                 let shortcuts_now = shortcuts_up == Some(true);
@@ -1923,4 +1996,80 @@ fn main() {
     // the voice recordings must not outlive the app. (Unlinking files the
     // recorders still hold open is fine: the data dies with their fds.)
     mictest::remove_recordings();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EngineCache, EngineView};
+    use hushmic::diagnostics::EngineTier;
+
+    /// A tray that is not there yet (TrayLink::Pending) drops the update.
+    /// The cache must not record it as shown, or the tier the tray finally
+    /// registers with stays wrong until it happens to change again.
+    #[test]
+    fn a_dropped_engine_update_is_pushed_again() {
+        let mut cache = EngineCache::default();
+        let mut sent: Vec<EngineView> = Vec::new();
+        let light: EngineView = (Some(EngineTier::Light), false);
+        // No tray: the push is attempted and does not land.
+        cache.push_changed(light, |v| {
+            sent.push(v);
+            false
+        });
+        assert_eq!(sent.len(), 1);
+        // Same value, still no tray: attempted again, not assumed shown.
+        cache.push_changed(light, |v| {
+            sent.push(v);
+            false
+        });
+        assert_eq!(sent.len(), 2);
+        // The tray registers and takes it.
+        cache.push_changed(light, |v| {
+            sent.push(v);
+            true
+        });
+        assert_eq!(sent.len(), 3);
+        // Now it is known to be shown, so nothing is resent.
+        cache.push_changed(light, |_| panic!("resent a value the tray shows"));
+        assert_eq!(sent.len(), 3);
+    }
+
+    /// The displayed state is the pair, not the tier alone: the same
+    /// `light` tier reads as a fallback or as the configured model
+    /// depending on the second field, and a change there must reach the
+    /// tray (a per-mic profile switch does exactly this).
+    #[test]
+    fn the_configured_light_flag_is_part_of_the_displayed_state() {
+        let mut cache = EngineCache::default();
+        let mut sent: Vec<EngineView> = Vec::new();
+        let fallback: EngineView = (Some(EngineTier::Light), false);
+        let configured: EngineView = (Some(EngineTier::Light), true);
+        cache.push_changed(fallback, |v| {
+            sent.push(v);
+            true
+        });
+        cache.push_changed(configured, |v| {
+            sent.push(v);
+            true
+        });
+        assert_eq!(sent, vec![fallback, configured]);
+    }
+
+    /// A full tray refresh carries the engine fields, so it also decides
+    /// what the cache holds: landed means shown, dropped means unknown.
+    #[test]
+    fn a_full_refresh_sets_the_cache_and_a_dropped_one_clears_it() {
+        let mut cache = EngineCache::default();
+        let quality: EngineView = (Some(EngineTier::Quality), false);
+        cache.record(quality, true);
+        cache.push_changed(quality, |_| panic!("resent what the refresh sent"));
+        // A refresh that reached no tray leaves the state unknown.
+        cache.record(quality, false);
+        let mut sent = 0;
+        cache.push_changed(quality, |_| {
+            sent += 1;
+            true
+        });
+        assert_eq!(sent, 1);
+    }
 }

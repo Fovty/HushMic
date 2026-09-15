@@ -3,13 +3,21 @@
 //! control-port mapping, the inference worker + alignment ledger that
 //! decouple the DSP from the host's cycle (issue #10), and the bundled
 //! ONNX Runtime's baked default paths.
+pub mod adaptive;
 pub mod align;
+pub mod ladder;
+pub mod log;
+pub mod rt;
 pub mod worker;
 
+pub use adaptive::{AdaptiveEngine, RawDelay};
 pub use align::{
-    Aligner, PopPlan, DESIGN_QUANTUM, OUTPUT_LEAD, PLUGIN_LATENCY_SAMPLES, STALL_HEADROOM,
+    required_lead, Aligner, PopPlan, DESIGN_QUANTUM, OUTPUT_LEAD, PLUGIN_LATENCY_SAMPLES,
+    STALL_HEADROOM,
 };
-pub use worker::{HopEngine, WorkerHandle, RING_CAPACITY};
+pub use ladder::{Event, Ladder, Pinned, Policy, ShadowKind, Step, Tier};
+pub use rt::{RtOutcome, RT_PRIORITY};
+pub use worker::{HopEngine, WorkerHandle, RING_CAPACITY, RUN_GUARD_AFTER, RUN_GUARD_MIN_PARK};
 
 use hushmic_denoiser::{Denoiser, Mode, RuntimeInit};
 use ladspa::{DefaultValue, Plugin, PluginDescriptor, Port, PortConnection, PortDescriptor};
@@ -40,13 +48,70 @@ fn mode_from_control(v: f32) -> Mode {
     }
 }
 
-/// Bring up the pinned bundled runtime and load the model. On any failure the
-/// plugin runs engine-less (working-but-silent node). The runtime commit is
-/// gated on OUR resolved path — a failed init must never fall through to a
-/// random system libonnxruntime replacing the pinned bundled one, so no
-/// `Denoiser` constructor (whose implicit resolution would try exactly that)
-/// is ever reached on the error path.
-fn init_engine() -> Option<Denoiser> {
+/// Which tiers a main model file and an optional light engine yield, and
+/// which slot the main model occupies. The file name decides: a main model
+/// named `dpdfnet2*` IS the light tier, so the ladder is `[Light, Raw]`.
+fn plan_tiers(main: &std::path::Path, light_loaded: bool) -> (Vec<Tier>, Tier) {
+    let main_is_light = main
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| f.starts_with("dpdfnet2"));
+    if main_is_light {
+        (vec![Tier::Light, Tier::Raw], Tier::Light)
+    } else if light_loaded {
+        (vec![Tier::Quality, Tier::Light, Tier::Raw], Tier::Quality)
+    } else {
+        (vec![Tier::Quality, Tier::Raw], Tier::Quality)
+    }
+}
+
+/// `HUSHMIC_DSP_TIER=quality|light|passthrough` pins the policy; a word
+/// that names a tier this ladder does not have is ignored with a log line.
+fn pinned_tier(value: Option<&str>, tiers: &[Tier]) -> Option<Tier> {
+    let v = value?;
+    let tier = match v {
+        "quality" => Some(Tier::Quality),
+        "light" => Some(Tier::Light),
+        "passthrough" => Some(Tier::Raw),
+        _ => None,
+    };
+    match tier {
+        Some(t) if tiers.contains(&t) => Some(t),
+        _ => {
+            eprintln!(
+                "[dpdfnet-ladspa] HUSHMIC_DSP_TIER={v} ignored (not one of this chain's tiers)"
+            );
+            None
+        }
+    }
+}
+
+fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
+    let pin = std::env::var("HUSHMIC_DSP_TIER").ok();
+    if let Some(t) = pinned_tier(pin.as_deref(), tiers) {
+        return Box::new(Pinned(t));
+    }
+    let mut ladder = Ladder::new(tiers);
+    if let Some(hops) = std::env::var("HUSHMIC_DSP_DWELL_HOPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        ladder = ladder.with_dwell_base(hops);
+    }
+    Box::new(ladder)
+}
+
+/// Bring up the pinned bundled runtime and load the model(s). On any failure
+/// of the main model the plugin runs engine-less (working-but-silent node).
+/// The runtime commit is gated on OUR resolved path — a failed init must
+/// never fall through to a random system libonnxruntime replacing the pinned
+/// bundled one, so no `Denoiser` constructor (whose implicit resolution would
+/// try exactly that) is ever reached on the error path.
+///
+/// `HUSHMIC_FALLBACK_MODEL_PATH` names the light model; when it loads, the
+/// adaptive engine can fall back to it under CPU pressure (issue #14). Both
+/// loads happen here, on the instantiate thread, before the worker exists.
+fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
     let dylib = std::env::var("ORT_DYLIB_PATH")
         .ok()
         .filter(|s| !s.is_empty()) // empty counts as unset, as in ort itself
@@ -64,13 +129,39 @@ fn init_engine() -> Option<Denoiser> {
         // runtime is committed", so proceeding is the right default.
         Ok(_) => {}
     }
-    match Denoiser::from_file(model_path()) {
-        Ok(d) => Some(d),
+    let main_path = model_path();
+    let main = match Denoiser::from_file(&main_path) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("[dpdfnet-ladspa] engine init failed: {e}");
-            None
+            return None;
         }
-    }
+    };
+    // A main model that is already the light one has no fallback to load;
+    // the comparison is by canonical path so a symlinked or differently
+    // spelled duplicate is not loaded twice as the "light" tier.
+    let (_, main_tier) = plan_tiers(&main_path, false);
+    let same_file = |p: &PathBuf| {
+        let canon = |q: &std::path::Path| q.canonicalize().unwrap_or_else(|_| q.to_path_buf());
+        canon(p) == canon(&main_path)
+    };
+    let light = std::env::var_os("HUSHMIC_FALLBACK_MODEL_PATH")
+        .map(PathBuf::from)
+        .filter(|p| main_tier != Tier::Light && !same_file(p))
+        .and_then(|p| match Denoiser::from_file(&p) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("[dpdfnet-ladspa] light model unavailable: {e}");
+                None
+            }
+        });
+    let (tiers, main_tier) = plan_tiers(&main_path, light.is_some());
+    let (quality, light) = match main_tier {
+        Tier::Light => (None, Some(main)),
+        _ => (Some(main), light),
+    };
+    let policy = build_policy(&tiers);
+    Some(AdaptiveEngine::new(quality, light, policy))
 }
 
 struct DpdfnetPlugin {
@@ -88,8 +179,6 @@ struct DpdfnetPlugin {
     // Control-port caches as bit patterns (NaN-proof compares).
     last_db_bits: u32,
     last_mode_bits: u32,
-    overflow_logged: bool,
-    dead_logged: bool,
 }
 
 impl DpdfnetPlugin {
@@ -114,8 +203,6 @@ impl DpdfnetPlugin {
             restarting: false,
             last_db_bits: f32::NAN.to_bits(),
             last_mode_bits: f32::NAN.to_bits(),
-            overflow_logged: false,
-            dead_logged: false,
         }
     }
 }
@@ -137,7 +224,6 @@ impl Plugin for DpdfnetPlugin {
         self.restarting = false;
         self.last_db_bits = f32::NAN.to_bits();
         self.last_mode_bits = f32::NAN.to_bits(); // force a set on first run()
-        self.overflow_logged = false;
         self.active = match self.worker.as_mut() {
             Some(w) => {
                 let ok = w.request_reset_and_wait(Duration::from_secs(2));
@@ -158,11 +244,10 @@ impl Plugin for DpdfnetPlugin {
         let db = *ports[2].unwrap_control();
         let mode_ctl = *ports[3].unwrap_control();
 
-        // RT contract: nothing below allocates, locks, or panics — ring
-        // pushes/pops, atomics, and one futex wake at most. (Exception:
-        // the two log-once eprintlns on the degradation paths lock
-        // stderr — once per instance, only when the stream is already
-        // broken.)
+        // RT contract: nothing below allocates, locks, logs or panics:
+        // ring pushes/pops, atomics, and one futex wake at most. The
+        // degradation paths (engine death, input overflow) are reported
+        // by the worker thread from flags set here.
         let w = match self.worker.as_mut() {
             Some(w) if self.active => w,
             _ => {
@@ -171,10 +256,6 @@ impl Plugin for DpdfnetPlugin {
             } // silent node: failed init, wrong rate, or failed activation
         };
         if w.engine_dead() {
-            if !self.dead_logged {
-                eprintln!("[dpdfnet-ladspa] engine died; the node stays silent");
-                self.dead_logged = true;
-            }
             emit_silence(&mut output, sample_count);
             return;
         }
@@ -210,12 +291,6 @@ impl Plugin for DpdfnetPlugin {
             // Input ring full: the worker is >680 ms behind. Restart the
             // stream — resync the mic to now instead of replaying stale
             // audio into a live call (see worker.rs / the design doc).
-            if !self.overflow_logged {
-                eprintln!(
-                    "[dpdfnet-ladspa] input ring overflowed (worker stalled); restarting stream"
-                );
-                self.overflow_logged = true;
-            }
             w.request_reset();
             self.restarting = true;
             self.aligner.reset();
@@ -223,6 +298,7 @@ impl Plugin for DpdfnetPlugin {
             emit_silence(&mut output, sample_count);
             return;
         }
+        w.note_quantum(sample_count);
         w.wake();
         let plan = self.aligner.plan(sample_count, w.output_available());
         for _ in 0..plan.discard {
@@ -310,6 +386,39 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiers_follow_the_main_model_name_and_light_load() {
+        let q = std::path::Path::new("/x/dpdfnet8_48khz_hr.onnx");
+        let l = std::path::Path::new("/x/dpdfnet2_48khz_hr.onnx");
+        assert_eq!(
+            plan_tiers(q, true),
+            (vec![Tier::Quality, Tier::Light, Tier::Raw], Tier::Quality)
+        );
+        assert_eq!(
+            plan_tiers(q, false),
+            (vec![Tier::Quality, Tier::Raw], Tier::Quality)
+        );
+        assert_eq!(
+            plan_tiers(l, false),
+            (vec![Tier::Light, Tier::Raw], Tier::Light)
+        );
+        assert_eq!(
+            plan_tiers(l, true),
+            (vec![Tier::Light, Tier::Raw], Tier::Light)
+        );
+    }
+
+    #[test]
+    fn pinned_tier_must_exist_in_the_ladder() {
+        let qlr = [Tier::Quality, Tier::Light, Tier::Raw];
+        let lr = [Tier::Light, Tier::Raw];
+        assert_eq!(pinned_tier(Some("light"), &qlr), Some(Tier::Light));
+        assert_eq!(pinned_tier(Some("passthrough"), &lr), Some(Tier::Raw));
+        assert_eq!(pinned_tier(Some("quality"), &lr), None);
+        assert_eq!(pinned_tier(Some("bogus"), &qlr), None);
+        assert_eq!(pinned_tier(None, &qlr), None);
+    }
 
     #[test]
     fn mode_port_is_declared_fourth() {

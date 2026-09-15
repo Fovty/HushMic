@@ -49,8 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu**:
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.8.0-1_amd64.deb
-sudo apt install ./hushmic_0.8.0-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.8.1-1_amd64.deb
+sudo apt install ./hushmic_0.8.1-1_amd64.deb
 ```
 
 **Arch Linux** (AUR):

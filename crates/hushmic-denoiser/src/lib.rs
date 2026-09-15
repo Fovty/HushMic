@@ -33,7 +33,7 @@ mod stream;
 
 pub use denoiser::Denoiser;
 pub use error::Error;
-pub use mode::Mode;
+pub use mode::{GainRamp, Mode, MUTE_RAMP_SAMPLES};
 #[cfg(feature = "load-dynamic")]
 pub use runtime::{init_runtime, RuntimeInit};
 pub use stream::StreamDenoiser;
