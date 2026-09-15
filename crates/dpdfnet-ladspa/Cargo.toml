@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the test
 # fallback. `--no-default-features` builds an ONNX-only plugin.
 default = ["native"]
 native = ["hushmic-denoiser/native"]
+experimental-openvino = ["hushmic-denoiser/experimental-openvino"]
 
 [dependencies]
 ladspa = "0.3.4"
@@ -23,3 +24,4 @@ libc = "0.2"
 
 [dev-dependencies]
 claxon = "0.4" # FLAC decode for the committed public parity fixture
+

@@ -37,13 +37,36 @@ fn parse_csv_f32(s: &str) -> Vec<f32> {
 /// API bootstrap would otherwise retry the dylib load itself and PANIC on
 /// failure) — `crate::runtime::ensure_runtime` guarantees that.
 fn session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
-    Session::builder()
-        .map_err(|e| e.to_string())?
-        .with_execution_providers([ort::ep::CPU::default().build()])
+    let builder = Session::builder()
         .map_err(|e| e.to_string())?
         .with_intra_threads(1)
         .map_err(|e| e.to_string())?
         .with_inter_threads(1)
+        .map_err(|e| e.to_string())?;
+
+    #[cfg(feature = "experimental-openvino")]
+    {
+        use ort::ep::ArbitrarilyConfigurableExecutionProvider;
+
+        // Keep the native benchmark's single-thread FP32 configuration. The
+        // Snippets workaround is internal to OpenVINO: recheck before shipping.
+        let provider = ort::ep::OpenVINO::default()
+            .with_device_type("CPU")
+            .with_arbitrary_config("load_config", r#"{"CPU":{"PERFORMANCE_HINT":"LATENCY","INFERENCE_PRECISION_HINT":"f32","INFERENCE_NUM_THREADS":"1","NUM_STREAMS":"1","ENABLE_CPU_PINNING":"NO","SNIPPETS_MODE":"DISABLE"}}"#)
+            .build()
+            .error_on_failure();
+        builder
+            .with_execution_providers([provider])
+            .map_err(|e| e.to_string())?
+            .with_disable_cpu_fallback()
+            .map_err(|e| e.to_string())?
+            // Let OpenVINO optimize the original ONNX graph.
+            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "experimental-openvino"))]
+    builder
+        .with_execution_providers([ort::ep::CPU::default().build()])
         .map_err(|e| e.to_string())?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| e.to_string())
@@ -213,6 +236,9 @@ mod tests {
             return;
         };
         // AlreadyInitialized is fine — some other test may have won the commit.
+        let rt = std::env::var_os("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or(rt);
         crate::runtime::init_runtime(rt).expect("runtime");
         let mut m = Model::load(&mp).expect("load model");
         // dpdfnet8 state size

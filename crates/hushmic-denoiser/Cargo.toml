@@ -23,6 +23,8 @@ load-dynamic = ["ort/load-dynamic", "dep:libloading"]
 # Off by default so the crate's default API and build needs stay as they
 # are; HushMic's plugin turns it on.
 native = ["dep:cc", "dep:sha2"]
+# Local CPU experiment; requires an ONNX Runtime build with OpenVINO support.
+experimental-openvino = ["load-dynamic"]
 
 [dependencies]
 rustfft = "6"

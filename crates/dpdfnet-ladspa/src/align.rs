@@ -25,8 +25,7 @@ use hushmic_denoiser::HOP;
 
 /// Worker stall headroom (20 ms): scheduling jitter plus transient
 /// compute inflation the cushion absorbs before a zero is substituted.
-/// Sized from the issue-#10 field data (a 4x-inflated 28 ms dpdfnet8 hop
-/// consumes 18 ms of cushion).
+/// Sustained overload still substitutes silence.
 pub const STALL_HEADROOM: usize = 960;
 
 /// The plugin-side output margin: output for the input pushed in a cycle
@@ -227,7 +226,7 @@ mod tests {
     #[test]
     fn startup_emits_exactly_the_lead_then_real_samples() {
         let mut s = Sim::new();
-        for _ in 0..6 {
+        for _ in 0..=OUTPUT_LEAD / DESIGN_QUANTUM {
             s.cycle(DESIGN_QUANTUM);
         }
         assert!(s.emitted[..OUTPUT_LEAD].iter().all(|&v| v == 0.0));
@@ -236,9 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn twenty_ms_worker_delay_preserves_every_sample() {
+        let mut s = Sim::new();
+        for _ in 0..20 {
+            s.push(DESIGN_QUANTUM);
+            // Model a worker whose output trails input by two 10 ms hops.
+            let ready = s.produced.len().saturating_sub(2 * DESIGN_QUANTUM);
+            s.pop(DESIGN_QUANTUM, ready.saturating_sub(s.consumed));
+        }
+        assert!(s.emitted[OUTPUT_LEAD..].iter().all(|&v| v != 0.0));
+        s.assert_alignment(OUTPUT_LEAD, 0);
+    }
+
+    #[test]
     fn a_stall_substitutes_zeros_then_realigns_exactly() {
         let mut s = Sim::new();
-        for _ in 0..4 {
+        for _ in 0..=OUTPUT_LEAD / DESIGN_QUANTUM {
             s.cycle(480);
         }
         // Worker stalls hard: only 180 samples sit in the ring — the
@@ -263,7 +275,7 @@ mod tests {
         for _ in 0..4 {
             s.cycle(480);
         }
-        for _ in 0..6 {
+        for _ in 0..=OUTPUT_LEAD / DESIGN_QUANTUM {
             s.cycle(1024); // metadata override beyond the design quantum
         }
         for _ in 0..4 {
