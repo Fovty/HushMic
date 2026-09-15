@@ -4,7 +4,7 @@
 //! (latency-aligned raw), same as the engine crate's own latency tests.
 //!
 //! Timing note: cycles are paced at real time (10 ms per 480-sample
-//! callback); a CI stall longer than the 20 ms headroom would substitute
+//! callback); a CI stall longer than the 40 ms headroom would substitute
 //! zeros and swallow the impulse, so the impulse check retries a few
 //! times before failing.
 

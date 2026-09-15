@@ -424,14 +424,16 @@ context.modules = [
 /// The chain's algorithmic latency in samples at 48 kHz: 2400 engine
 /// latency (480 STFT framing + 1920 model group delay — MEASURED: the
 /// hushmic-denoiser latency tests push impulses and real speech through
-/// the actual DSP and pin it exactly) + 1440 async output lead (one
-/// pinned 480-sample quantum + 960 samples / 20 ms of worker stall
+/// the actual DSP and pin it exactly) + 2400 async output lead (one
+/// pinned 480-sample quantum + 1920 samples / 40 ms of worker stall
 /// headroom, since inference runs on its own thread — issue #10)
-/// = 3840 = 80 ms. The plugin pins the same figure as
+/// = 4800 = 100 ms. The plugin pins the same figure as
 /// PLUGIN_LATENCY_SAMPLES (crates/dpdfnet-ladspa/src/align.rs) and its
 /// asset-gated test measures the whole plugin end to end; change either
 /// side and a test forces this constant to be re-derived. PipeWire adds
 /// its own quantum/device buffering on top.
+pub const LATENCY_SAMPLES: u32 = 4800;
+
 /// The light model's id: the plugin's fallback tier under CPU pressure.
 pub const LIGHT_MODEL: &str = "dpdfnet2_48khz_hr";
 
@@ -445,8 +447,6 @@ pub fn plugin_inference(
 ) -> Option<&'static str> {
     (setting == crate::config::Inference::Onnx && !inherited).then_some("onnx")
 }
-
-pub const LATENCY_SAMPLES: u32 = 3840;
 
 /// The graph quantum the chain pins while it runs (issue #10). With
 /// inference decoupled onto a worker thread the RT callback is a memcpy

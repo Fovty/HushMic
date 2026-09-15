@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(v["mic"]["fallback_active"], false);
         assert_eq!(v["model"], "dpdfnet8_48khz_hr");
         assert_eq!(v["attn_limit"], 100.0);
-        assert_eq!(v["latency_samples"], 3840);
+        assert_eq!(v["latency_samples"], 4800);
         assert_eq!(v["tray"], "sni");
         assert_eq!(v["chain"]["running"], true);
         assert_eq!(v["chain"]["node_present"], true);
@@ -886,7 +886,7 @@ mod tests {
         let h = render_status_human(&s);
         assert!(h.contains("mute"), "{h}");
         assert!(h.contains("alsa_input.rode"), "{h}");
-        assert!(h.contains("80 ms"), "latency stated: {h}");
+        assert!(h.contains("100 ms"), "latency stated: {h}");
         assert!(!h.contains('{'), "no JSON braces in human output: {h}");
         // fallback state is spelled out when engaged
         let mut f = demo_status();

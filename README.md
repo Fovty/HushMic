@@ -15,7 +15,7 @@
   <a href="https://ko-fi.com/fovty"><img src="https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=ko-fi&logoColor=white" alt="Support on Ko-fi"></a>
 </p>
 
-HushMic adds a virtual microphone to PipeWire that removes keyboard noise, fans and background chatter from your voice in real time. Pick **HushMic** as the input in Discord, TeamSpeak, OBS or your browser. The model is DPDFNet, which scored above Krisp, DeepFilterNet and RNNoise on the demo clips (see [Why DPDFNet](#why-dpdfnet)). Processing adds 80 ms of latency.
+HushMic adds a virtual microphone to PipeWire that removes keyboard noise, fans and background chatter from your voice in real time. Pick **HushMic** as the input in Discord, TeamSpeak, OBS or your browser. The model is DPDFNet, which scored above Krisp, DeepFilterNet and RNNoise on the demo clips (see [Why DPDFNet](#why-dpdfnet)). Processing adds 100 ms of latency.
 
 ## Demo
 
@@ -136,7 +136,7 @@ Three clips are not a formal benchmark, but the source audio is public. Method, 
 
 **Does my audio go anywhere?** No. Everything runs on the CPU and nothing is uploaded.
 
-**How much latency and CPU?** 80 ms of processing (10 ms framing, 40 ms model context, 30 ms scheduling margin) plus PipeWire's own buffering. On PipeWire 1.6 and later the latency is reported to the graph, so apps like OBS can compensate. On CPUs with AVX2 (most Intel Core and AMD Ryzen CPUs since 2015) the models run on a native engine that needs roughly half the CPU of ONNX Runtime. CPUs without it, including many older Pentium, Celeron and Atom chips, use ONNX Runtime: there the quality model takes about a third of a fast desktop core and more than a whole core on slow chips, where HushMic runs the cheaper light model on its own.
+**How much latency and CPU?** 100 ms of processing (10 ms framing, 40 ms model context, 50 ms scheduling margin) plus PipeWire's own buffering. On PipeWire 1.6 and later the latency is reported to the graph, so apps like OBS can compensate. On CPUs with AVX2 (most Intel Core and AMD Ryzen CPUs since 2015) the models run on a native engine that needs roughly half the CPU of ONNX Runtime. CPUs without it, including many older Pentium, Celeron and Atom chips, use ONNX Runtime: there the quality model takes about a third of a fast desktop core and more than a whole core on slow chips, where HushMic runs the cheaper light model on its own.
 
 **No tray icon on GNOME?** Install the *AppIndicator and KStatusNotifierItem Support* extension. HushMic keeps running without it.
 

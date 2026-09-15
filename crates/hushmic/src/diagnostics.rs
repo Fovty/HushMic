@@ -868,7 +868,7 @@ mod tests {
             commands: vec![("pw-dump", true), ("pw-cli", true)],
             log_tail: Some("[hushmic] chain up\n".into()),
             latency_supported: true,
-            latency_reported: Some(3840),
+            latency_reported: Some(4800),
             capture_feeders: Some(vec!["alsa_input.usb-mic".into()]),
             prior_default: Some("alsa_input.usb-mic".into()),
             chain_quantum_pin: Some(crate::controller::PINNED_QUANTUM),
@@ -1148,10 +1148,10 @@ mod tests {
         let (text, problems) = render(&healthy());
         assert_eq!(problems, 0);
         assert!(
-            text.contains("chain latency: 80 ms (3840 samples @ 48 kHz)"),
+            text.contains("chain latency: 100 ms (4800 samples @ 48 kHz)"),
             "{text}"
         );
-        assert!(text.contains("reported to PipeWire: yes (3840)"), "{text}");
+        assert!(text.contains("reported to PipeWire: yes (4800)"), "{text}");
     }
 
     #[test]
