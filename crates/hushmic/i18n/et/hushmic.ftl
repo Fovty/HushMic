@@ -77,7 +77,6 @@ notify-autostart-denied-body = Töölauakeskkond keelas HushMicil määrata end 
 notify-mic-fallback-body = Sinu mikrofon on hetkel lülitatud välja - HushMic järgib hetkel süsteemi vaikimisi seadistust.
 notify-mic-return-body = Sinu mikrofon uuesti lülitatud sisse - HushMic jätkab selle kasutamist.
 ab-no-input-title = Puudub sisend mikrofonist
-notify-tray-failed-title = HushMic-i käivitamine ei õnnestunud
 notify-window-fallback-body = Testakna käivitamine ei õnnestunud - selle asemel käivitan ainult helipõhise testi.
 notify-chain-failed-summary = HushMic ei suutnud virtuaalset mikrofoni käivitada
 notify-chain-stuck-summary = HushMic tundub kogu aeg kaotama virtuaalset mikrofoni
