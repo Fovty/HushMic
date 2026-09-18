@@ -48,9 +48,11 @@ package() {
   install -Dm644 share/applications/hushmic.desktop \
     "$pkgdir/usr/share/applications/hushmic.desktop"
 
-  # App icon + the tray status ladder (three SNI names x eight sizes); a plain
-  # copy of the tree keeps every size/state the release ships.
-  find share/icons -type f -name '*.png' -print0 | while IFS= read -r -d '' _icon; do
+  # App icon + the tray status ladder (five SNI names x eight sizes) + the
+  # monochrome -symbolic SVGs the desktop recolors; a plain copy of the tree
+  # keeps every size, state and format the release ships.
+  find share/icons -type f \( -name '*.png' -o -name '*.svg' \) -print0 \
+    | while IFS= read -r -d '' _icon; do
     install -Dm644 "$_icon" "$pkgdir/usr/$_icon"
   done
 

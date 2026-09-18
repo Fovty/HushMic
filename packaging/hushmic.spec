@@ -81,9 +81,11 @@ install -Dm644 share/applications/hushmic.desktop \
 install -Dm644 lib/systemd/user/hushmic.service \
   %{buildroot}%{_userunitdir}/hushmic.service
 
-# App icon + the tray status ladder (five SNI names x eight sizes); copying the
-# tree keeps every size/state the release ships.
-find share/icons -type f -name '*.png' -print0 | while IFS= read -r -d '' _icon; do
+# App icon + the tray status ladder (five SNI names x eight sizes) + the
+# monochrome -symbolic SVGs the desktop recolors; copying the tree keeps every
+# size, state and format the release ships.
+find share/icons -type f \( -name '*.png' -o -name '*.svg' \) -print0 \
+  | while IFS= read -r -d '' _icon; do
   install -Dm644 "$_icon" "%{buildroot}%{_prefix}/$_icon"
 done
 
@@ -111,6 +113,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/hushmic.desktop
 %{_datadir}/applications/hushmic.desktop
 %{_userunitdir}/hushmic.service
 %{_datadir}/icons/hicolor/*/*/hushmic*.png
+%{_datadir}/icons/hicolor/*/*/hushmic*-symbolic.svg
 
 %changelog
 * Wed Jul 15 2026 Fovty <38868829+Fovty@users.noreply.github.com> - 0.2.1-1

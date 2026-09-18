@@ -24,7 +24,7 @@ Only one instance runs per session. Quitting removes the virtual mic and restore
 
 Switching between suppress, bypass and mute changes a control on the running chain, so your call stays connected. Mute silences the virtual mic only; an app that captures the physical microphone directly still hears you.
 
-The tray icon shows the state: cyan while suppressing, gray in bypass, a red struck-through mic while muted, gray struck-through when off, and a warning badge on an error.
+The tray icon shows the state. On KDE and GNOME it is a monochrome icon in your panel's own color: a mic with noise going in and a clean line coming out while suppressing, a hollow mic in bypass, a struck-through mic while muted, a faint mic when off, and a red warning badge on an error. Other desktops get the colored set: cyan while suppressing, gray in bypass, a red struck-through mic while muted, gray struck-through when off, and a warning badge on an error. The [`tray_icon`](#configuration) setting picks between the two, so `hushmic config set tray_icon color` brings the colored icons back on KDE and GNOME.
 
 <details>
 <summary>Menu screenshots</summary>
@@ -90,10 +90,13 @@ The file is `~/.config/hushmic/config.toml` (`hushmic config path` prints the ex
 | `set_default` | `true` or `false`: make HushMic the system default input | `false` | live |
 | `autostart` | `true` or `false`: desktop autostart entry | `false` | live |
 | `tray` | `true` or `false`: register a tray icon | `true` | next start |
+| `tray_icon` | `auto`, `color` or `symbolic`: which tray icon set to use | `auto` | live |
 | `notifications` | `true` or `false`: desktop notifications | `true` | live |
 
 Booleans also accept `on`/`off`, `yes`/`no` and `1`/`0`. `tray = false` hides the icon; a plain `hushmic` launch still opens the window, so use `--headless` when you want neither.
 
-The file also holds `enabled` (set with `hushmic mode`), `mic_prefs` (model and strength per microphone) and `shortcuts_setup`, all managed by the app. `tray` and `notifications` are only written when false, `mic_prefs` when non-empty and `shortcuts_setup` when true, so a file from an older version stays unchanged.
+`tray_icon = auto` picks the monochrome icons on KDE and GNOME and the colored ones everywhere else, because those two desktops recolor a monochrome panel icon to match their theme. `color` and `symbolic` pin the choice if you prefer the other set. HushMic only names the icon it wants; the desktop draws it, so the monochrome one follows your panel from light to dark on its own. The change applies while HushMic runs, with no restart. `symbolic` on a desktop that does not recolor panel icons (LXQt, for example) can come out near-black on a dark panel, which is why `auto` leaves those on the colored set. If the monochrome files are not installed (an older package, a plain `cargo build`), the desktop falls back to the colored icon.
+
+The file also holds `enabled` (set with `hushmic mode`), `mic_prefs` (model and strength per microphone) and `shortcuts_setup`, all managed by the app. `tray` and `notifications` are only written when false, `tray_icon` when it is not `auto`, `mic_prefs` when non-empty and `shortcuts_setup` when true, so a file from an older version stays unchanged.
 
 `SIGTERM`, `SIGINT` and `SIGHUP` all stop HushMic cleanly. There is no reload signal; use `hushmic config set`.

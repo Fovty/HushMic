@@ -29,6 +29,11 @@ TOOLS="$REPO_ROOT/.build-tools"
 # and the names the tray requests over SNI.
 TRAY_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256"
 TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error"
+# The monochrome set the desktop recolors (issue #17), same five states under
+# the same stems plus a -symbolic suffix. Shipped in GNOME's and Plasma's
+# panel sizes plus scalable/ for everything else. hicolor's fixed directories
+# only match at their own scale, hence the @2 twins.
+TRAY_SYMBOLIC_DIRS="16x16 16x16@2 22x22 22x22@2 24x24 24x24@2 scalable"
 
 # Install-layout paths to bake into the plugin for system builds.
 export HUSHMIC_BUILD_MODEL="/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx"
@@ -87,6 +92,13 @@ for size in $TRAY_SIZES; do
              "$STAGE/share/icons/hicolor/$size/status/$icon.png"
   done
 done
+for size in $TRAY_SYMBOLIC_DIRS; do
+  install -d -m 755 "$STAGE/share/icons/hicolor/$size/status"
+  for icon in $TRAY_NAMES; do
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon-symbolic.svg" \
+             "$STAGE/share/icons/hicolor/$size/status/$icon-symbolic.svg"
+  done
+done
 install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE/LICENSE-MIT"
 install -m 644 "$REPO_ROOT/LICENSE-APACHE" "$STAGE/LICENSE-APACHE"
 install -m 755 "$REPO_ROOT/scripts/install.sh" "$STAGE/install.sh"
@@ -130,6 +142,13 @@ for size in $TRAY_SIZES; do
   for icon in $TRAY_NAMES; do
     install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon.png" \
              "$APPDIR/usr/share/icons/hicolor/$size/status/$icon.png"
+  done
+done
+for size in $TRAY_SYMBOLIC_DIRS; do
+  install -d -m 755 "$APPDIR/usr/share/icons/hicolor/$size/status"
+  for icon in $TRAY_NAMES; do
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon-symbolic.svg" \
+             "$APPDIR/usr/share/icons/hicolor/$size/status/$icon-symbolic.svg"
   done
 done
 install -m755 "$REPO_ROOT/packaging/AppRun" "$APPDIR/AppRun"

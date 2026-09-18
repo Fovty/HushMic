@@ -2,7 +2,7 @@
 // is kept intentionally as forward-compat across ksni versions.
 #![allow(clippy::needless_update)]
 
-use crate::config::Config;
+use crate::config::{Config, TrayIcon};
 use crate::controller::RunMode;
 use crate::diagnostics::EngineTier;
 use crate::pipewire::Source;
@@ -53,6 +53,84 @@ impl TrayStatus {
             TrayStatus::Error => "hushmic-tray-error",
         }
     }
+
+    /// The name handed to the SNI host for one icon style. The symbolic set
+    /// ships under the same stems with a `-symbolic` suffix, which is both
+    /// the file name and the signal GTK reads to recolor the drawing.
+    pub fn themed_icon_name(&self, style: IconStyle) -> String {
+        match style {
+            IconStyle::Color => self.icon_name().to_string(),
+            IconStyle::Symbolic => format!("{}-symbolic", self.icon_name()),
+        }
+    }
+}
+
+/// The icon set actually in use, once `tray_icon = auto` has been resolved
+/// against the desktop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum IconStyle {
+    #[default]
+    Color,
+    Symbolic,
+}
+
+/// Resolve the configured preference for one desktop. `desktop` is
+/// XDG_CURRENT_DESKTOP as the session sets it: a colon-separated list in
+/// whatever case the session chose, or None when it is unset.
+///
+/// KDE and GNOME are the two desktops that recolor symbolic icons for the
+/// panel they are drawn on (KDE through the current-color-scheme stylesheet
+/// the files carry, GTK through the `-symbolic` name), so `auto` asks for
+/// the monochrome set there and keeps the coloured ladder everywhere else,
+/// where a flat one-color glyph could come out invisible on its own panel.
+/// The line is drawn by desktop name, not by capability: GNOME-based sessions
+/// (Budgie:GNOME, ubuntu:GNOME) are in, other GTK trays that would recolor
+/// (Cinnamon, XFCE, MATE) are deliberately left on the known-good colored set.
+pub fn resolve_icon_style(pref: TrayIcon, desktop: Option<&str>) -> IconStyle {
+    match pref {
+        TrayIcon::Color => IconStyle::Color,
+        TrayIcon::Symbolic => IconStyle::Symbolic,
+        TrayIcon::Auto => {
+            let themed = desktop.is_some_and(|d| {
+                d.split(':')
+                    .any(|e| e.eq_ignore_ascii_case("KDE") || e.eq_ignore_ascii_case("GNOME"))
+            });
+            if themed {
+                IconStyle::Symbolic
+            } else {
+                IconStyle::Color
+            }
+        }
+    }
+}
+
+/// The style for a config in THIS session (the env read `auto` needs).
+pub fn icon_style_for(cfg: &Config) -> IconStyle {
+    resolve_icon_style(
+        cfg.tray_icon,
+        std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+    )
+}
+
+/// The name handed to the SNI host, for a status, a style and a sandbox.
+///
+/// Inside a Flatpak only app-ID-prefixed icon names are exported to the host
+/// theme (~/.local/share/flatpak/exports/share/icons on the host
+/// XDG_DATA_DIRS), so the host can resolve
+/// `<app-id>-tray[-off|-error][-symbolic]` but never the bare `hushmic-tray`
+/// set — the manifest installs both ladders under the prefixed names only.
+/// The pixmap fallback stays the safety net for hosts that resolve nothing.
+fn sni_icon_name(status: TrayStatus, style: IconStyle, app_id: Option<&str>) -> String {
+    let name = status.themed_icon_name(style);
+    match app_id {
+        Some(id) => {
+            let suffix = name
+                .strip_prefix("hushmic")
+                .expect("tray icon names start with 'hushmic'");
+            format!("{id}{suffix}")
+        }
+        None => name,
+    }
 }
 
 pub struct HushMicTray {
@@ -81,6 +159,11 @@ pub struct HushMicTray {
     /// The running chain is on the light model by configuration (per-mic
     /// profile or global), so `light` is not a degradation.
     pub engine_light_configured: bool,
+    /// `cfg.tray_icon` already resolved against the desktop, so the name
+    /// this hands the host never depends on reading the environment inside
+    /// a property call. The main loop refreshes it with the rest of the
+    /// state, which is what makes `config set tray_icon` land at once.
+    pub icon_style: IconStyle,
 }
 
 // The option tables hold ids/values only; labels come from the catalog via
@@ -156,24 +239,11 @@ impl Tray for HushMicTray {
         }
     }
     fn icon_name(&self) -> String {
-        // Inside a Flatpak only app-ID-prefixed icon names are exported to
-        // the host theme (~/.local/share/flatpak/exports/share/icons on the
-        // host XDG_DATA_DIRS), so the SNI host can resolve
-        // `<app-id>-tray[-off|-error]` but never the bare `hushmic-tray`
-        // set — the manifest installs the ladder under the prefixed names
-        // only. The pixmap fallback below stays the safety net for hosts
-        // that resolve nothing.
-        match crate::sandbox::flatpak_app_id() {
-            Some(id) => {
-                let suffix = self
-                    .status
-                    .icon_name()
-                    .strip_prefix("hushmic")
-                    .expect("tray icon names start with 'hushmic'");
-                format!("{id}{suffix}")
-            }
-            None => self.status.icon_name().into(),
-        }
+        sni_icon_name(
+            self.status,
+            self.icon_style,
+            crate::sandbox::flatpak_app_id(),
+        )
     }
     fn icon_theme_path(&self) -> String {
         // Read per call, not cached: ksni re-queries on every property fetch
@@ -182,10 +252,12 @@ impl Tray for HushMicTray {
         std::env::var("HUSHMIC_TRAY_THEME_DIR").unwrap_or_default()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        // Embedded copies of the same icons, for setups where the named
+        // Embedded copies of the coloured icons, for setups where the named
         // lookup cannot resolve (raw cargo-build runs without the installed
-        // ladder, SNI hosts that ignore IconThemePath). Hosts prefer
-        // IconName whenever it resolves.
+        // ladder, SNI hosts that ignore IconThemePath). These stay coloured
+        // whatever `tray_icon` says: a pixmap is pixels, so nothing on the
+        // host side could recolor a symbolic one for the panel it lands on.
+        // Hosts prefer IconName whenever it resolves.
         crate::branding::tray_icon_rgba(self.status.icon_name())
             .into_iter()
             .map(|(w, h, mut data)| {
@@ -481,6 +553,165 @@ mod tests {
         }
     }
 
+    /// Every status, in one list, for the name tests below.
+    const ALL_STATUS: [TrayStatus; 5] = [
+        TrayStatus::Off,
+        TrayStatus::Active,
+        TrayStatus::Bypass,
+        TrayStatus::Mute,
+        TrayStatus::Error,
+    ];
+
+    #[test]
+    fn the_symbolic_set_on_disk_is_complete_and_recolorable() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/tray/hicolor");
+        for dir in [
+            "16x16", "16x16@2", "22x22", "22x22@2", "24x24", "24x24@2", "scalable",
+        ] {
+            for s in ALL_STATUS {
+                let name = s.themed_icon_name(IconStyle::Symbolic);
+                let path = root.join(dir).join("status").join(format!("{name}.svg"));
+                let svg = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                // KDE swaps this stylesheet, GTK fills every path: no strokes,
+                // no hardcoded fills.
+                assert!(
+                    svg.contains(r#"id="current-color-scheme""#),
+                    "{}",
+                    path.display()
+                );
+                assert!(svg.contains(".ColorScheme-Text"), "{}", path.display());
+                assert!(!svg.contains("stroke"), "{}", path.display());
+                let paths = svg.matches("<path ").count();
+                assert!(paths > 0, "{}", path.display());
+                assert_eq!(
+                    svg.matches(r#"fill="currentColor""#).count(),
+                    paths,
+                    "{}",
+                    path.display()
+                );
+                // GTK keys the badge's red on the `error` class.
+                assert_eq!(
+                    svg.contains(r#"class="ColorScheme-NegativeText error""#),
+                    matches!(s, TrayStatus::Error),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_names_are_the_colour_names_plus_the_suffix() {
+        use super::TrayStatus::*;
+        // Exact names: the shipped SVG set carries precisely these stems
+        // (the_symbolic_set_on_disk_is_complete_and_recolorable holds it to that).
+        assert_eq!(
+            Active.themed_icon_name(IconStyle::Symbolic),
+            "hushmic-tray-symbolic"
+        );
+        assert_eq!(
+            Off.themed_icon_name(IconStyle::Symbolic),
+            "hushmic-tray-off-symbolic"
+        );
+        assert_eq!(
+            Bypass.themed_icon_name(IconStyle::Symbolic),
+            "hushmic-tray-bypass-symbolic"
+        );
+        assert_eq!(
+            Mute.themed_icon_name(IconStyle::Symbolic),
+            "hushmic-tray-mute-symbolic"
+        );
+        assert_eq!(
+            Error.themed_icon_name(IconStyle::Symbolic),
+            "hushmic-tray-error-symbolic"
+        );
+        // Colour keeps the ladder's own name, which is also the key the
+        // embedded pixmaps are looked up by.
+        for s in ALL_STATUS {
+            assert_eq!(s.themed_icon_name(IconStyle::Color), s.icon_name(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn every_status_name_stays_distinct_in_both_styles() {
+        let mut seen: Vec<String> = Vec::new();
+        for style in [IconStyle::Color, IconStyle::Symbolic] {
+            for s in ALL_STATUS {
+                let n = s.themed_icon_name(style);
+                assert!(n.starts_with("hushmic-tray"), "{s:?}/{style:?}: {n}");
+                assert!(!seen.contains(&n), "duplicate name {n} ({s:?}/{style:?})");
+                seen.push(n);
+            }
+        }
+        assert_eq!(seen.len(), 10);
+    }
+
+    #[test]
+    fn inside_a_flatpak_both_ladders_use_the_app_id_prefix() {
+        let id = "io.github.fovty.HushMic";
+        assert_eq!(
+            sni_icon_name(TrayStatus::Active, IconStyle::Symbolic, Some(id)),
+            "io.github.fovty.HushMic-tray-symbolic"
+        );
+        assert_eq!(
+            sni_icon_name(TrayStatus::Mute, IconStyle::Symbolic, Some(id)),
+            "io.github.fovty.HushMic-tray-mute-symbolic"
+        );
+        assert_eq!(
+            sni_icon_name(TrayStatus::Mute, IconStyle::Color, Some(id)),
+            "io.github.fovty.HushMic-tray-mute"
+        );
+        // Outside a sandbox the name is handed over unchanged.
+        for style in [IconStyle::Color, IconStyle::Symbolic] {
+            for s in ALL_STATUS {
+                assert_eq!(
+                    sni_icon_name(s, style, None),
+                    s.themed_icon_name(style),
+                    "{s:?}/{style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_follows_the_desktop_and_the_two_words_pin_it() {
+        use super::IconStyle::*;
+        for (desktop, want) in [
+            (Some("KDE"), Symbolic),
+            (Some("kde"), Symbolic),
+            (Some("ubuntu:GNOME"), Symbolic),
+            (Some("GNOME-Classic:GNOME"), Symbolic),
+            (Some("Budgie:GNOME"), Symbolic),
+            (Some("X-Cinnamon"), Color),
+            (Some("XFCE"), Color),
+            (Some("sway"), Color),
+            (Some(""), Color),
+            (None, Color),
+        ] {
+            assert_eq!(
+                resolve_icon_style(TrayIcon::Auto, desktop),
+                want,
+                "{desktop:?}"
+            );
+            // The explicit words ignore the desktop entirely.
+            assert_eq!(resolve_icon_style(TrayIcon::Color, desktop), Color);
+            assert_eq!(resolve_icon_style(TrayIcon::Symbolic, desktop), Symbolic);
+        }
+    }
+
+    #[test]
+    fn the_tray_hands_the_host_its_resolved_style() {
+        let mut tray = test_tray(false);
+        tray.status = TrayStatus::Active;
+        assert_eq!(tray.icon_name(), "hushmic-tray");
+        tray.icon_style = IconStyle::Symbolic;
+        assert_eq!(tray.icon_name(), "hushmic-tray-symbolic");
+        // The embedded pixmap fallback stays the coloured set either way.
+        assert!(!tray.icon_pixmap().is_empty());
+    }
+
     #[test]
     fn title_reflects_status() {
         let mut tray = test_tray(false);
@@ -627,6 +858,7 @@ mod tests {
             shortcuts_available: false,
             engine: None,
             engine_light_configured: false,
+            icon_style: IconStyle::Color,
         };
         let menu = tray.menu();
         let g = mode_radio(&menu);
@@ -685,6 +917,7 @@ mod tests {
             shortcuts_available: false,
             engine: None,
             engine_light_configured: false,
+            icon_style: IconStyle::Color,
         }
     }
 
@@ -782,6 +1015,7 @@ mod tests {
             shortcuts_available: false,
             engine: None,
             engine_light_configured: false,
+            icon_style: IconStyle::Color,
         };
         let menu = tray.menu();
         let item = mic_test_item(&menu);
@@ -808,6 +1042,7 @@ mod tests {
             shortcuts_available: false,
             engine: None,
             engine_light_configured: false,
+            icon_style: IconStyle::Color,
         };
         let menu = tray.menu();
         let pos = |label: &str| {
@@ -868,6 +1103,7 @@ mod tests {
             shortcuts_available: true,
             engine: None,
             engine_light_configured: false,
+            icon_style: IconStyle::Color,
         };
         let menu = tray.menu();
         let item = shortcuts_item(&menu);

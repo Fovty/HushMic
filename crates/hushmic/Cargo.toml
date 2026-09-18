@@ -76,7 +76,7 @@ license-file = ["../../LICENSE-MIT", "0"]
 extended-description = "Real-time microphone noise suppression as a system-wide virtual microphone (DPDFNet via PipeWire)."
 section = "sound"
 priority = "optional"
-depends = "$auto, pipewire, pipewire-bin, pipewire-pulse, wireplumber"
+depends = "$auto, hicolor-icon-theme, pipewire, pipewire-bin, pipewire-pulse, wireplumber"
 assets = [
   ["../../target/release/hushmic", "usr/bin/", "755"],
   ["../../target/release/libdpdfnet_ladspa.so", "usr/lib/ladspa/", "644"],
@@ -131,6 +131,45 @@ assets = [
   ["../../packaging/tray/hicolor/256x256/status/hushmic-tray-bypass.png", "usr/share/icons/hicolor/256x256/status/", "644"],
   ["../../packaging/tray/hicolor/256x256/status/hushmic-tray-mute.png", "usr/share/icons/hicolor/256x256/status/", "644"],
   ["../../packaging/tray/hicolor/256x256/status/hushmic-tray-error.png", "usr/share/icons/hicolor/256x256/status/", "644"],
+  # The monochrome set the desktop recolors (issue #17): the same five
+  # states under the same stems plus a -symbolic suffix, in GNOME's and
+  # Plasma's panel sizes (with their @2 twins) plus scalable/, listed per file for the
+  # same reason as the ladder above.
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/16x16/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16@2/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/16x16@2/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16@2/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/16x16@2/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16@2/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/16x16@2/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16@2/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/16x16@2/status/", "644"],
+  ["../../packaging/tray/hicolor/16x16@2/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/16x16@2/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/22x22/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22@2/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/22x22@2/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22@2/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/22x22@2/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22@2/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/22x22@2/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22@2/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/22x22@2/status/", "644"],
+  ["../../packaging/tray/hicolor/22x22@2/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/22x22@2/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/24x24/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24@2/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/24x24@2/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24@2/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/24x24@2/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24@2/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/24x24@2/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24@2/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/24x24@2/status/", "644"],
+  ["../../packaging/tray/hicolor/24x24@2/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/24x24@2/status/", "644"],
+  ["../../packaging/tray/hicolor/scalable/status/hushmic-tray-symbolic.svg", "usr/share/icons/hicolor/scalable/status/", "644"],
+  ["../../packaging/tray/hicolor/scalable/status/hushmic-tray-off-symbolic.svg", "usr/share/icons/hicolor/scalable/status/", "644"],
+  ["../../packaging/tray/hicolor/scalable/status/hushmic-tray-bypass-symbolic.svg", "usr/share/icons/hicolor/scalable/status/", "644"],
+  ["../../packaging/tray/hicolor/scalable/status/hushmic-tray-mute-symbolic.svg", "usr/share/icons/hicolor/scalable/status/", "644"],
+  ["../../packaging/tray/hicolor/scalable/status/hushmic-tray-error-symbolic.svg", "usr/share/icons/hicolor/scalable/status/", "644"],
   ["../../LICENSE-MIT", "usr/share/doc/hushmic/", "644"],
   ["../../LICENSE-APACHE", "usr/share/doc/hushmic/", "644"],
 ]

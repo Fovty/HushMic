@@ -54,12 +54,20 @@ package() {
   install -Dm644 packaging/hushmic.desktop "$pkgdir/usr/share/applications/hushmic.desktop"
   install -Dm644 packaging/systemd/hushmic.service "$pkgdir/usr/lib/systemd/user/hushmic.service"
   install -Dm644 packaging/hushmic-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/hushmic.png"
-  # Tray status-icon ladder (three SNI names x eight sizes); explicit installs
+  # Tray status-icon ladder (five SNI names x eight sizes); explicit installs
   # so a missing size or state fails packaging instead of shipping incomplete.
   for _size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256; do
     for _icon in hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error; do
       install -Dm644 "packaging/tray/hicolor/$_size/status/$_icon.png" \
         "$pkgdir/usr/share/icons/hicolor/$_size/status/$_icon.png"
+    done
+  done
+  # The monochrome set the desktop recolors: same five states, same stems
+  # plus a -symbolic suffix, in the panel sizes (with their @2 twins) plus scalable/.
+  for _size in 16x16 16x16@2 22x22 22x22@2 24x24 24x24@2 scalable; do
+    for _icon in hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error; do
+      install -Dm644 "packaging/tray/hicolor/$_size/status/$_icon-symbolic.svg" \
+        "$pkgdir/usr/share/icons/hicolor/$_size/status/$_icon-symbolic.svg"
     done
   done
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/hushmic/LICENSE-MIT"

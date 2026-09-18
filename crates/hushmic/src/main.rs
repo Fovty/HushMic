@@ -522,9 +522,13 @@ fn refresh_tray(
     // change can move the tier and the configured-light flag at the same
     // time, and a tray that registers here has never seen either.
     let engine_now = engine_view(controller);
+    // `tray_icon` is resolved here too, so `config set tray_icon` repaints
+    // the icon on this very refresh instead of on the next start.
+    let icon_style = hushmic::tray::icon_style_for(cfg);
     let landed = handle
         .update(move |t: &mut HushMicTray| {
             t.cfg = snapshot;
+            t.icon_style = icon_style;
             t.mics = new_mics;
             t.status = status;
             t.testing = testing;
@@ -560,7 +564,7 @@ settings (applied live while running, saved to the file otherwise):
        hushmic config path
        hushmic devices [--json]          microphones usable as `mic`
        hushmic service install|uninstall systemd user unit for this install
-  keys: mic model attn_limit set_default autostart tray notifications
+  keys: mic model attn_limit set_default autostart tray tray_icon notifications
 
 exit codes: 0 ok, 1 usage/failed, 2 not running (control commands only)
 "
@@ -851,6 +855,7 @@ fn main() {
         shortcuts_available: false,
         engine: None,
         engine_light_configured: false,
+        icon_style: hushmic::tray::icon_style_for(cfg),
     };
     let mut handle = if !want_tray {
         TrayLink::Disabled
@@ -1158,7 +1163,7 @@ fn main() {
                             cc::get(&cfg, k),
                             cc::set_qualifier(k, true)
                         );
-                        if k == cc::Key::Tray && headless {
+                        if matches!(k, cc::Key::Tray | cc::Key::TrayIcon) && headless {
                             line.push_str(" (--headless ignores it)");
                         }
                         if k == cc::Key::Autostart && hushmic::sandbox::is_flatpak() {

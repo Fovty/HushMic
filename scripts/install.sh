@@ -114,6 +114,10 @@ DEST_LICENSES="$PREFIX/share/licenses/hushmic"
 # sizes, status/ context); must stay in lockstep with packaging/tray/hicolor/.
 TRAY_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256"
 TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error"
+# The monochrome set the desktop recolors: the same five states under the same
+# stems plus a -symbolic suffix, in GNOME's and Plasma's panel sizes (with their
+# @2 twins) plus scalable/ for everything else.
+TRAY_SYMBOLIC_DIRS="16x16 16x16@2 22x22 22x22@2 24x24 24x24@2 scalable"
 
 refresh_icon_cache() {
   # Refresh the hicolor cache so SNI hosts pick icon changes up without a
@@ -166,6 +170,11 @@ do_uninstall() {
   for _s in $TRAY_SIZES; do
     for _n in $TRAY_NAMES; do
       as_root rm -f "$DEST_HICOLOR/$_s/status/$_n.png"
+    done
+  done
+  for _s in $TRAY_SYMBOLIC_DIRS; do
+    for _n in $TRAY_NAMES; do
+      as_root rm -f "$DEST_HICOLOR/$_s/status/$_n-symbolic.svg"
     done
   done
   refresh_icon_cache
@@ -385,6 +394,15 @@ for _s in $TRAY_SIZES; do
     fi
   done
 done
+# Same for the monochrome set (payloads older than it simply lack the files).
+for _s in $TRAY_SYMBOLIC_DIRS; do
+  for _n in $TRAY_NAMES; do
+    _icon="$PAYLOAD/share/icons/hicolor/$_s/status/$_n-symbolic.svg"
+    if [ -f "$_icon" ]; then
+      install_file "$_icon" "$DEST_HICOLOR/$_s/status" 644
+    fi
+  done
+done
 refresh_icon_cache
 [ -f "$PAYLOAD/LICENSE-MIT" ] && install_file "$PAYLOAD/LICENSE-MIT" "$DEST_LICENSES" 644
 [ -f "$PAYLOAD/LICENSE-APACHE" ] && install_file "$PAYLOAD/LICENSE-APACHE" "$DEST_LICENSES" 644
@@ -404,7 +422,8 @@ prefix_sq="$(printf %s "$PREFIX" | sed "s/'/'\\\\''/g")"
     'set -eu' \
     "PREFIX='${prefix_sq}'" \
     "TRAY_SIZES='${TRAY_SIZES}'" \
-    "TRAY_NAMES='${TRAY_NAMES}'"
+    "TRAY_NAMES='${TRAY_NAMES}'" \
+    "TRAY_SYMBOLIC_DIRS='${TRAY_SYMBOLIC_DIRS}'"
   cat <<'UNINSTALL_EOF'
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -423,6 +442,11 @@ $SUDO rm -f "$PREFIX/share/icons/hicolor/256x256/apps/hushmic.png"
 for _s in $TRAY_SIZES; do
   for _n in $TRAY_NAMES; do
     $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/status/$_n.png"
+  done
+done
+for _s in $TRAY_SYMBOLIC_DIRS; do
+  for _n in $TRAY_NAMES; do
+    $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/status/$_n-symbolic.svg"
   done
 done
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then

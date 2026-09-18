@@ -261,6 +261,13 @@ modules:
               "/app/share/icons/hicolor/$size/status/io.github.fovty.HushMic${name#hushmic}.png"
           done
         done
+        # the monochrome set the desktop recolors, exported the same way
+        for size in 16x16 16x16@2 22x22 22x22@2 24x24 24x24@2 scalable; do
+          for name in hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error; do
+            install -Dm644 "packaging/tray/hicolor/$size/status/$name-symbolic.svg" \
+              "/app/share/icons/hicolor/$size/status/io.github.fovty.HushMic${name#hushmic}-symbolic.svg"
+          done
+        done
       - install -Dm644 packaging/flatpak/50-hushmic-manager.conf /app/share/pipewire/client.conf.d/50-hushmic-manager.conf
       - install -Dm644 packaging/flatpak/io.github.fovty.HushMic.metainfo.xml /app/share/metainfo/io.github.fovty.HushMic.metainfo.xml
     sources:

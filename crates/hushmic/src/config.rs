@@ -3,6 +3,57 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::{fs, path::PathBuf};
 
+/// Which tray icon set HushMic asks the desktop for (issue #17). The
+/// desktop does the drawing either way: `Color` names the shipped coloured
+/// ladder, `Symbolic` the monochrome one that the theme recolors, and
+/// `Auto` picks between them from the running desktop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrayIcon {
+    #[default]
+    Auto,
+    Color,
+    Symbolic,
+}
+
+impl TrayIcon {
+    /// The three words the file and the CLI accept, in listing order.
+    pub const VALUES: [&'static str; 3] = ["auto", "color", "symbolic"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "color" => Some(Self::Color),
+            "symbolic" => Some(Self::Symbolic),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Color => "color",
+            Self::Symbolic => "symbolic",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+impl<'de> Deserialize<'de> for TrayIcon {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A typo in a hand-edited file must cost the reader nothing but
+        // this one field: the strict derive would fail the whole document,
+        // and load() reacts to that by moving the file aside and starting
+        // from defaults (enabled = true has real side effects). Read any
+        // value, keep the ones we know, fall back to auto for the rest.
+        let raw = toml::Value::deserialize(d)?;
+        Ok(raw.as_str().and_then(Self::parse).unwrap_or_default())
+    }
+}
+
 /// One microphone's remembered settings. Keyed by
 /// `node.name` in [`Config::mic_prefs`]; the globals stay as the
 /// System-default settings and the fallback for mics without an entry.
@@ -39,6 +90,10 @@ pub struct Config {
     /// Desktop notifications (failures, mic-test progress, recovery).
     #[serde(skip_serializing_if = "is_true")]
     pub notifications: bool,
+    /// Which tray icon set the SNI host is asked for. Skipped while `auto`
+    /// so existing files stay byte-identical.
+    #[serde(skip_serializing_if = "TrayIcon::is_default")]
+    pub tray_icon: TrayIcon,
 }
 
 fn is_true(b: &bool) -> bool {
@@ -61,6 +116,7 @@ impl Default for Config {
             shortcuts_setup: false,
             tray: true,
             notifications: true,
+            tray_icon: TrayIcon::Auto,
         }
     }
 }
@@ -247,6 +303,54 @@ mod tests {
         assert!(!back.tray && !back.notifications);
         let old: Config = toml::from_str("enabled = true\n").unwrap();
         assert!(old.tray && old.notifications);
+    }
+
+    #[test]
+    fn tray_icon_defaults_to_auto_and_stays_absent_until_changed() {
+        let d = Config::default();
+        assert_eq!(d.tray_icon, TrayIcon::Auto);
+        let plain = toml::to_string_pretty(&d).unwrap();
+        assert!(!plain.contains("tray_icon"), "{plain}");
+        for (v, word) in [(TrayIcon::Color, "color"), (TrayIcon::Symbolic, "symbolic")] {
+            let c = Config {
+                tray_icon: v,
+                ..Config::default()
+            };
+            let s = toml::to_string_pretty(&c).unwrap();
+            assert!(s.contains(&format!("tray_icon = \"{word}\"")), "{s}");
+            let back: Config = toml::from_str(&s).unwrap();
+            assert_eq!(back.tray_icon, v);
+        }
+        let old: Config = toml::from_str("enabled = true\n").unwrap();
+        assert_eq!(old.tray_icon, TrayIcon::Auto);
+    }
+
+    #[test]
+    fn an_unknown_tray_icon_falls_back_without_losing_the_file() {
+        // A hand-edited typo (or a value of the wrong type) costs that one
+        // field, not the whole document — load() would move the file aside.
+        for bad in [
+            "tray_icon = \"mono\"\n",
+            "tray_icon = \"SYMBOLIC\"\n",
+            "tray_icon = true\n",
+            "tray_icon = 3\n",
+        ] {
+            let c: Config =
+                toml::from_str(&format!("attn_limit = 24.0\n{bad}")).unwrap_or_else(|e| {
+                    panic!("{bad} should not fail the document: {e}");
+                });
+            assert_eq!(c.tray_icon, TrayIcon::Auto, "{bad}");
+            assert_eq!(c.attn_limit, 24.0, "{bad}");
+        }
+    }
+
+    #[test]
+    fn tray_icon_words_round_trip() {
+        for w in TrayIcon::VALUES {
+            let v = TrayIcon::parse(w).unwrap_or_else(|| panic!("{w} must parse"));
+            assert_eq!(v.as_str(), w);
+        }
+        assert_eq!(TrayIcon::parse("mono"), None);
     }
 
     #[test]
