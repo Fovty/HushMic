@@ -36,7 +36,9 @@ jobs:
       - name: Check tag matches the workspace version
         run: |
           V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+          # A prerelease tag (v0.9.0-rc.1) builds the version it leads up to:
+          # the tree already says 0.9.0, the suffix only lives in the tag.
+          if [ "v$V" != "${GITHUB_REF_NAME%%-*}" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $V — bump Cargo.toml (+ README .deb URL, flatpak metainfo release entry) before tagging"
             exit 1
           fi
@@ -87,12 +89,16 @@ jobs:
             dist/dpdfnet2_48khz_hr.onnx
             dist/sha256sums.txt
           generate_release_notes: true
+          # A tag with a suffix is a test build: marked as a prerelease (so it
+          # never becomes "latest") and kept off the package channels below.
+          prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   aur:
     name: Publish to AUR
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -119,6 +125,7 @@ jobs:
   aur-bin:
     name: Publish hushmic-bin to the AUR
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -145,6 +152,7 @@ jobs:
   copr:
     name: Build the Fedora COPR package
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     # Fedora tooling (rpmbuild/spectool/copr-cli) isn't on the stock runner;
     # only the SRPM is assembled here — COPR does the per-chroot builds. Pinned
@@ -211,6 +219,7 @@ jobs:
   nix:
     name: Trigger the NixOS flake update
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       # Fire the self-maintained hushmic-nix fork's updater the moment a release
