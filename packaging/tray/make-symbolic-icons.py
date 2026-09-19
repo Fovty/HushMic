@@ -20,7 +20,7 @@ from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 ROOT = pathlib.Path(__file__).parent / "hicolor"
-TEXT, NEGATIVE = "#232629", "#da4453"
+TEXT, NEGATIVE, HIGHLIGHT = "#232629", "#da4453", "#3daee9"
 
 
 def vbar(x0, y0, y1):
@@ -86,7 +86,7 @@ def shapes(g):
     tri, grow, clear = g["badge"]
     badge = Polygon(tri).buffer(grow, quad_segs=8)
     return dict(
-        mic=mic, hollow=hollow,
+        mic=mic, hollow=hollow, core=cap.buffer(-1, quad_segs=12),
         noise_in=unary_union(g["noise_in"]), noise_out=unary_union(g["noise_out"]),
         clean_out=g["clean_out"],
         slash=line.buffer(w, quad_segs=6), slash_gap=line.buffer(gap, cap_style="flat"),
@@ -114,6 +114,7 @@ def svg(size, margin, parts):
     <style id="current-color-scheme" type="text/css">
       .ColorScheme-Text {{ color:{TEXT}; }}
       .ColorScheme-NegativeText {{ color:{NEGATIVE}; }}
+      .ColorScheme-Highlight {{ color:{HIGHLIGHT}; }}
     </style>
   </defs>
 {body}
@@ -122,12 +123,14 @@ def svg(size, margin, parts):
 
 
 T, N = "ColorScheme-Text", "ColorScheme-NegativeText error"
+# KDE only: the accent colour. GTK has no such class and fills it as foreground.
+H = "ColorScheme-Highlight"
 
 
 def icons(s):
     return {
         # suppressing: noise in, clean out
-        "hushmic-tray": [(unary_union([s["mic"], s["noise_in"], s["clean_out"]]), T, "")],
+        "hushmic-tray": [(unary_union([s["hollow"], s["noise_in"], s["clean_out"]]), T, ""), (s["core"], H, "")],
         # off: the virtual microphone is gone, a faint mic and nothing moving
         "hushmic-tray-off": [(s["mic"], T, ' opacity="0.35"')],
         # bypass: the mic is live but hollow, the noise goes out as it came in
