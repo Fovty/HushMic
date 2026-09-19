@@ -92,8 +92,23 @@ jobs:
           # A tag with a suffix is a test build: marked as a prerelease (so it
           # never becomes "latest") and kept off the package channels below.
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # Releases here are immutable once published. The action publishes a
+          # prerelease before it uploads, which then refuses the assets, so a
+          # prerelease stays a draft until publish-prerelease below.
+          draft: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-prerelease:
+    name: Publish the prerelease
+    needs: release
+    if: ${{ contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft with its assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
 
   aur:
     name: Publish to AUR
