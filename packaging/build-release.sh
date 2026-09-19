@@ -95,8 +95,8 @@ done
 for size in $TRAY_SYMBOLIC_DIRS; do
   install -d -m 755 "$STAGE/share/icons/hicolor/$size/status"
   for icon in $TRAY_NAMES; do
-    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon-symbolic.svg" \
-             "$STAGE/share/icons/hicolor/$size/status/$icon-symbolic.svg"
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/hushmic-mono${icon#hushmic-tray}-symbolic.svg" \
+             "$STAGE/share/icons/hicolor/$size/status/hushmic-mono${icon#hushmic-tray}-symbolic.svg"
   done
 done
 install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE/LICENSE-MIT"
@@ -147,8 +147,8 @@ done
 for size in $TRAY_SYMBOLIC_DIRS; do
   install -d -m 755 "$APPDIR/usr/share/icons/hicolor/$size/status"
   for icon in $TRAY_NAMES; do
-    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/$icon-symbolic.svg" \
-             "$APPDIR/usr/share/icons/hicolor/$size/status/$icon-symbolic.svg"
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/status/hushmic-mono${icon#hushmic-tray}-symbolic.svg" \
+             "$APPDIR/usr/share/icons/hicolor/$size/status/hushmic-mono${icon#hushmic-tray}-symbolic.svg"
   done
 done
 install -m755 "$REPO_ROOT/packaging/AppRun" "$APPDIR/AppRun"

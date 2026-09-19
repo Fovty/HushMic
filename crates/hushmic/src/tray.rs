@@ -55,12 +55,20 @@ impl TrayStatus {
     }
 
     /// The name handed to the SNI host for one icon style. The symbolic set
-    /// ships under the same stems with a `-symbolic` suffix, which is both
-    /// the file name and the signal GTK reads to recolor the drawing.
+    /// carries the `-symbolic` suffix GTK reads to recolor the drawing, under
+    /// a stem of its own (`hushmic-mono`): Plasma 6 draws `<name>-symbolic`
+    /// in place of `<name>` whenever that file exists, so a shared stem would
+    /// make the colored set unreachable there.
     pub fn themed_icon_name(&self, style: IconStyle) -> String {
         match style {
             IconStyle::Color => self.icon_name().to_string(),
-            IconStyle::Symbolic => format!("{}-symbolic", self.icon_name()),
+            IconStyle::Symbolic => {
+                let state = self
+                    .icon_name()
+                    .strip_prefix("hushmic-tray")
+                    .expect("tray icon names start with 'hushmic-tray'");
+                format!("hushmic-mono{state}-symbolic")
+            }
         }
     }
 }
@@ -117,7 +125,7 @@ pub fn icon_style_for(cfg: &Config) -> IconStyle {
 /// Inside a Flatpak only app-ID-prefixed icon names are exported to the host
 /// theme (~/.local/share/flatpak/exports/share/icons on the host
 /// XDG_DATA_DIRS), so the host can resolve
-/// `<app-id>-tray[-off|-error][-symbolic]` but never the bare `hushmic-tray`
+/// `<app-id>-tray[-state]` and `<app-id>-mono[-state]-symbolic` but never the bare `hushmic-tray`
 /// set — the manifest installs both ladders under the prefixed names only.
 /// The pixmap fallback stays the safety net for hosts that resolve nothing.
 fn sni_icon_name(status: TrayStatus, style: IconStyle, app_id: Option<&str>) -> String {
@@ -603,29 +611,29 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_names_are_the_colour_names_plus_the_suffix() {
+    fn symbolic_names_keep_the_state_under_their_own_stem() {
         use super::TrayStatus::*;
         // Exact names: the shipped SVG set carries precisely these stems
         // (the_symbolic_set_on_disk_is_complete_and_recolorable holds it to that).
         assert_eq!(
             Active.themed_icon_name(IconStyle::Symbolic),
-            "hushmic-tray-symbolic"
+            "hushmic-mono-symbolic"
         );
         assert_eq!(
             Off.themed_icon_name(IconStyle::Symbolic),
-            "hushmic-tray-off-symbolic"
+            "hushmic-mono-off-symbolic"
         );
         assert_eq!(
             Bypass.themed_icon_name(IconStyle::Symbolic),
-            "hushmic-tray-bypass-symbolic"
+            "hushmic-mono-bypass-symbolic"
         );
         assert_eq!(
             Mute.themed_icon_name(IconStyle::Symbolic),
-            "hushmic-tray-mute-symbolic"
+            "hushmic-mono-mute-symbolic"
         );
         assert_eq!(
             Error.themed_icon_name(IconStyle::Symbolic),
-            "hushmic-tray-error-symbolic"
+            "hushmic-mono-error-symbolic"
         );
         // Colour keeps the ladder's own name, which is also the key the
         // embedded pixmaps are looked up by.
@@ -640,7 +648,13 @@ mod tests {
         for style in [IconStyle::Color, IconStyle::Symbolic] {
             for s in ALL_STATUS {
                 let n = s.themed_icon_name(style);
-                assert!(n.starts_with("hushmic-tray"), "{s:?}/{style:?}: {n}");
+                assert!(n.starts_with("hushmic-"), "{s:?}/{style:?}: {n}");
+                // Plasma 6 swaps in `<name>-symbolic` when it exists, so no
+                // symbolic name may be a color name plus the suffix.
+                assert!(
+                    !seen.contains(&n.trim_end_matches("-symbolic").to_string()),
+                    "{n} shadows a color name"
+                );
                 assert!(!seen.contains(&n), "duplicate name {n} ({s:?}/{style:?})");
                 seen.push(n);
             }
@@ -653,11 +667,11 @@ mod tests {
         let id = "io.github.fovty.HushMic";
         assert_eq!(
             sni_icon_name(TrayStatus::Active, IconStyle::Symbolic, Some(id)),
-            "io.github.fovty.HushMic-tray-symbolic"
+            "io.github.fovty.HushMic-mono-symbolic"
         );
         assert_eq!(
             sni_icon_name(TrayStatus::Mute, IconStyle::Symbolic, Some(id)),
-            "io.github.fovty.HushMic-tray-mute-symbolic"
+            "io.github.fovty.HushMic-mono-mute-symbolic"
         );
         assert_eq!(
             sni_icon_name(TrayStatus::Mute, IconStyle::Color, Some(id)),
@@ -707,7 +721,7 @@ mod tests {
         tray.status = TrayStatus::Active;
         assert_eq!(tray.icon_name(), "hushmic-tray");
         tray.icon_style = IconStyle::Symbolic;
-        assert_eq!(tray.icon_name(), "hushmic-tray-symbolic");
+        assert_eq!(tray.icon_name(), "hushmic-mono-symbolic");
         // The embedded pixmap fallback stays the coloured set either way.
         assert!(!tray.icon_pixmap().is_empty());
     }

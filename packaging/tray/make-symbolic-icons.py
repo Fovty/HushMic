@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Draw the symbolic (monochrome, theme coloured) tray icons.
 
-Writes hushmic-tray[-state]-symbolic.svg into the hicolor status directories
+Writes hushmic-mono[-state]-symbolic.svg into the hicolor status directories
 next to this script. The canvas filling 16 px glyph goes to 16x16 (GNOME's
 panel size), the glyph with Breeze's margins to 22x22, 24x24 and scalable, so
 every other size and scale keeps Breeze's proportions. hicolor's fixed
@@ -130,15 +130,15 @@ H = "ColorScheme-Highlight"
 def icons(s):
     return {
         # suppressing: noise in, clean out
-        "hushmic-tray": [(unary_union([s["hollow"], s["noise_in"], s["clean_out"]]), T, ""), (s["core"], H, "")],
+        "hushmic-mono": [(unary_union([s["hollow"], s["noise_in"], s["clean_out"]]), T, ""), (s["core"], H, "")],
         # off: the virtual microphone is gone, a faint mic and nothing moving
-        "hushmic-tray-off": [(s["mic"], T, ' opacity="0.35"')],
+        "hushmic-mono-off": [(s["mic"], T, ' opacity="0.35"')],
         # bypass: the mic is live but hollow, the noise goes out as it came in
-        "hushmic-tray-bypass": [(unary_union([s["hollow"], s["noise_in"], s["noise_out"]]), T, "")],
+        "hushmic-mono-bypass": [(unary_union([s["hollow"], s["noise_in"], s["noise_out"]]), T, "")],
         # mute: the usual struck-through microphone
-        "hushmic-tray-mute": [(unary_union([s["mic"].difference(s["slash_gap"]), s["slash"]]), T, "")],
+        "hushmic-mono-mute": [(unary_union([s["mic"].difference(s["slash_gap"]), s["slash"]]), T, "")],
         # error: mic with a warning badge in the desktop's error colour
-        "hushmic-tray-error": [(s["mic"].difference(s["badge_gap"]), T, ""), (s["badge"], N, "")],
+        "hushmic-mono-error": [(s["mic"].difference(s["badge_gap"]), T, ""), (s["badge"], N, "")],
     }
 
 

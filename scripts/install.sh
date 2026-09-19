@@ -174,7 +174,7 @@ do_uninstall() {
   done
   for _s in $TRAY_SYMBOLIC_DIRS; do
     for _n in $TRAY_NAMES; do
-      as_root rm -f "$DEST_HICOLOR/$_s/status/$_n-symbolic.svg"
+      as_root rm -f "$DEST_HICOLOR/$_s/status/hushmic-mono${_n#hushmic-tray}-symbolic.svg"
     done
   done
   refresh_icon_cache
@@ -391,15 +391,21 @@ for _s in $TRAY_SIZES; do
     _icon="$PAYLOAD/share/icons/hicolor/$_s/status/$_n.png"
     if [ -f "$_icon" ]; then
       install_file "$_icon" "$DEST_HICOLOR/$_s/status" 644
+      # 0.9.0-rc.2 shipped this set as hushmic-tray*-symbolic; Plasma picks a
+      # -symbolic twin over the colored name, so a leftover breaks tray_icon=color.
+      as_root rm -f "$DEST_HICOLOR/$_s/status/$_n-symbolic.svg"
     fi
   done
 done
 # Same for the monochrome set (payloads older than it simply lack the files).
 for _s in $TRAY_SYMBOLIC_DIRS; do
   for _n in $TRAY_NAMES; do
-    _icon="$PAYLOAD/share/icons/hicolor/$_s/status/$_n-symbolic.svg"
+    _icon="$PAYLOAD/share/icons/hicolor/$_s/status/hushmic-mono${_n#hushmic-tray}-symbolic.svg"
     if [ -f "$_icon" ]; then
       install_file "$_icon" "$DEST_HICOLOR/$_s/status" 644
+      # 0.9.0-rc.2 shipped this set as hushmic-tray*-symbolic; Plasma picks a
+      # -symbolic twin over the colored name, so a leftover breaks tray_icon=color.
+      as_root rm -f "$DEST_HICOLOR/$_s/status/$_n-symbolic.svg"
     fi
   done
 done
@@ -446,7 +452,7 @@ for _s in $TRAY_SIZES; do
 done
 for _s in $TRAY_SYMBOLIC_DIRS; do
   for _n in $TRAY_NAMES; do
-    $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/status/$_n-symbolic.svg"
+    $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/status/hushmic-mono${_n#hushmic-tray}-symbolic.svg"
   done
 done
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then

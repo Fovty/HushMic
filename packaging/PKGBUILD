@@ -66,8 +66,8 @@ package() {
   # plus a -symbolic suffix, in the panel sizes (with their @2 twins) plus scalable/.
   for _size in 16x16 16x16@2 22x22 22x22@2 24x24 24x24@2 scalable; do
     for _icon in hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error; do
-      install -Dm644 "packaging/tray/hicolor/$_size/status/$_icon-symbolic.svg" \
-        "$pkgdir/usr/share/icons/hicolor/$_size/status/$_icon-symbolic.svg"
+      install -Dm644 "packaging/tray/hicolor/$_size/status/hushmic-mono${_icon#hushmic-tray}-symbolic.svg" \
+        "$pkgdir/usr/share/icons/hicolor/$_size/status/hushmic-mono${_icon#hushmic-tray}-symbolic.svg"
     done
   done
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/hushmic/LICENSE-MIT"
