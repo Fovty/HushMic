@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.0" date="2026-09-19">
+      <description>
+        <p>
+          On KDE and GNOME the tray icon is now a monochrome icon in your
+          panel's own color, like the icons next to it, and it follows a
+          switch between light and dark on its own. The new tray_icon setting
+          brings the colored icons back if you prefer them.
+        </p>
+      </description>
+    </release>
     <release version="0.8.1" date="2026-09-15">
       <description>
         <p>
