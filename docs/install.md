@@ -7,7 +7,7 @@ The [README](../README.md#install) has the install commands. This page covers th
 Stock 22.04 still ships `pipewire-media-session`, and apt refuses the deb with a conflict against `wireplumber`. Install both in one command; the trailing minus removes the old session manager:
 
 ```bash
-sudo apt install ./hushmic_0.8.1-1_amd64.deb wireplumber pipewire-media-session-
+sudo apt install ./hushmic_0.9.0-1_amd64.deb wireplumber pipewire-media-session-
 ```
 
 Log out and back in afterwards. PipeWire 0.3.48 on 22.04 works with the native packages; the Flatpak does not support it.

@@ -136,7 +136,7 @@ def icons(s):
         # bypass: the mic is live but hollow, the noise goes out as it came in
         "hushmic-mono-bypass": [(unary_union([s["hollow"], s["noise_in"], s["noise_out"]]), T, "")],
         # mute: the usual struck-through microphone
-        "hushmic-mono-mute": [(unary_union([s["mic"].difference(s["slash_gap"]), s["slash"]]), T, "")],
+        "hushmic-mono-mute": [(s["mic"].difference(s["slash_gap"]), T, ""), (s["slash"], N, "")],
         # error: mic with a warning badge in the desktop's error colour
         "hushmic-mono-error": [(s["mic"].difference(s["badge_gap"]), T, ""), (s["badge"], N, "")],
     }

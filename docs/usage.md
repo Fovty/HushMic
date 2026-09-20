@@ -24,7 +24,7 @@ Only one instance runs per session. Quitting removes the virtual mic and restore
 
 Switching between suppress, bypass and mute changes a control on the running chain, so your call stays connected. Mute silences the virtual mic only; an app that captures the physical microphone directly still hears you.
 
-The tray icon shows the state. On KDE and GNOME it is a monochrome icon in your panel's own color: a mic with noise going in and a clean line coming out while suppressing (on KDE its inside takes your accent color), a hollow mic in bypass, a struck-through mic while muted, a faint mic when off, and a red warning badge on an error. Other desktops get the colored set: cyan while suppressing, gray in bypass, a red struck-through mic while muted, gray struck-through when off, and a warning badge on an error. The [`tray_icon`](#configuration) setting picks between the two, so `hushmic config set tray_icon color` brings the colored icons back on KDE and GNOME.
+The tray icon shows the state. On KDE and GNOME it is a monochrome icon in your panel's own color: a mic with noise going in and a clean line coming out while suppressing (on KDE its inside takes your accent color), a hollow mic in bypass, a mic struck through in red while muted, a faint mic when off, and a red warning badge on an error. Other desktops get the colored set: cyan while suppressing, gray in bypass, a red struck-through mic while muted, gray struck-through when off, and a warning badge on an error. The [`tray_icon`](#configuration) setting picks between the two, so `hushmic config set tray_icon color` brings the colored icons back on KDE and GNOME.
 
 <details>
 <summary>Menu screenshots</summary>

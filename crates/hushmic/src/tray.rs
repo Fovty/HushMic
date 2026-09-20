@@ -599,10 +599,11 @@ mod tests {
                     "{}",
                     path.display()
                 );
-                // GTK keys the badge's red on the `error` class.
+                // GTK keys red on the `error` class: the error badge and the
+                // mute slash carry it, nothing else.
                 assert_eq!(
                     svg.contains(r#"class="ColorScheme-NegativeText error""#),
-                    matches!(s, TrayStatus::Error),
+                    matches!(s, TrayStatus::Error | TrayStatus::Mute),
                     "{}",
                     path.display()
                 );
