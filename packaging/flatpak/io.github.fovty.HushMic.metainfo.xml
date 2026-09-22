@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.1" date="2026-09-22">
+      <description>
+        <p>
+          On KDE Plasma before 6.4, System Settings no longer opens on
+          every start once keyboard shortcuts are set up, and the keys keep
+          working after a restart. Holding the push-to-mute key no longer
+          leaves the microphone muted after you let go.
+        </p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-09-20">
       <description>
         <p>
