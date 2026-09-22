@@ -56,7 +56,7 @@ The tray icon shows the state. On KDE and GNOME it is a monochrome icon in your 
 
 **Set up shortcuts…** in the menu opens your desktop's key-binding dialog for four actions: toggle mute, toggle bypass, push to talk (live only while held) and push to mute (silent while held). The compositor grabs the keys, so they work in any app. After the first setup the entry reads **Change shortcuts…** and opens the desktop's shortcut editor; the keys also show up in your system's keyboard settings.
 
-This needs the GlobalShortcuts portal (KDE Plasma, GNOME 45 and later). Where it is missing, the entry stays hidden; bind the commands below in your desktop's shortcut settings instead. Starting HushMic from a terminal additionally needs xdg-desktop-portal 1.18 or newer so it can identify itself to the portal; app-menu and autostart launches do not.
+On KDE Plasma before 6.4 (Kubuntu 24.04, Debian 12 and 13) HushMic registers the actions with Plasma's own shortcut service instead, and the entry opens System Settings on HushMic's page under Shortcuts, where you assign the keys. The Flatpak cannot reach that service: on Plasma 5 it has no shortcuts, and on Plasma 6.0 to 6.3 System Settings opens on each start once they are set up. Elsewhere this needs the GlobalShortcuts portal (Plasma 6.4 and later, GNOME 45 and later). Where it is missing, the entry stays hidden; bind the commands below in your desktop's shortcut settings instead. Starting HushMic from a terminal additionally needs xdg-desktop-portal 1.18 or newer so it can identify itself to the portal; app-menu and autostart launches do not.
 
 ## Command line
 

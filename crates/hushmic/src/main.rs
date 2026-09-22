@@ -1194,12 +1194,14 @@ fn main() {
                     }
                     Ok(control::Request::SetMode(sel)) => {
                         control_reply = Some(req.reply);
+                        shortcut_holds.user_mode_change();
                         Event::Cmd(TrayCmd::SetMode(sel))
                     }
                     Ok(control::Request::Toggle(target)) => {
                         let cur = cfg.enabled.then(|| controller.mode());
                         let sel = control::toggle_next(cur, prev_alive, target);
                         control_reply = Some(req.reply);
+                        shortcut_holds.user_mode_change();
                         Event::Cmd(TrayCmd::SetMode(sel))
                     }
                 }
@@ -1274,7 +1276,14 @@ fn main() {
                     },
                 }
             }
-            other => other,
+            // A mode change from the tray (the CLI's are marked above)
+            // makes whatever push-to-mute had muted the user's own choice.
+            other => {
+                if matches!(other, Event::Cmd(TrayCmd::SetMode(_))) {
+                    shortcut_holds.user_mode_change();
+                }
+                other
+            }
         };
         match ev {
             Event::Cmd(cmd) => {
@@ -1993,6 +2002,8 @@ fn main() {
             Event::Shortcut(_) => unreachable!("shortcut events are preprocessed"),
         }
     }
+    // Let go of the global shortcut keys before the process goes.
+    shortcuts::shutdown(&shortcuts_cmd, std::time::Duration::from_secs(2));
     // Orderly shutdown removes the control socket; a crash leaves it for
     // the next start's unlink+rebind (and clients' connects fail = exit 2).
     let _ = std::fs::remove_file(&control_socket_path);

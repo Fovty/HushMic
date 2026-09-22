@@ -12,6 +12,8 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::controller::RunMode;
 
+mod kglobalaccel;
+
 /// The four bindable actions. Registering all of them is free — anything
 /// the user leaves unbound in the compositor dialog is inert. No mode-off
 /// hotkey by design (a mic-kill surprise).
@@ -81,16 +83,28 @@ pub fn signal_action(our_session: &str, signal_session: &str, id: &str) -> Optio
         .flatten()
 }
 
-/// What the hold keys are currently doing, owned by the main loop and
-/// threaded through every [`shortcut_transition`] call. Two jobs:
-/// push-to-mute's release may only restore a mute ITS OWN press performed
-/// (a tap while already muted must never un-mute — the hot-mic corner),
-/// and a push-to-talk hold left dangling by a dying portal session lets
-/// the main loop re-mute (the key's contract is live-only-while-held).
+/// KDE repeats the pressed signal (`globalShortcutPressed`, and through
+/// its portal `Activated`) at the keyboard's auto-repeat rate while a key
+/// is down, so a press of a key that has not been released since its last
+/// press is that repeat, and does nothing: the first press already acted.
+/// No timing is involved (a stalled main loop or a long repeat delay would
+/// break any window). A press whose release never comes (an invoked
+/// shortcut, a lost release) costs the key's next press, which is ignored
+/// and whose release resets it — for push-to-talk that errs toward muted.
+fn slot(a: Action) -> usize {
+    Action::ALL.iter().position(|x| *x == a).unwrap_or(0)
+}
+
+/// What the keys are currently doing, owned by the main loop and threaded
+/// through every [`shortcut_transition`] call: which keys are down (to tell
+/// auto-repeat from a press), whether push-to-mute's release may restore
+/// (only a mute ITS OWN press performed — a tap while already muted must
+/// never un-mute, the hot-mic corner), and whether a push-to-talk hold is
+/// dangling when the session dies (the key promises live only while held).
 #[derive(Default)]
 pub struct Holds {
-    /// The push-to-talk key is down (any press, even a no-op one).
-    ptt: bool,
+    /// Per action: the key reported a press and no release since.
+    down: [bool; 4],
     /// The last push-to-mute press actually performed the mute.
     ptm_armed: bool,
 }
@@ -99,18 +113,28 @@ impl Holds {
     /// A push-to-talk hold is in progress — consulted when the portal
     /// session dies (the release would never arrive; err toward muted).
     pub fn ptt_held(&self) -> bool {
-        self.ptt
+        self.down[slot(Action::PushToTalk)]
     }
     /// The session died: any release we were waiting for is lost.
     pub fn reset(&mut self) {
         *self = Holds::default();
     }
+    /// The mode was changed by something other than a shortcut (tray,
+    /// CLI): whatever push-to-mute had muted is now the user's choice, and
+    /// its release must not undo it.
+    pub fn user_mode_change(&mut self) {
+        self.ptm_armed = false;
+    }
+    /// Record a press or release; true when the press is auto-repeat.
+    fn repeat(&mut self, a: Action, activated: bool) -> bool {
+        std::mem::replace(&mut self.down[slot(a)], activated) && activated
+    }
 }
 
 /// The press/release state machine: what mode (if any) a shortcut event
 /// selects, given the current selection, the toggle overlay's return
-/// address, and the hold state. `None` = no-op. Guiding principle for
-/// every ambiguous corner: err toward MUTED.
+/// address and the key state. `None` = no-op. Guiding
+/// principle for every ambiguous corner: err toward MUTED.
 pub fn shortcut_transition(
     action: Action,
     activated: bool,
@@ -118,6 +142,12 @@ pub fn shortcut_transition(
     prev_alive: RunMode,
     holds: &mut Holds,
 ) -> Option<Option<RunMode>> {
+    // A held key: its first press already acted. (A held toggle must not
+    // flip back and forth; push-to-talk must not re-open a mic the user
+    // just muted mid-hold; push-to-mute's hold goes on.)
+    if holds.repeat(action, activated) {
+        return None;
+    }
     match (action, activated) {
         // plain toggles: the CLI overlay machine, press only
         (Action::ToggleMute, true) => Some(crate::control::toggle_next(
@@ -135,24 +165,18 @@ pub fn shortcut_transition(
         // push-to-talk: live while held (entering from Mute or Off),
         // muted on release — the key's contract survives mid-hold state
         // changes because the safe direction is muted
-        (Action::PushToTalk, true) => {
-            holds.ptt = true;
-            match current {
-                Some(RunMode::Mute) | None => Some(Some(prev_alive)),
-                Some(_) => None, // already live
-            }
-        }
+        (Action::PushToTalk, true) => match current {
+            Some(RunMode::Mute) | None => Some(Some(prev_alive)),
+            Some(_) => None, // already live
+        },
         // release: mute — but only an AUDIBLE state; already muted is a
         // clean no-op, and from Off there is nothing live to silence
         // (spawning a muted chain would fight a mid-hold Off click, or a
         // stray release in a startup race)
-        (Action::PushToTalk, false) => {
-            holds.ptt = false;
-            match current {
-                Some(m) if m != RunMode::Mute => Some(Some(RunMode::Mute)),
-                _ => None,
-            }
-        }
+        (Action::PushToTalk, false) => match current {
+            Some(m) if m != RunMode::Mute => Some(Some(RunMode::Mute)),
+            _ => None,
+        },
 
         // push-to-mute: silence while held. The press ARMS the release:
         // only a mute this press performed may be restored — tapping the
@@ -167,11 +191,10 @@ pub fn shortcut_transition(
                 Some(Some(RunMode::Mute))
             }
         },
-        // release restores only if armed AND still muted (a mid-hold
-        // change by the user wins; a mid-hold toggle-mute round trip
-        // landing back on Mute still restores — acceptable: the user's
-        // last action left the mic muted and the key promises "silent
-        // only while held")
+        // release restores only if armed AND still muted: it returns to the
+        // mode before the press unless the user picked a mode since (tray
+        // or CLI disarm it; a shortcut round trip landing back on Mute
+        // still restores — the key promises "silent only while held")
         (Action::PushToMute, false) => {
             let fire = holds.ptm_armed && current == Some(RunMode::Mute);
             holds.ptm_armed = false;
@@ -231,6 +254,117 @@ pub enum Cmd {
     Configure,
     /// Reconnect attempt after Unavailable (backoff-gated watchdog tick).
     Retry,
+    /// The app is quitting: let go of the keys, then acknowledge.
+    Shutdown(std::sync::mpsc::Sender<()>),
+}
+
+/// On quit: ask the worker to let go of the keys and wait for it (bounded).
+/// A detached worker would otherwise die with the process mid-cleanup, and
+/// kglobalaccel keeps keys grabbed that nobody unregistered.
+pub fn shutdown(cmds: &tokio::sync::mpsc::UnboundedSender<Cmd>, wait: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if cmds.send(Cmd::Shutdown(tx)).is_ok() {
+        let _ = rx.recv_timeout(wait);
+    }
+}
+
+/// Which client serves the shortcuts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// org.freedesktop.portal.GlobalShortcuts (GNOME, Plasma 6.4+, sandboxes).
+    Portal,
+    /// KDE's own shortcut service, for Plasma older than 6.4: its portal
+    /// opens System Settings on every BindShortcuts, the call every start
+    /// makes to bring the keys back (issue #20).
+    KGlobalAccel,
+    /// None: a sandbox on Plasma 5, where kglobalaccel is out of reach and
+    /// KDE's portal names the binding after each session, so the keys never
+    /// survive a restart while every start opens System Settings.
+    Unsupported,
+}
+
+/// Pick the backend. `plasma` is the running Plasma's (major, minor) when
+/// known. A sandbox keeps the portal (kglobalaccel is outside it), and a
+/// Plasma 6 of unknown minor keeps the portal too: that is what every
+/// version up to 0.9 did, and 6.4+ is the common case by now.
+pub fn choose_backend(
+    flatpak: bool,
+    xdg_current_desktop: Option<&str>,
+    kde_session_version: Option<&str>,
+    plasma: Option<(u32, u32)>,
+) -> Backend {
+    if !is_kde(xdg_current_desktop) {
+        return Backend::Portal;
+    }
+    let old = match plasma {
+        Some((major, minor)) => major < 6 || (major == 6 && minor < 4),
+        None => kde_session_version == Some("5"),
+    };
+    match (flatpak, old) {
+        (false, true) => Backend::KGlobalAccel,
+        (true, true) if kde_session_version == Some("5") => Backend::Unsupported,
+        _ => Backend::Portal,
+    }
+}
+
+fn is_kde(xdg_current_desktop: Option<&str>) -> bool {
+    xdg_current_desktop.is_some_and(|d| d.split(':').any(|e| e.eq_ignore_ascii_case("KDE")))
+}
+
+/// plasmashell's version string ("6.3.6") as (major, minor).
+pub fn parse_plasma_version(v: &str) -> Option<(u32, u32)> {
+    let mut parts = v.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// The running Plasma's version, from plasmashell's application object on
+/// the session bus (running `plasmashell --version` needs a display and
+/// aborts without one, as under the headless unit). An autostarted
+/// HushMic can come up before plasmashell, so this waits up to `wait` for
+/// it to appear.
+fn plasma_version(wait: Duration) -> Option<(u32, u32)> {
+    // Every call bounded: a plasmashell that owns its name but has stopped
+    // answering must not hold the worker (or --doctor) forever.
+    let conn = zbus::blocking::connection::Builder::session()
+        .ok()?
+        .method_timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // uncached: the property cache's initial GetAll ignores the
+        // method timeout
+        let version: Option<String> =
+            zbus::blocking::proxy::Builder::<zbus::blocking::Proxy>::new(&conn)
+                .destination("org.kde.plasmashell")
+                .and_then(|b| b.path("/MainApplication"))
+                .and_then(|b| b.interface("org.qtproject.Qt.QCoreApplication"))
+                .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
+                .and_then(|b| b.build())
+                .ok()
+                .and_then(|p| p.get_property("applicationVersion").ok());
+        if let Some(v) = version {
+            return parse_plasma_version(&v);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The backend for this session, from the environment and (on Plasma 6)
+/// plasmashell's version, waiting up to `wait` for plasmashell to start.
+pub fn detect_backend(wait: Duration) -> Backend {
+    let flatpak = crate::sandbox::is_flatpak();
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+    let session = std::env::var("KDE_SESSION_VERSION").ok();
+    let plasma = (!flatpak && is_kde(desktop.as_deref()) && session.as_deref() != Some("5"))
+        .then(|| plasma_version(wait))
+        .flatten();
+    choose_backend(flatpak, desktop.as_deref(), session.as_deref(), plasma)
 }
 
 /// Start the worker thread: probe the portal, create a session, and stream
@@ -250,7 +384,11 @@ pub fn spawn(
             .enable_all()
             .build()
         {
-            Ok(rt) => rt.block_on(worker(events, rebind_on_start, cmd_rx)),
+            Ok(rt) => match detect_backend(Duration::from_secs(20)) {
+                Backend::Portal => rt.block_on(worker(events, rebind_on_start, cmd_rx)),
+                Backend::KGlobalAccel => rt.block_on(kglobalaccel::worker(events, cmd_rx)),
+                Backend::Unsupported => rt.block_on(unsupported(events, cmd_rx)),
+            },
             Err(e) => {
                 eprintln!("[hushmic] global-shortcuts worker could not start: {e}");
                 let _ = events.send(PortalEvent::Unavailable);
@@ -258,6 +396,25 @@ pub fn spawn(
         }
     });
     cmd_tx
+}
+
+/// No shortcuts in this session: the entry stays hidden, and every retry
+/// the main loop's backoff sends gets the same answer.
+async fn unsupported(
+    events: std::sync::mpsc::Sender<PortalEvent>,
+    mut cmds: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+) {
+    eprintln!("[hushmic] global shortcuts: unavailable in a sandbox on Plasma 5");
+    while events.send(PortalEvent::Unavailable).is_ok() {
+        match cmds.recv().await {
+            None => return,
+            Some(Cmd::Shutdown(ack)) => {
+                let _ = ack.send(());
+                return;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 async fn worker(
@@ -277,8 +434,13 @@ async fn worker(
         // wakes a reconnect — a Bind or Configure that races the death
         // just reconnects (the menu entry is hidden while we are down, so
         // the click's intent is gone anyway).
-        if cmds.recv().await.is_none() {
-            return;
+        match cmds.recv().await {
+            None => return,
+            Some(Cmd::Shutdown(ack)) => {
+                let _ = ack.send(());
+                return;
+            }
+            Some(_) => {}
         }
     }
 }
@@ -352,9 +514,9 @@ async fn serve_session(
                 let member = msg.header().member().map(|n| n.as_str().to_owned());
                 match member.as_deref() {
                     Some(dir @ ("Activated" | "Deactivated")) => {
+                        let pressed = dir == "Activated";
                         match parse_signal(&session, &msg) {
-                            Some(a) if dir == "Activated" =>
-                                events.send(PortalEvent::Activated(a)),
+                            Some(a) if pressed => events.send(PortalEvent::Activated(a)),
                             Some(a) => events.send(PortalEvent::Deactivated(a)),
                             None => Ok(()),
                         }
@@ -382,6 +544,16 @@ async fn serve_session(
             },
             c = cmds.recv() => match c {
                 None => return Ok(()),
+                Some(Cmd::Shutdown(ack)) => {
+                    // closing the session lets the compositor release the keys
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        session_proxy.call::<_, _, ()>("Close", &()),
+                    )
+                    .await;
+                    let _ = ack.send(());
+                    return Ok(());
+                }
                 Some(Cmd::Retry) => Ok(()), // already up
                 Some(Cmd::Bind) => match bind(&conn, &portal, &session).await {
                     Ok(()) => {
@@ -635,6 +807,156 @@ mod tests {
     use super::*;
     use RunMode::*;
 
+    /// A press or release of a key that is used as a separate tap each
+    /// time: a press is preceded by the key's release (tests of repeats
+    /// call shortcut_transition directly).
+    fn st(
+        a: Action,
+        down: bool,
+        cur: Option<RunMode>,
+        prev: RunMode,
+        h: &mut Holds,
+    ) -> Option<Option<RunMode>> {
+        if down {
+            h.down[slot(a)] = false;
+        }
+        shortcut_transition(a, down, cur, prev, h)
+    }
+
+    #[test]
+    fn a_held_key_acts_once() {
+        // toggle: the repeats of one hold do not flip it back and forth
+        let mut h = Holds::default();
+        let tm = |down, cur, h: &mut Holds| {
+            shortcut_transition(Action::ToggleMute, down, cur, Suppress, h)
+        };
+        assert_eq!(tm(true, Some(Suppress), &mut h), Some(Some(Mute)));
+        for _ in 0..50 {
+            assert_eq!(tm(true, Some(Mute), &mut h), None);
+        }
+        assert_eq!(tm(false, Some(Mute), &mut h), None);
+        assert_eq!(
+            tm(true, Some(Mute), &mut h),
+            Some(Some(Suppress)),
+            "a new press after the release"
+        );
+        // push-to-mute held: repeats keep the hold, the release restores
+        let mut h = Holds::default();
+        let ptm = |down, cur, h: &mut Holds| {
+            shortcut_transition(Action::PushToMute, down, cur, Suppress, h)
+        };
+        assert_eq!(ptm(true, Some(Suppress), &mut h), Some(Some(Mute)));
+        for _ in 0..50 {
+            assert_eq!(ptm(true, Some(Mute), &mut h), None);
+        }
+        assert_eq!(ptm(false, Some(Mute), &mut h), Some(Some(Suppress)));
+    }
+
+    #[test]
+    fn push_to_talk_repeats_never_reopen_a_mic_the_user_muted() {
+        // Found in review: hold push-to-talk, mute (or turn off) from the
+        // tray mid-hold; however late the key's repeats come, they must not
+        // bring the mic back.
+        for user in [Some(Mute), None] {
+            let mut h = Holds::default();
+            let ptt = |down, h: &mut Holds, cur| {
+                shortcut_transition(Action::PushToTalk, down, cur, Suppress, h)
+            };
+            assert_eq!(ptt(true, &mut h, Some(Mute)), Some(Some(Suppress)));
+            h.user_mode_change();
+            for _ in 0..50 {
+                assert_eq!(ptt(true, &mut h, user), None);
+            }
+            assert_eq!(ptt(false, &mut h, user), None, "stays as the user set it");
+        }
+    }
+
+    #[test]
+    fn a_press_without_release_costs_only_the_next_press() {
+        // An invoked shortcut has no release: the key's next press is taken
+        // for its repeat and ignored, its release resets the key.
+        let mut h = Holds::default();
+        let ptt = |down, h: &mut Holds, cur| {
+            shortcut_transition(Action::PushToTalk, down, cur, Suppress, h)
+        };
+        assert_eq!(ptt(true, &mut h, Some(Mute)), Some(Some(Suppress)));
+        // (the release got lost; something muted again meanwhile)
+        assert_eq!(ptt(true, &mut h, Some(Mute)), None, "stays muted");
+        assert_eq!(ptt(false, &mut h, Some(Mute)), None);
+        assert_eq!(
+            ptt(true, &mut h, Some(Mute)),
+            Some(Some(Suppress)),
+            "works again"
+        );
+    }
+
+    #[test]
+    fn a_mode_the_user_picked_survives_push_to_mute() {
+        // Found in review: push-to-mute pressed (its release lost), the user
+        // mutes from the tray, then taps the key: it must stay muted.
+        let mut h = Holds::default();
+        let ptm = |down, h: &mut Holds, cur| {
+            shortcut_transition(Action::PushToMute, down, cur, Suppress, h)
+        };
+        assert_eq!(ptm(true, &mut h, Some(Suppress)), Some(Some(Mute)));
+        h.user_mode_change();
+        assert_eq!(ptm(true, &mut h, Some(Mute)), None);
+        assert_eq!(ptm(false, &mut h, Some(Mute)), None, "stays muted");
+        assert_eq!(ptm(true, &mut h, Some(Mute)), None, "a tap while muted");
+        assert_eq!(ptm(false, &mut h, Some(Mute)), None, "never un-mutes");
+    }
+
+    #[test]
+    fn old_plasma_gets_kglobalaccel_everything_else_the_portal() {
+        use Backend::*;
+        let kde = Some("KDE");
+        // Plasma 5, from the version or from the session variable alone.
+        assert_eq!(choose_backend(false, kde, Some("5"), None), KGlobalAccel);
+        assert_eq!(
+            choose_backend(false, kde, Some("5"), Some((5, 27))),
+            KGlobalAccel
+        );
+        // Plasma 6 before 6.4 opens System Settings on every bind.
+        for minor in 0..4 {
+            assert_eq!(
+                choose_backend(false, kde, Some("6"), Some((6, minor))),
+                KGlobalAccel
+            );
+        }
+        // 6.4 and later re-bind silently: the portal, as before.
+        assert_eq!(choose_backend(false, kde, Some("6"), Some((6, 4))), Portal);
+        assert_eq!(choose_backend(false, kde, Some("6"), Some((6, 7))), Portal);
+        // Unknown minor on Plasma 6: keep the old behavior.
+        assert_eq!(choose_backend(false, kde, Some("6"), None), Portal);
+        // A sandbox cannot reach kglobalaccel: on Plasma 5 nothing works,
+        // on 6.x it keeps the portal (keys persist there, 6.1 onwards).
+        assert_eq!(choose_backend(true, kde, Some("5"), None), Unsupported);
+        assert_eq!(choose_backend(true, kde, Some("6"), None), Portal);
+        assert_eq!(choose_backend(true, kde, Some("6"), Some((6, 3))), Portal);
+        // other desktops never use it
+        assert_eq!(choose_backend(true, Some("GNOME"), None, None), Portal);
+        assert_eq!(
+            choose_backend(false, Some("GNOME"), Some("5"), None),
+            Portal
+        );
+        assert_eq!(choose_backend(false, None, Some("5"), None), Portal);
+        // XDG_CURRENT_DESKTOP is a list in any case.
+        assert_eq!(
+            choose_backend(false, Some("ubuntu:kde"), Some("5"), None),
+            KGlobalAccel
+        );
+    }
+
+    #[test]
+    fn plasma_version_parses_major_and_minor() {
+        assert_eq!(parse_plasma_version("5.27.11"), Some((5, 27)));
+        assert_eq!(parse_plasma_version("6.3.6"), Some((6, 3)));
+        assert_eq!(parse_plasma_version("6.4"), Some((6, 4)));
+        assert_eq!(parse_plasma_version(""), None);
+        assert_eq!(parse_plasma_version("6"), None);
+        assert_eq!(parse_plasma_version("six.one"), None);
+    }
+
     #[test]
     fn bind_payload_registers_every_action_with_its_description() {
         // The BindShortcuts argument: all four actions, each carrying the
@@ -693,8 +1015,7 @@ mod tests {
     fn toggles_mirror_the_cli_overlay() {
         // Same machine as `hushmic toggle mute|bypass`.
         let mut h = Holds::default();
-        let t =
-            |cur, prev, h: &mut Holds| shortcut_transition(Action::ToggleMute, true, cur, prev, h);
+        let t = |cur, prev, h: &mut Holds| st(Action::ToggleMute, true, cur, prev, h);
         assert_eq!(t(Some(Suppress), Suppress, &mut h), Some(Some(Mute)));
         assert_eq!(
             t(Some(Mute), Bypass, &mut h),
@@ -708,11 +1029,11 @@ mod tests {
         );
         // release of a plain toggle is nothing
         assert_eq!(
-            shortcut_transition(Action::ToggleMute, false, Some(Mute), Suppress, &mut h),
+            st(Action::ToggleMute, false, Some(Mute), Suppress, &mut h),
             None
         );
         assert_eq!(
-            shortcut_transition(Action::ToggleBypass, true, Some(Bypass), Suppress, &mut h),
+            st(Action::ToggleBypass, true, Some(Bypass), Suppress, &mut h),
             Some(Some(Suppress)),
             "toggle-bypass leaves bypass for the previous state"
         );
@@ -722,8 +1043,7 @@ mod tests {
     #[test]
     fn push_to_talk_is_live_while_held_muted_after() {
         let mut h = Holds::default();
-        let press =
-            |cur, prev, h: &mut Holds| shortcut_transition(Action::PushToTalk, true, cur, prev, h);
+        let press = |cur, prev, h: &mut Holds| st(Action::PushToTalk, true, cur, prev, h);
         // held: leave mute for the previous chain-alive state
         assert_eq!(press(Some(Mute), Suppress, &mut h), Some(Some(Suppress)));
         assert_eq!(
@@ -744,13 +1064,13 @@ mod tests {
         // config/tray churn)
         for cur in [Some(Suppress), Some(Bypass)] {
             assert_eq!(
-                shortcut_transition(Action::PushToTalk, false, cur, Suppress, &mut h),
+                st(Action::PushToTalk, false, cur, Suppress, &mut h),
                 Some(Some(Mute)),
                 "release from {cur:?}"
             );
         }
         assert_eq!(
-            shortcut_transition(Action::PushToTalk, false, Some(Mute), Suppress, &mut h),
+            st(Action::PushToTalk, false, Some(Mute), Suppress, &mut h),
             None,
             "release while already muted changes nothing"
         );
@@ -760,7 +1080,7 @@ mod tests {
         // release during startup races) — same rule as push-to-mute's
         // release guard
         assert_eq!(
-            shortcut_transition(Action::PushToTalk, false, None, Suppress, &mut h),
+            st(Action::PushToTalk, false, None, Suppress, &mut h),
             None,
             "release from Off must not spawn a chain"
         );
@@ -769,12 +1089,11 @@ mod tests {
     #[test]
     fn push_to_mute_is_the_inverse_cough_button() {
         let mut h = Holds::default();
-        let press =
-            |cur, prev, h: &mut Holds| shortcut_transition(Action::PushToMute, true, cur, prev, h);
+        let press = |cur, prev, h: &mut Holds| st(Action::PushToMute, true, cur, prev, h);
         assert_eq!(press(Some(Suppress), Suppress, &mut h), Some(Some(Mute)));
         // release restores the previous state — this press DID the muting
         assert_eq!(
-            shortcut_transition(Action::PushToMute, false, Some(Mute), Bypass, &mut h),
+            st(Action::PushToMute, false, Some(Mute), Bypass, &mut h),
             Some(Some(Bypass))
         );
         assert_eq!(press(Some(Bypass), Suppress, &mut h), Some(Some(Mute)));
@@ -783,7 +1102,7 @@ mod tests {
         for cur in [Some(Suppress), Some(Bypass), None] {
             let mut armed = Holds::default();
             assert_eq!(
-                shortcut_transition(
+                st(
                     Action::PushToMute,
                     true,
                     Some(Suppress),
@@ -793,7 +1112,7 @@ mod tests {
                 Some(Some(Mute))
             );
             assert_eq!(
-                shortcut_transition(Action::PushToMute, false, cur, Suppress, &mut armed),
+                st(Action::PushToMute, false, cur, Suppress, &mut armed),
                 None,
                 "release from {cur:?} must not fight a mid-hold change"
             );
@@ -811,12 +1130,12 @@ mod tests {
         // otherwise a mute + reflexive tap ends with a live mic.
         let mut h = Holds::default();
         assert_eq!(
-            shortcut_transition(Action::PushToMute, true, Some(Mute), Suppress, &mut h),
+            st(Action::PushToMute, true, Some(Mute), Suppress, &mut h),
             None,
             "press while already muted is a no-op"
         );
         assert_eq!(
-            shortcut_transition(Action::PushToMute, false, Some(Mute), Suppress, &mut h),
+            st(Action::PushToMute, false, Some(Mute), Suppress, &mut h),
             None,
             "…and its release must stay muted"
         );
@@ -824,7 +1143,7 @@ mod tests {
         // through a reconnect) is equally inert.
         let mut h = Holds::default();
         assert_eq!(
-            shortcut_transition(Action::PushToMute, false, Some(Mute), Bypass, &mut h),
+            st(Action::PushToMute, false, Some(Mute), Bypass, &mut h),
             None,
             "release without a live armed press never un-mutes"
         );

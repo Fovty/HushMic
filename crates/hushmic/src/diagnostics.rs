@@ -37,6 +37,8 @@ pub struct Report {
     /// `enabled` AND `instance_running` (otherwise a plain fact).
     pub hushmic_present: Option<bool>,
     pub can_set_default: bool,
+    /// Which client the global shortcuts use in this session.
+    pub shortcuts_backend: crate::shortcuts::Backend,
     pub instance_running: bool,
     pub assets: Vec<AssetFact>,
     /// (command, on PATH). Missing = problem.
@@ -117,6 +119,7 @@ pub fn collect() -> Report {
             .as_deref()
             .map(|v| v.iter().any(|s| s.name == "hushmic_source")),
         can_set_default: crate::pipewire::can_set_default(),
+        shortcuts_backend: crate::shortcuts::detect_backend(std::time::Duration::ZERO),
         instance_running,
         assets: vec![
             AssetFact {
@@ -389,6 +392,18 @@ pub fn render(r: &Report) -> (String, usize) {
         format!(
             "can set default: {}",
             if r.can_set_default { "yes" } else { "no" }
+        ),
+    );
+    line(
+        &mut out,
+        false,
+        format!(
+            "global shortcuts: {}",
+            match r.shortcuts_backend {
+                crate::shortcuts::Backend::Portal => "desktop portal",
+                crate::shortcuts::Backend::KGlobalAccel => "KDE kglobalaccel (Plasma before 6.4)",
+                crate::shortcuts::Backend::Unsupported => "unavailable (sandbox on Plasma 5)",
+            }
         ),
     );
     out.push_str("assets:\n");
@@ -669,6 +684,7 @@ mod tests {
             default_source: Some("hushmic_source".into()),
             hushmic_present: Some(true),
             can_set_default: true,
+            shortcuts_backend: crate::shortcuts::Backend::Portal,
             instance_running: true,
             assets: vec![AssetFact {
                 what: "LADSPA plugin",
