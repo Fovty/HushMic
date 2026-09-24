@@ -167,7 +167,8 @@ fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
     if let Some(t) = pinned_tier(pin.as_deref(), tiers) {
         return Box::new(Pinned(t));
     }
-    let mut ladder = Ladder::new(tiers);
+    // Automatic fallback stops at the cheapest model; raw is explicit-only.
+    let mut ladder = Ladder::new(&tiers[..tiers.len() - 1]);
     if let Some(hops) = std::env::var("HUSHMIC_DSP_DWELL_HOPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -465,6 +466,39 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_fallback_never_runs_raw_and_recovers_quality() {
+        for (model, light, cheapest) in [
+            ("dpdfnet8.onnx", true, Tier::Light),
+            ("dpdfnet8.onnx", false, Tier::Quality),
+            ("dpdfnet2.onnx", false, Tier::Light),
+        ] {
+            for (cost, lag) in [(0.85, 0), (2.0, 8)] {
+                let (tiers, main) = plan_tiers(std::path::Path::new(model), light);
+                let mut policy = build_policy(&tiers);
+                for (hops, cost, lag, expected) in
+                    [(1000, cost, lag, cheapest), (4000, 0.1, 0, main)]
+                {
+                    for _ in 0..hops {
+                        match policy.step() {
+                            Step::Steady { live } => assert_ne!(live, Tier::Raw),
+                            Step::Shadow { live, shadow, .. } => {
+                                assert_ne!(live, Tier::Raw);
+                                assert_ne!(shadow, Tier::Raw);
+                            }
+                            Step::Crossfade { from, to, .. } => {
+                                assert_ne!(from, Tier::Raw);
+                                assert_ne!(to, Tier::Raw);
+                            }
+                        }
+                        policy.observe(cost, Some(0.1), lag);
+                    }
+                    assert_eq!(policy.live(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn tiers_follow_the_main_model_name_and_light_load() {

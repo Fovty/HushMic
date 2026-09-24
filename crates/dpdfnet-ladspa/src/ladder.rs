@@ -275,8 +275,7 @@ enum Phase {
     },
 }
 
-/// The ladder. Tiers are indexed top (0) to bottom; the bottom is always
-/// `Raw`, so a larger index is a cheaper tier.
+/// The ladder. Tiers are indexed top (0) to bottom, cheapest last.
 pub struct Ladder {
     tiers: [Tier; 3],
     n: usize,
@@ -318,16 +317,18 @@ pub struct Ladder {
 }
 
 impl Ladder {
-    /// `tiers` top to bottom; the last must be `Raw`, two or three entries.
+    /// `tiers` top to bottom; one to three entries, optionally ending in Raw.
     pub fn new(tiers: &[Tier]) -> Ladder {
         assert!(
-            (2..=3).contains(&tiers.len()) && *tiers.last().unwrap() == Tier::Raw,
-            "ladder must be [model.., Raw]"
+            (1..=3).contains(&tiers.len()),
+            "ladder must contain one to three tiers"
         );
         let mut t = [Tier::Raw; 3];
         t[..tiers.len()].copy_from_slice(tiers);
         let mut base = [DWELL_BASE; 3];
-        base[tiers.len() - 2] = RAW_RETRY_BASE;
+        if tiers.len() > 1 && tiers.last() == Some(&Tier::Raw) {
+            base[tiers.len() - 2] = RAW_RETRY_BASE;
+        }
         Ladder {
             tiers: t,
             n: tiers.len(),
@@ -381,7 +382,7 @@ impl Ladder {
     }
 
     fn double_dwell(&mut self, tier: usize) {
-        let cap = if tier == self.n - 2 {
+        let cap = if self.tiers[self.bottom()] == Tier::Raw && tier + 2 == self.n {
             RAW_RETRY_MAX.max(self.base[tier])
         } else {
             DWELL_MAX
@@ -415,6 +416,17 @@ impl Ladder {
     }
 
     fn start_emergency(&mut self, lag: u32, cheap: bool) -> Option<Event> {
+        if self.tiers[self.bottom()] != Tier::Raw {
+            let cost = self.load;
+            // Stop the overloaded model immediately. A cold model may need
+            // to refill its delay line, but unfiltered audio is never exposed.
+            self.finish_crossfade(self.bottom(), 0.0, Change::Prevent);
+            return Some(Event::Demoted {
+                to: self.tiers[self.live],
+                cost,
+                lag,
+            });
+        }
         let failed = self.live;
         self.cheap_panic = cheap;
         self.phase = Phase::Crossfade {
@@ -2217,7 +2229,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn ladder_must_end_in_raw() {
-        let _ = Ladder::new(&[Tier::Quality, Tier::Light]);
+    fn ladder_must_not_be_empty() {
+        let _ = Ladder::new(&[]);
     }
 }
