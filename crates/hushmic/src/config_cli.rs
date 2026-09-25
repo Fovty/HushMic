@@ -188,19 +188,14 @@ fn installed_models(model_dir: &Path) -> Vec<String> {
     v
 }
 
-/// Same rules as the tray commands: a mic pick loads its saved profile; a
-/// model or strength change is remembered under the selected mic.
-pub fn apply(cfg: &mut Config, key: Key, value: Value) {
+/// Same rules as the tray commands: `model` and `attn_limit` change the
+/// settings in effect for the device in use, `device` (see
+/// [`Config::edit_target`]).
+pub fn apply(cfg: &mut Config, key: Key, value: Value, device: Option<&str>) {
     match (key, value) {
         (Key::Mic, Value::Mic(m)) => cfg.apply_mic_selection(m),
-        (Key::Model, Value::Model(m)) => {
-            cfg.model = m;
-            cfg.remember_selected_prefs();
-        }
-        (Key::AttnLimit, Value::Attn(v)) => {
-            cfg.attn_limit = v;
-            cfg.remember_selected_prefs();
-        }
+        (Key::Model, Value::Model(m)) => cfg.set_model_for(device, m),
+        (Key::AttnLimit, Value::Attn(v)) => cfg.set_attn_for(device, v),
         (Key::SetDefault, Value::Bool(b)) => cfg.set_default = b,
         (Key::Autostart, Value::Bool(b)) => cfg.autostart = b,
         (Key::Tray, Value::Bool(b)) => cfg.tray = b,
@@ -218,12 +213,13 @@ fn attn_text(v: f32) -> String {
     }
 }
 
-/// The plain-text value of one key.
-pub fn get(cfg: &Config, key: Key) -> String {
+/// The plain-text value of one key. `model` and `attn_limit` are the ones
+/// `device` runs with — what `set` on the same device changes.
+pub fn get(cfg: &Config, key: Key, device: Option<&str>) -> String {
     match key {
         Key::Mic => cfg.mic.clone().unwrap_or_else(|| "default".into()),
-        Key::Model => cfg.model.clone(),
-        Key::AttnLimit => attn_text(cfg.attn_limit),
+        Key::Model => cfg.profile_for(device).model,
+        Key::AttnLimit => attn_text(cfg.profile_for(device).attn_limit),
         Key::SetDefault => cfg.set_default.to_string(),
         Key::Autostart => cfg.autostart.to_string(),
         Key::Tray => cfg.tray.to_string(),
@@ -247,18 +243,18 @@ pub fn get(cfg: &Config, key: Key) -> String {
 
 /// `key = value` for every listed key — including the ones the file
 /// omits at their default, which are exactly what a new user asks about.
-pub fn render_all(cfg: &Config) -> String {
+pub fn render_all(cfg: &Config, device: Option<&str>) -> String {
     listed()
-        .map(|k| format!("{} = {}\n", k.name(), get(cfg, k)))
+        .map(|k| format!("{} = {}\n", k.name(), get(cfg, k, device)))
         .collect()
 }
 
-fn json_value(cfg: &Config, key: Key) -> serde_json::Value {
+fn json_value(cfg: &Config, key: Key, device: Option<&str>) -> serde_json::Value {
     use serde_json::json;
     match key {
         Key::Mic => json!(cfg.mic),
-        Key::Model => json!(cfg.model),
-        Key::AttnLimit => json!(cfg.attn_limit),
+        Key::Model => json!(cfg.profile_for(device).model),
+        Key::AttnLimit => json!(cfg.profile_for(device).attn_limit),
         Key::SetDefault => json!(cfg.set_default),
         Key::Autostart => json!(cfg.autostart),
         Key::Tray => json!(cfg.tray),
@@ -280,17 +276,17 @@ fn json_value(cfg: &Config, key: Key) -> serde_json::Value {
     }
 }
 
-pub fn render_all_json(cfg: &Config) -> String {
+pub fn render_all_json(cfg: &Config, device: Option<&str>) -> String {
     let mut map = serde_json::Map::new();
     for k in listed() {
-        map.insert(k.name().to_string(), json_value(cfg, k));
+        map.insert(k.name().to_string(), json_value(cfg, k, device));
     }
     serde_json::Value::Object(map).to_string()
 }
 
-pub fn render_one_json(cfg: &Config, key: Key) -> String {
+pub fn render_one_json(cfg: &Config, key: Key, device: Option<&str>) -> String {
     let mut map = serde_json::Map::new();
-    map.insert(key.name().to_string(), json_value(cfg, key));
+    map.insert(key.name().to_string(), json_value(cfg, key, device));
     serde_json::Value::Object(map).to_string()
 }
 
@@ -333,14 +329,28 @@ pub fn diff(old: &Config, new: &Config) -> Diff {
 // --- `config get` / `config set` without a daemon ---------------------------
 
 /// `config` / `config get KEY` rendered from a Config (the daemon's live
-/// copy or the file).
-pub fn offline_get(cfg: &Config, key: Option<&str>, json: bool) -> Result<String, String> {
+/// copy or the file), `device` being the one whose settings apply.
+pub fn offline_get(
+    cfg: &Config,
+    key: Option<&str>,
+    json: bool,
+    device: Option<&str>,
+) -> Result<String, String> {
     Ok(match (key, json) {
-        (None, false) => render_all(cfg),
-        (None, true) => render_all_json(cfg),
-        (Some(k), false) => format!("{}\n", get(cfg, parse_key(k)?)),
-        (Some(k), true) => render_one_json(cfg, parse_key(k)?),
+        (None, false) => render_all(cfg, device),
+        (None, true) => render_all_json(cfg, device),
+        (Some(k), false) => format!("{}\n", get(cfg, parse_key(k)?, device)),
+        (Some(k), true) => render_one_json(cfg, parse_key(k)?, device),
     })
+}
+
+/// The device a start would take its settings from — what `config get` and
+/// `set` refer to without a daemon (see
+/// [`crate::pipewire::resolve_chain_target`]). A crashed run's takeover
+/// breadcrumb counts, as in `--doctor`.
+pub fn offline_device(cfg: &Config) -> Option<String> {
+    let prior = crate::controller::persisted_prior_default();
+    crate::pipewire::resolve_chain_target(cfg.mic.as_deref(), prior.as_deref()).profile_device
 }
 
 /// The no-daemon path: validate exactly like the daemon, write the file,
@@ -349,7 +359,8 @@ pub fn offline_set(key: &str, raw: &str, model_dir: &Path) -> Result<String, Str
     let k = parse_settable_key(key)?;
     let v = parse_value(k, raw, model_dir)?;
     let mut cfg = Config::load();
-    apply(&mut cfg, k, v);
+    let device = offline_device(&cfg);
+    apply(&mut cfg, k, v, device.as_deref());
     cfg.save()
         .map_err(|e| format!("could not write {}: {e}", Config::path().display()))?;
     let mut note = String::new();
@@ -375,7 +386,7 @@ pub fn offline_set(key: &str, raw: &str, model_dir: &Path) -> Result<String, Str
     Ok(format!(
         "{} = {}{}{}\n",
         k.name(),
-        get(&cfg, k),
+        get(&cfg, k, device.as_deref()),
         set_qualifier(k, false),
         note
     ))
@@ -546,29 +557,56 @@ mod tests {
             mic: Some("rode".into()),
             ..Config::default()
         };
-        apply(&mut c, Key::AttnLimit, Value::Attn(24.0));
-        assert_eq!(c.attn_limit, 24.0);
+        let rode = Some("rode");
+        apply(&mut c, Key::AttnLimit, Value::Attn(24.0), rode);
         assert_eq!(c.mic_prefs["rode"].attn_limit, 24.0);
-        apply(&mut c, Key::Model, Value::Model("dpdfnet2_48khz_hr".into()));
+        assert_eq!(c.attn_limit, 100.0, "the defaults stay");
+        apply(
+            &mut c,
+            Key::Model,
+            Value::Model("dpdfnet2_48khz_hr".into()),
+            rode,
+        );
         assert_eq!(c.mic_prefs["rode"].model, "dpdfnet2_48khz_hr");
-        apply(&mut c, Key::Mic, Value::Mic(None));
+        assert_eq!(get(&c, Key::AttnLimit, rode), "24");
+        assert_eq!(get(&c, Key::Model, rode), "dpdfnet2_48khz_hr");
+        apply(&mut c, Key::Mic, Value::Mic(None), rode);
         assert_eq!(c.mic, None);
-        c.model = "dpdfnet8_48khz_hr".into();
-        apply(&mut c, Key::Mic, Value::Mic(Some("rode".into())));
-        assert_eq!(c.model, "dpdfnet2_48khz_hr", "profile loaded on pick");
-        apply(&mut c, Key::TrayIcon, Value::Icon(TrayIcon::Symbolic));
+        // Follow-default: the RODE still has its profile, so edits keep
+        // landing there…
+        apply(&mut c, Key::AttnLimit, Value::Attn(18.0), rode);
+        assert_eq!(c.mic_prefs["rode"].attn_limit, 18.0);
+        // …while a device without one runs on the defaults, and an edit
+        // changes those — no new profile.
+        apply(&mut c, Key::AttnLimit, Value::Attn(6.0), Some("jabra"));
+        assert!(!c.mic_prefs.contains_key("jabra"));
+        assert_eq!(c.attn_limit, 6.0);
+        assert_eq!(get(&c, Key::AttnLimit, Some("jabra")), "6");
+        // No device can own it (unknown default, our own node): the
+        // defaults change too.
+        apply(&mut c, Key::AttnLimit, Value::Attn(12.0), None);
+        apply(
+            &mut c,
+            Key::AttnLimit,
+            Value::Attn(12.0),
+            Some("hushmic_source"),
+        );
+        assert_eq!(c.attn_limit, 12.0);
+        assert_eq!(c.mic_prefs.len(), 1);
+        assert_eq!(get(&c, Key::AttnLimit, None), "12");
+        apply(&mut c, Key::TrayIcon, Value::Icon(TrayIcon::Symbolic), None);
         assert_eq!(c.tray_icon, TrayIcon::Symbolic);
-        apply(&mut c, Key::Tray, Value::Bool(false));
-        apply(&mut c, Key::Notifications, Value::Bool(false));
-        apply(&mut c, Key::SetDefault, Value::Bool(true));
-        apply(&mut c, Key::Autostart, Value::Bool(true));
+        apply(&mut c, Key::Tray, Value::Bool(false), None);
+        apply(&mut c, Key::Notifications, Value::Bool(false), None);
+        apply(&mut c, Key::SetDefault, Value::Bool(true), None);
+        apply(&mut c, Key::Autostart, Value::Bool(true), None);
         assert!(!c.tray && !c.notifications && c.set_default && c.autostart);
     }
 
     #[test]
     fn rendering_lists_every_key_plainly_and_as_json() {
         let c = Config::default();
-        let plain = render_all(&c);
+        let plain = render_all(&c, None);
         for k in listed() {
             let k = k.name();
             assert!(
@@ -581,16 +619,16 @@ mod tests {
         assert!(plain.contains("tray_icon = auto\n"), "{plain}");
         assert!(plain.contains("attn_limit = 100\n"), "{plain}");
         assert!(plain.contains("mic_prefs = (none)\n"), "{plain}");
-        let v: serde_json::Value = serde_json::from_str(&render_all_json(&c)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render_all_json(&c, None)).unwrap();
         assert!(v["mic"].is_null());
         assert_eq!(v["attn_limit"], 100.0);
         assert_eq!(v["tray"], true);
         assert_eq!(v["tray_icon"], "auto");
         assert!(v["mic_prefs"].is_object());
         let one: serde_json::Value =
-            serde_json::from_str(&render_one_json(&c, Key::Model)).unwrap();
+            serde_json::from_str(&render_one_json(&c, Key::Model, None)).unwrap();
         assert_eq!(one["model"], "dpdfnet8_48khz_hr");
-        assert_eq!(get(&c, Key::AttnLimit), "100");
+        assert_eq!(get(&c, Key::AttnLimit, None), "100");
         let mut c2 = c.clone();
         c2.attn_limit = 24.5;
         c2.mic_prefs.insert(
@@ -600,15 +638,36 @@ mod tests {
                 attn_limit: 12.0,
             },
         );
-        assert_eq!(get(&c2, Key::AttnLimit), "24.5");
-        assert_eq!(get(&c2, Key::MicPrefs), "rode: dpdfnet2_48khz_hr 12 dB");
-        let v: serde_json::Value = serde_json::from_str(&render_all_json(&c2)).unwrap();
-        assert_eq!(v["mic_prefs"]["rode"]["attn_limit"], 12.0);
+        assert_eq!(get(&c2, Key::AttnLimit, None), "24.5");
         assert_eq!(
-            offline_get(&c, Some("model"), false).unwrap(),
+            get(&c2, Key::MicPrefs, None),
+            "rode: dpdfnet2_48khz_hr 12 dB"
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_all_json(&c2, None)).unwrap();
+        assert_eq!(v["mic_prefs"]["rode"]["attn_limit"], 12.0);
+        // With the RODE in use, model and attn_limit are its profile's.
+        let rode = Some("alsa_input.rode");
+        let rode_cfg = {
+            let mut r = c2.clone();
+            r.mic_prefs
+                .insert("alsa_input.rode".into(), c2.mic_prefs["rode"].clone());
+            r
+        };
+        let plain = render_all(&rode_cfg, rode);
+        assert!(plain.contains("model = dpdfnet2_48khz_hr\n"), "{plain}");
+        assert!(plain.contains("attn_limit = 12\n"), "{plain}");
+        let v: serde_json::Value = serde_json::from_str(&render_all_json(&rode_cfg, rode)).unwrap();
+        assert_eq!(v["attn_limit"], 12.0);
+        assert_eq!(v["model"], "dpdfnet2_48khz_hr");
+        assert_eq!(
+            offline_get(&c, Some("model"), false, None).unwrap(),
             "dpdfnet8_48khz_hr\n"
         );
-        assert!(offline_get(&c, Some("volume"), false).is_err());
+        assert_eq!(
+            offline_get(&rode_cfg, Some("attn_limit"), true, rode).unwrap(),
+            r#"{"attn_limit":12.0}"#
+        );
+        assert!(offline_get(&c, Some("volume"), false, None).is_err());
     }
 
     #[test]

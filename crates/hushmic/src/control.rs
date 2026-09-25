@@ -149,8 +149,18 @@ pub struct Status {
     pub mic_configured: Option<String>,
     pub mic_active: Option<String>,
     pub fallback_active: bool,
+    /// The model and strength in effect: the active profile's (see
+    /// `Config::active_profile`), not necessarily the defaults below.
     pub model: String,
     pub attn_limit: f32,
+    /// The device whose saved profile is in effect (node.name, and its
+    /// display name); None = the defaults apply.
+    pub profile: Option<String>,
+    pub profile_name: Option<String>,
+    /// The defaults for devices without a profile (config `model` /
+    /// `attn_limit`).
+    pub defaults_model: String,
+    pub defaults_attn_limit: f32,
     pub chain_running: bool,
     pub node_present: Option<bool>,
     /// A StatusNotifierItem is registered (`sni`) or the daemon runs
@@ -200,12 +210,16 @@ pub fn render_status_human(s: &Status) -> String {
         _ => String::new(),
     };
     format!(
-        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB\n{}latency: {} ms added\ntray: {}\nchain: {}\n",
+        "hushmic {} — mode: {}\nmic: {}\nmodel: {}  strength: {} dB ({})\n{}latency: {} ms added\ntray: {}\nchain: {}\n",
         s.version,
         mode,
         mic,
         s.model,
         s.attn_limit,
+        match &s.profile {
+            Some(p) => format!("{} profile", s.profile_name.as_deref().unwrap_or(p)),
+            None => "defaults".to_string(),
+        },
         engine,
         crate::controller::LATENCY_SAMPLES * 1000 / 48_000,
         tray_word(s.tray_sni),
@@ -233,6 +247,11 @@ pub fn render_status_json(s: &Status) -> String {
         },
         "model": s.model,
         "attn_limit": s.attn_limit,
+        "profile": s.profile,
+        "defaults": {
+            "model": s.defaults_model,
+            "attn_limit": s.defaults_attn_limit,
+        },
         "engine": s.chain_running.then_some(s.engine).flatten().map(EngineTier::word),
         "latency_samples": crate::controller::LATENCY_SAMPLES,
         "tray": tray_word(s.tray_sni),
@@ -635,6 +654,10 @@ mod tests {
             fallback_active: false,
             model: "dpdfnet8_48khz_hr".into(),
             attn_limit: 100.0,
+            profile: Some("alsa_input.rode".into()),
+            profile_name: Some("RODE NT-USB".into()),
+            defaults_model: "dpdfnet2_48khz_hr".into(),
+            defaults_attn_limit: 24.0,
             chain_running: true,
             node_present: Some(true),
             tray_sni: true,
@@ -683,6 +706,40 @@ mod tests {
         assert_eq!(v["tray"], "sni");
         assert_eq!(v["chain"]["running"], true);
         assert_eq!(v["chain"]["node_present"], true);
+    }
+
+    /// The reported bug: the RODE profile runs, and `status` must say so
+    /// instead of showing the defaults.
+    #[test]
+    fn status_shows_the_settings_in_effect_and_whose_they_are() {
+        let mut s = demo_status();
+        let h = render_status_human(&s);
+        assert!(
+            h.contains("model: dpdfnet8_48khz_hr  strength: 100 dB (RODE NT-USB profile)\n"),
+            "{h}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        // Top-level model/attn_limit are what runs (compatible: they
+        // always were what `status` claimed was running).
+        assert_eq!(v["model"], "dpdfnet8_48khz_hr");
+        assert_eq!(v["attn_limit"], 100.0);
+        assert_eq!(v["profile"], "alsa_input.rode");
+        assert_eq!(v["defaults"]["model"], "dpdfnet2_48khz_hr");
+        assert_eq!(v["defaults"]["attn_limit"], 24.0);
+        // No description known: the node name.
+        s.profile_name = None;
+        assert!(render_status_human(&s).contains("100 dB (alsa_input.rode profile)\n"));
+        // The defaults in effect.
+        s.profile = None;
+        s.model = "dpdfnet2_48khz_hr".into();
+        s.attn_limit = 24.0;
+        let h = render_status_human(&s);
+        assert!(
+            h.contains("model: dpdfnet2_48khz_hr  strength: 24 dB (defaults)\n"),
+            "{h}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert!(v["profile"].is_null());
     }
 
     #[test]

@@ -44,7 +44,11 @@ The tray icon shows the state. On KDE and GNOME it is a monochrome icon in your 
 
 **Model**: `dpdfnet8_48khz_hr` is the quality model, `dpdfnet2_48khz_hr` needs less CPU. Changing the model restarts the chain (a short gap on the virtual mic).
 
-**Suppression strength** caps how much noise is removed, in dB: maximum (100), strong (24), medium (12) or light (6). Lower values keep more of the room sound. Model and strength are remembered per microphone.
+**Suppression strength** caps how much noise is removed, in dB: maximum (100), strong (24), medium (12) or light (6). Lower values keep more of the room sound.
+
+Model and strength are remembered per microphone. Pick a microphone under **Microphone** and change them: that microphone keeps its own settings from then on. Every microphone without its own settings shares the defaults (`model` and `attn_limit` in the file). A change goes to the settings in effect: the microphone's own when it has them, else the defaults. `hushmic status` says which. With *System default* selected, the settings follow the default input: when it moves to another microphone for longer than a few seconds, HushMic restarts with that microphone's settings (a short gap). If the default keeps switching back and forth, those restarts get further apart, up to five minutes. Bluetooth headsets can show up as a different device per audio profile (for example music and headset mode), and each one has its own settings.
+
+With **Set as default microphone** on, HushMic is the default input and uses the microphone that was the default before. If you switch the system default to another microphone yourself, that switch stays: HushMic follows the new microphone with its settings and does not take the default back until you turn it on again (mode, the checkbox, or the next start).
 
 ## Test my mic
 
@@ -76,7 +80,7 @@ hushmic service install|uninstall   see headless.md
 
 `status`, `mode`, `toggle` and `quit` talk to the running instance over a socket. Exit codes: 0 ok, 1 invalid usage or a failed command, 2 HushMic is not running. The `engine:` line in `status` (`quality model`, `light model`, `passthrough`; the JSON field `engine`) says which engine the chain is running right now: under CPU pressure HushMic falls back to the light model or to unfiltered audio and climbs back later, see [troubleshooting.md](troubleshooting.md#latency-and-cpu).
 
-`config set` applies the change immediately while HushMic runs and writes it to the file otherwise, with the same validation either way. `config` and `config get` read the running instance's settings when there is one, else the file. `toggle mute` twice returns you to the state you came from, so one key can serve as a mute button.
+`config set` applies the change immediately while HushMic runs and writes it to the file otherwise, with the same validation either way. `model` and `attn_limit` follow the menu's rule: `config get` shows the settings in effect and `config set` changes them where the menu would (the microphone's own settings, or the defaults). Without a running instance they refer to the microphone HushMic would start with. `status` names whose settings they are, for example `strength: 100 dB (RODE NT-USB profile)` or `(defaults)`; in `status --json`, `model` and `attn_limit` are the values in effect, `profile` is the node name of the microphone they belong to (`null` for the defaults), and `defaults` holds the default `model` and `attn_limit`. `config` and `config get` read the running instance's settings when there is one, else the file. `toggle mute` twice returns you to the state you came from, so one key can serve as a mute button.
 
 ## Configuration
 
@@ -85,9 +89,9 @@ The file is `~/.config/hushmic/config.toml` (`hushmic config path` prints the ex
 | key | values | default | applied |
 |-----|--------|---------|---------|
 | `mic` | a node name from `hushmic devices`, or `default` | `default` | live |
-| `model` | `dpdfnet8_48khz_hr` or `dpdfnet2_48khz_hr` | `dpdfnet8_48khz_hr` | live, restarts the chain |
-| `attn_limit` | 0 to 100 (dB), or `maximum`, `strong`, `medium`, `light` | `100` | live |
-| `set_default` | `true` or `false`: make HushMic the system default input | `false` | live |
+| `model` | `dpdfnet8_48khz_hr` or `dpdfnet2_48khz_hr`, for the settings in effect | `dpdfnet8_48khz_hr` | live, restarts the chain |
+| `attn_limit` | 0 to 100 (dB), or `maximum`, `strong`, `medium`, `light`, for the settings in effect | `100` | live |
+| `set_default` | `true` or `false`: make HushMic the system default input (a switch away by hand sticks until the next start or mode change) | `false` | live |
 | `autostart` | `true` or `false`: desktop autostart entry | `false` | live |
 | `tray` | `true` or `false`: register a tray icon | `true` | next start |
 | `tray_icon` | `auto`, `color` or `symbolic`: which tray icon set to use | `auto` | live |
@@ -97,6 +101,6 @@ Booleans also accept `on`/`off`, `yes`/`no` and `1`/`0`. `tray = false` hides th
 
 `tray_icon = auto` picks the monochrome icons on KDE and GNOME and the colored ones everywhere else, because those two desktops recolor a monochrome panel icon to match their theme. `color` and `symbolic` pin the choice if you prefer the other set. HushMic only names the icon it wants; the desktop draws it, so the monochrome one follows your panel from light to dark on its own. The change applies while HushMic runs, with no restart. `symbolic` on a desktop that does not recolor panel icons (LXQt, for example) can come out near-black on a dark panel, which is why `auto` leaves those on the colored set. If the monochrome files are not installed (an older package, a plain `cargo build`), the desktop falls back to the colored icon.
 
-The file also holds `enabled` (set with `hushmic mode`), `mic_prefs` (model and strength per microphone) and `shortcuts_setup`, all managed by the app. `tray` and `notifications` are only written when false, `tray_icon` when it is not `auto`, `mic_prefs` when non-empty and `shortcuts_setup` when true, so a file from an older version stays unchanged.
+The file also holds `enabled` (set with `hushmic mode`), `mic_prefs` (model and strength per microphone) and `shortcuts_setup`, all managed by the app. The top-level `model` and `attn_limit` are the defaults for microphones without an entry in `mic_prefs`. `tray` and `notifications` are only written when false, `tray_icon` when it is not `auto`, `mic_prefs` when non-empty and `shortcuts_setup` when true, so a file from an older version stays unchanged.
 
 `SIGTERM`, `SIGINT` and `SIGHUP` all stop HushMic cleanly. There is no reload signal; use `hushmic config set`.

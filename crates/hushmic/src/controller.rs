@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{ActiveProfile, Config};
 use crate::pipewire;
 use directories::ProjectDirs;
 use std::os::unix::process::CommandExt;
@@ -485,15 +485,24 @@ pub struct Controller {
     /// restore attempt FAILS (daemon flap), so the prior default is retried
     /// later instead of being dropped.
     set_default_active: bool,
+    /// The user moved the default away from our node (see
+    /// `release_default`): no takeover until `reclaim_default`.
+    default_released: bool,
+    /// The takeover's write was confirmed (read back) — false while
+    /// `set_default_active` only records an attempt that did not land.
+    default_landed: bool,
     spawned_at: Option<Instant>,
     /// The mic the running child's conf pins (None = follows the system
     /// default). Set only once a child actually spawned; cleared by
     /// `disable()` — see [`Controller::active_mic`].
     active_mic: Option<String>,
-    /// The model the running child's conf names (the per-mic effective
-    /// model, not necessarily the global setting). Set on spawn, cleared by
-    /// `disable()`.
-    active_model: Option<String>,
+    /// Whose settings the running child's conf carries (the per-mic
+    /// profile in effect, or the globals) and their values. Set on spawn,
+    /// cleared by `disable()`.
+    active_profile: Option<ActiveProfile>,
+    /// The profile last announced in the log, so a restart onto the same
+    /// settings stays quiet.
+    logged_profile: Option<ActiveProfile>,
     /// The processing mode every spawn renders into the conf. Living here
     /// (not per-`enable` argument) is what makes the mode survive automatic
     /// restarts — mic recovery re-enabling the chain must never silently
@@ -511,11 +520,14 @@ impl Controller {
             child: None,
             prior_default: None,
             set_default_active: false,
+            default_released: false,
+            default_landed: false,
             spawned_at: None,
             active_mic: None,
             mode: RunMode::default(),
             tee: None,
-            active_model: None,
+            active_profile: None,
+            logged_profile: None,
         }
     }
 
@@ -540,13 +552,36 @@ impl Controller {
     /// The model the running chain was started with (per-mic profiles can
     /// differ from the global setting); None without a child.
     pub fn active_model(&self) -> Option<&str> {
-        self.active_model.as_deref()
+        self.active_profile.as_ref().map(|p| p.model.as_str())
     }
 
     /// The running chain is on the light model by configuration, so a
     /// reported `light` tier is not a degradation.
     pub fn active_model_is_light(&self) -> bool {
-        self.active_model.as_deref() == Some(LIGHT_MODEL)
+        self.active_model() == Some(LIGHT_MODEL)
+    }
+
+    /// Whose settings the running chain carries; None without a child.
+    pub fn active_profile(&self) -> Option<&ActiveProfile> {
+        self.active_profile.as_ref()
+    }
+
+    /// The default source changed under a follow-default chain to a device
+    /// whose settings equal the running ones: no restart needed, but the
+    /// settings now belong to that device (the tray label, `status` and
+    /// the next edit follow it). No-op without a child.
+    pub fn retarget_profile(&mut self, profile: ActiveProfile, name: Option<&str>) {
+        if self.active_profile.is_some() {
+            self.log_profile(&profile, name);
+            self.active_profile = Some(profile);
+        }
+    }
+
+    fn log_profile(&mut self, profile: &ActiveProfile, name: Option<&str>) {
+        if self.logged_profile.as_ref() != Some(profile) {
+            eprintln!("[hushmic] settings: {}", profile.describe(name));
+            self.logged_profile = Some(profile.clone());
+        }
     }
 
     /// The default source remembered before "Set as default microphone"
@@ -554,6 +589,49 @@ impl Controller {
     /// the default, and therefore the capture-repin expectation there.
     pub fn prior_default(&self) -> Option<&str> {
         self.prior_default.as_deref()
+    }
+
+    /// This run made `hushmic_source` the system default (and restores
+    /// the prior one on the next disable).
+    pub fn default_taken(&self) -> bool {
+        self.set_default_active
+    }
+
+    /// The user switched the system default away from `hushmic_source`
+    /// while this run held it: their pick sticks. The takeover ends
+    /// without restoring anything (the default already is what the user
+    /// wants), and no restart or quit takes it back until
+    /// [`Self::reclaim_default`] — the next deliberate start or toggle.
+    /// True when HushMic really had been the default (worth telling the
+    /// user); false for a takeover whose write never landed.
+    pub fn release_default(&mut self, to: &str) -> bool {
+        if !self.set_default_active {
+            return false;
+        }
+        let landed = self.default_landed;
+        if landed {
+            eprintln!(
+                "[hushmic] the default microphone was switched to {to}; leaving it \
+                 there until HushMic is turned on again"
+            );
+        } else {
+            eprintln!(
+                "[hushmic] the default microphone is {to}, not HushMic (the takeover \
+                 did not take); leaving it there until HushMic is turned on again"
+            );
+        }
+        self.set_default_active = false;
+        self.default_landed = false;
+        self.prior_default = None;
+        clear_persisted_prior_default();
+        self.default_released = true;
+        landed
+    }
+
+    /// A deliberate start, mode-on or "Set as default microphone" change:
+    /// `set_default` may take the default again.
+    pub fn reclaim_default(&mut self) {
+        self.default_released = false;
     }
 
     /// Seconds since the current child was spawned (None = no child). The
@@ -600,20 +678,21 @@ impl Controller {
         // which links to nothing and leaves the chain silent. Drop it so we
         // follow the system default instead — but only when the probe ran (a
         // failed probe keeps the saved mic; unknown is not gone).
-        let effective_mic = pipewire::resolve_effective_mic(
-            cfg.mic.as_deref(),
-            pipewire::sources_snapshot().as_deref(),
-        );
-        // Settings follow the ACTIVE device (per-mic profiles): the default
-        // source is only probed when the chain will follow it — the one case
-        // where its profile applies.
-        let default_source = if effective_mic.is_none() {
-            pipewire::get_default_source()
-        } else {
-            None
-        };
-        let (eff_model, eff_attn) =
-            cfg.effective_settings(effective_mic.as_deref(), default_source.as_deref());
+        // Settings follow the ACTIVE device (per-mic profiles): the pinned
+        // mic, or the default source when the chain follows it. disable()
+        // above handed the default back to the pre-takeover device; only a
+        // failed restore leaves that device in `prior_default`.
+        let target =
+            pipewire::resolve_chain_target(cfg.mic.as_deref(), self.prior_default.as_deref());
+        let effective_mic = target.mic;
+        let profile = cfg.profile_for(target.profile_device.as_deref());
+        let profile_name = profile.device.as_deref().and_then(|d| {
+            target
+                .sources
+                .as_deref()
+                .and_then(|v| pipewire::description_of(v, d))
+        });
+        let (eff_model, eff_attn) = (profile.model.clone(), profile.attn_limit);
 
         // Preflight the assets. A missing plugin/model/runtime otherwise fails
         // INSIDE the child where `flags = [ nofail ]` hides it completely: the
@@ -740,7 +819,8 @@ impl Controller {
         self.child = Some(child);
         self.spawned_at = Some(Instant::now());
         self.active_mic = effective_mic;
-        self.active_model = Some(adjusted.model.clone());
+        self.log_profile(&profile, profile_name);
+        self.active_profile = Some(profile);
 
         if cfg.set_default && !pipewire::can_set_default() {
             // One line, once: the toggle is hidden in the tray when the
@@ -756,7 +836,7 @@ impl Controller {
                 );
             });
         }
-        if cfg.set_default && pipewire::can_set_default() {
+        if cfg.set_default && pipewire::can_set_default() && !self.default_released {
             // Never repoint the system default at a node that never appeared:
             // wait (bounded) for hushmic_source to register first. On timeout
             // the user's default is left completely untouched — a broken
@@ -815,8 +895,12 @@ impl Controller {
         // would defeat it. State is deliberately NOT rolled back: the
         // breadcrumb and set_default_active make disable() restore/clear
         // whatever half-state the failed attempt left behind.
-        if let Err(e) = pipewire::set_default_source("hushmic_source") {
-            eprintln!("[hushmic] could not make hushmic_source the default microphone: {e}");
+        match pipewire::set_default_source("hushmic_source") {
+            Ok(()) => self.default_landed = true,
+            Err(e) => {
+                self.default_landed = false;
+                eprintln!("[hushmic] could not make hushmic_source the default microphone: {e}");
+            }
         }
     }
 
@@ -828,6 +912,7 @@ impl Controller {
         if cfg.set_default
             && pipewire::can_set_default()
             && !self.set_default_active
+            && !self.default_released
             && node_present
             && self.is_running()
         {
@@ -856,6 +941,7 @@ impl Controller {
             if restored {
                 self.prior_default = None;
                 self.set_default_active = false;
+                self.default_landed = false;
                 clear_persisted_prior_default();
             } else {
                 eprintln!(
@@ -886,7 +972,7 @@ impl Controller {
         }
         self.spawned_at = None;
         self.active_mic = None;
-        self.active_model = None;
+        self.active_profile = None;
         Ok(())
     }
 }

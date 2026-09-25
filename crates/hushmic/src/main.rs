@@ -372,11 +372,15 @@ fn cli_dispatch(args: &[String]) -> (i32, String) {
     // No daemon: the file is the truth.
     let model_dir = Paths::resolve().model_dir;
     let cfg = Config::load();
+    // model/attn_limit are the ones the device a start would use runs with.
+    let device = || config_cli::offline_device(&cfg);
     let res = match words.as_slice() {
-        ["config"] => config_cli::offline_get(&cfg, None, false),
-        ["config", "--json"] => config_cli::offline_get(&cfg, None, true),
-        ["config", "get", k] => config_cli::offline_get(&cfg, Some(k), false),
-        ["config", "get", k, "--json"] => config_cli::offline_get(&cfg, Some(k), true),
+        ["config"] => config_cli::offline_get(&cfg, None, false, device().as_deref()),
+        ["config", "--json"] => config_cli::offline_get(&cfg, None, true, device().as_deref()),
+        ["config", "get", k] => config_cli::offline_get(&cfg, Some(k), false, device().as_deref()),
+        ["config", "get", k, "--json"] => {
+            config_cli::offline_get(&cfg, Some(k), true, device().as_deref())
+        }
         ["config", "set", k, rest @ ..] if !rest.is_empty() => {
             config_cli::offline_set(k, &rest.join(" "), &model_dir)
         }
@@ -490,9 +494,42 @@ impl EngineCache {
     }
 }
 
+/// `(mic, device)`: the device a start would take its settings from, and
+/// the configured `mic` it was resolved for.
+type TargetCache = Option<(Option<String>, Option<String>)>;
+
+/// The device whose model and strength the tray, `status` and edits refer
+/// to: the running chain's (what its conf was rendered with), else the one
+/// a start would pick — from the cache the Tick keeps while no chain runs,
+/// probed only when that is missing or was resolved for another `mic`.
+/// None = no device (the defaults).
+fn settings_device(
+    cfg: &Config,
+    controller: &Controller,
+    cache: &mut TargetCache,
+) -> Option<String> {
+    if let Some(p) = controller.active_profile() {
+        return p.device.clone();
+    }
+    if let Some((mic, device)) = cache.as_ref() {
+        if *mic == cfg.mic {
+            return device.clone();
+        }
+    }
+    let device = pipewire::resolve_chain_target(cfg.mic.as_deref(), None).profile_device;
+    *cache = Some((cfg.mic.clone(), device.clone()));
+    device
+}
+
+/// A device's display name from the tray's mic list.
+fn device_name<'a>(mics: &'a [pipewire::Source], device: Option<&str>) -> Option<&'a str> {
+    device.and_then(|d| pipewire::description_of(mics, d))
+}
+
 /// After any settings change (tray menu or `config set`): one pw-dump
 /// snapshot refreshes the mic list and the node probe, and the tray gets
 /// the full state. The one place the post-change tray closure lives.
+#[allow(clippy::too_many_arguments)]
 fn refresh_tray(
     handle: &TrayLink,
     cfg: &Config,
@@ -501,6 +538,7 @@ fn refresh_tray(
     last_node_present: &mut Option<bool>,
     engine: &mut EngineCache,
     testing: bool,
+    target_cache: &mut TargetCache,
 ) {
     let nodes = pipewire::sources_snapshot();
     let node_present = nodes
@@ -513,6 +551,7 @@ fn refresh_tray(
     let status = compute_status(cfg, controller, node_present);
     let new_mics = known_mics.clone();
     let snapshot = cfg.clone();
+    let profile = cfg.profile_for(settings_device(cfg, controller, target_cache).as_deref());
     let fallback_now = cfg.enabled
         && cfg.mic.is_some()
         && controller.is_running()
@@ -528,6 +567,7 @@ fn refresh_tray(
     let landed = handle
         .update(move |t: &mut HushMicTray| {
             t.cfg = snapshot;
+            t.profile = profile;
             t.icon_style = icon_style;
             t.mics = new_mics;
             t.status = status;
@@ -846,6 +886,7 @@ fn main() {
     // block below and every Tick push the real state.
     let make_tray = |cfg: &Config, mics: &[pipewire::Source]| HushMicTray {
         cfg: cfg.clone(),
+        profile: cfg.profile_for(None),
         mics: mics.to_vec(),
         cmd_tx: ctx.clone(),
         status: TrayStatus::Off,
@@ -985,8 +1026,10 @@ fn main() {
     // above, and the first watchdog tick is 5 s out.
     {
         let status = compute_status(&cfg, &mut controller, pipewire::hushmic_source_present());
+        let profile = cfg.profile_for(settings_device(&cfg, &controller, &mut None).as_deref());
         let _ = handle.update(move |t: &mut HushMicTray| {
             t.status = status;
+            t.profile = profile;
         });
     }
 
@@ -1053,6 +1096,13 @@ fn main() {
     let mut repin_streak: u32 = 0;
     let mut repin_last: Option<Instant> = None;
     let mut repin_notified = false;
+    // Settings follow the default source (see the Tick arm).
+    let mut profile_follow = watchdog::ProfileFollow::new();
+    let mut default_release = watchdog::DefaultRelease::default();
+    // The device a start would take its settings from, as last seen with
+    // no chain running, and the `mic` it was resolved for — spares the
+    // main loop a pw-dump per status/config request (see settings_device).
+    let mut target_cache: TargetCache = None;
     // Shortcuts portal state: None until the worker's first report;
     // Some(false) makes Tick nudge a reconnect, throttled by the backoff.
     let mut shortcuts_up: Option<bool> = None;
@@ -1082,6 +1132,10 @@ fn main() {
                         continue;
                     }
                     Ok(control::Request::Status { json }) => {
+                        let profile = cfg.profile_for(
+                            settings_device(&cfg, &controller, &mut target_cache).as_deref(),
+                        );
+                        let saved = profile.device.clone().filter(|_| profile.saved);
                         let s = control::Status {
                             version: env!("CARGO_PKG_VERSION").to_string(),
                             mode: cfg.enabled.then(|| controller.mode()),
@@ -1091,8 +1145,13 @@ fn main() {
                                 && cfg.mic.is_some()
                                 && controller.is_running()
                                 && controller.active_mic() != cfg.mic.as_deref(),
-                            model: cfg.model.clone(),
-                            attn_limit: cfg.attn_limit,
+                            model: profile.model.clone(),
+                            attn_limit: profile.attn_limit,
+                            profile_name: device_name(&known_mics, saved.as_deref())
+                                .map(str::to_string),
+                            profile: saved,
+                            defaults_model: cfg.model.clone(),
+                            defaults_attn_limit: cfg.attn_limit,
                             chain_running: controller.is_running(),
                             node_present: last_node_present,
                             tray_sni: handle.is_sni(),
@@ -1120,8 +1179,13 @@ fn main() {
                         Event::Cmd(TrayCmd::Quit)
                     }
                     Ok(control::Request::ConfigGet { key, json }) => {
-                        let msg = match hushmic::config_cli::offline_get(&cfg, key.as_deref(), json)
-                        {
+                        let device = settings_device(&cfg, &controller, &mut target_cache);
+                        let msg = match hushmic::config_cli::offline_get(
+                            &cfg,
+                            key.as_deref(),
+                            json,
+                            device.as_deref(),
+                        ) {
                             Ok(s) => control::encode_ok(&s),
                             Err(e) => control::encode_err(&e),
                         };
@@ -1144,9 +1208,20 @@ fn main() {
                                 continue;
                             }
                         };
+                        // model/attn_limit land where the tray's edits do:
+                        // the device in use (see Config::set_model_for).
+                        let device = settings_device(&cfg, &controller, &mut target_cache);
                         let mut new = cfg.clone();
-                        cc::apply(&mut new, k, v);
+                        cc::apply(&mut new, k, v, device.as_deref());
                         let chain_changed = cc::diff(&cfg, &new).chain;
+                        if k == cc::Key::SetDefault {
+                            // Deliberate: may take the default again even
+                            // after the user switched it away.
+                            controller.reclaim_default();
+                        }
+                        // Resolved for the chain as it was; the change
+                        // may move or stop it.
+                        target_cache = None;
                         let res = apply_config(
                             &mut cfg,
                             new,
@@ -1160,7 +1235,7 @@ fn main() {
                         let mut line = format!(
                             "{} = {}{}",
                             k.name(),
-                            cc::get(&cfg, k),
+                            cc::get(&cfg, k, device.as_deref()),
                             cc::set_qualifier(k, true)
                         );
                         if matches!(k, cc::Key::Tray | cc::Key::TrayIcon) && headless {
@@ -1189,6 +1264,7 @@ fn main() {
                             &mut last_node_present,
                             &mut tray_engine,
                             testing,
+                            &mut target_cache,
                         );
                         continue;
                     }
@@ -1287,6 +1363,9 @@ fn main() {
         };
         match ev {
             Event::Cmd(cmd) => {
+                // Every command may move or stop the chain: the cached
+                // no-chain device is resolved again when needed.
+                target_cache = None;
                 // Any command that will re-render/restart the chain (or tear
                 // it down) invalidates a running mic test's cleaned leg —
                 // cancel it rather than let it record a dead node.
@@ -1323,6 +1402,11 @@ fn main() {
                 match cmd {
                     TrayCmd::SetMode(sel) => {
                         let old_sel = cfg.enabled.then(|| controller.mode());
+                        if sel.is_some() && !cfg.enabled {
+                            // Turned on deliberately: "Set as default
+                            // microphone" applies again.
+                            controller.reclaim_default();
+                        }
                         match sel {
                             None => {
                                 cfg.enabled = false;
@@ -1358,30 +1442,32 @@ fn main() {
                         prev_alive = control::update_prev_alive(prev_alive, old_sel, sel);
                     }
                     TrayCmd::SelectMic(m) => {
-                        // Loads the pick's saved profile into model/attn
-                        // (per-mic prefs); the snapshot pushed back below
-                        // updates the tray radios to match.
+                        // The restart applies the pick's profile; the
+                        // refresh below shows it in the radios.
                         cfg.apply_mic_selection(m);
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SelectModel(m) => {
-                        cfg.model = m;
-                        cfg.remember_selected_prefs();
+                        // Into the profile the radios showed: the device
+                        // in use (a new profile if it had none).
+                        let device = settings_device(&cfg, &controller, &mut target_cache);
+                        cfg.set_model_for(device.as_deref(), m);
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SetAttn(v) => {
-                        cfg.attn_limit = v;
-                        cfg.remember_selected_prefs();
+                        let device = settings_device(&cfg, &controller, &mut target_cache);
+                        cfg.set_attn_for(device.as_deref(), v);
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }
                     }
                     TrayCmd::SetDefaultToggle(v) => {
                         cfg.set_default = v;
+                        controller.reclaim_default();
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
                         }
@@ -1510,6 +1596,7 @@ fn main() {
                     &mut last_node_present,
                     &mut tray_engine,
                     testing,
+                    &mut target_cache,
                 );
             }
             Event::ShowWindow(env) => {
@@ -1628,6 +1715,7 @@ fn main() {
                                     &mut last_node_present,
                                     &mut tray_engine,
                                     testing,
+                                    &mut target_cache,
                                 );
                                 let shortcuts_now = shortcuts_up == Some(true);
                                 let _ = handle.update(move |t: &mut HushMicTray| {
@@ -1707,6 +1795,9 @@ fn main() {
                 // are far too rare to be the only refresh trigger), AND the
                 // capture-stream feeder check below.
                 let dump = pipewire::pw_dump();
+                // Whether the takeover predates this snapshot: the one
+                // that completes later in this tick is not in it.
+                let taken_before_dump = controller.default_taken();
                 let nodes = dump.as_deref().map(pipewire::parse_pwdump_nodes);
                 let node_present = nodes
                     .as_ref()
@@ -1977,6 +2068,117 @@ fn main() {
                     }
                 }
 
+                // --- per-mic profiles: a chain that follows the default
+                // source re-links on its own when the default moves, but
+                // its model and strength were rendered for the device it
+                // started on. watchdog::ProfileFollow decides (debounce,
+                // cooldown, compared against what the running chain
+                // resolved); this only gathers the facts and executes.
+                // With "Set as default microphone" active the chain
+                // follows the pre-takeover device. A user who switches the
+                // default away from HushMic keeps that switch: the
+                // takeover is released first (watchdog::DefaultRelease),
+                // so neither the settings restart nor a quit takes the
+                // default back — until the next deliberate start.
+                // No deferral while an app records: the wrong settings
+                // for a whole call are worse than one short gap.
+                let settling = controller
+                    .secs_since_spawn()
+                    .is_some_and(|s| s < STARTUP_GRACE_SECS);
+                let moved_to = dump
+                    .as_deref()
+                    .and_then(pipewire::parse_configured_default_source)
+                    .filter(|d| hushmic::config::can_own_profile(d));
+                if default_release.observe(
+                    taken_before_dump && controller.default_taken(),
+                    moved_to.is_some(),
+                    settling,
+                ) {
+                    if let Some(to) = &moved_to {
+                        if controller.release_default(to) {
+                            let name = nodes
+                                .as_deref()
+                                .and_then(|v| pipewire::description_of(v, to))
+                                .unwrap_or(to);
+                            notify::send(
+                                Slot::Status,
+                                "audio-input-microphone",
+                                &tr!("notify-default-released-summary"),
+                                &tr!("notify-default-released-body", device = name),
+                            );
+                        }
+                    }
+                }
+                let running = controller.active_profile().cloned();
+                let following = cfg.enabled
+                    && !down
+                    && controller.is_running()
+                    && controller.active_mic().is_none()
+                    && running.is_some();
+                let observed = dump
+                    .as_deref()
+                    .and_then(|d| pipewire::followed_default(d, controller.prior_default()));
+                let want = observed.as_deref().map(|o| cfg.profile_for(Some(o)));
+                let same_settings = match (&want, &running) {
+                    (Some(w), Some(r)) => w.model == r.model && w.attn_limit == r.attn_limit,
+                    _ => false,
+                };
+                let action = profile_follow.observe(watchdog::ProfileFacts {
+                    following,
+                    in_grace: settling,
+                    running: running.as_ref().and_then(|r| r.device.as_deref()),
+                    observed: observed.as_deref().map(Some),
+                    same_settings,
+                });
+                if let (Some(observed), Some(want)) = (observed.as_deref(), want) {
+                    let name = nodes
+                        .as_deref()
+                        .and_then(|v| pipewire::description_of(v, observed))
+                        .map(str::to_string);
+                    match action {
+                        watchdog::ProfileAction::Keep => {}
+                        watchdog::ProfileAction::Retarget => {
+                            controller.retarget_profile(want, name.as_deref());
+                        }
+                        watchdog::ProfileAction::GiveUp => {
+                            eprintln!(
+                                "[hushmic] the default microphone is {} but restarts \
+                                 keep landing on another device; keeping the running \
+                                 settings",
+                                name.as_deref().unwrap_or(observed)
+                            );
+                        }
+                        watchdog::ProfileAction::Restart => {
+                            eprintln!(
+                                "[hushmic] default microphone is now {}; restarting \
+                                 the chain with its settings",
+                                name.as_deref().unwrap_or(observed)
+                            );
+                            // Same invalidation as a settings change.
+                            if testing {
+                                if let Some(c) = &mictest_cancel {
+                                    c.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            close_ab_window(&mut ab_window);
+                            match controller.enable(&cfg) {
+                                Ok(()) => schedule_early_tick(&tx),
+                                Err(e) => {
+                                    eprintln!("hushmic: enable failed: {e}");
+                                    if gate.on_enable_error(&e.to_string(), false) {
+                                        notify::send(
+                                            Slot::Status,
+                                            "dialog-error",
+                                            &fail_summary(),
+                                            &e.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // reflect liveness in the tray status (icon + title) every tick
                 let status = compute_status(&cfg, &mut controller, node_present);
                 let testing_now = testing;
@@ -1984,10 +2186,30 @@ fn main() {
                     && cfg.mic.is_some()
                     && controller.is_running()
                     && controller.active_mic() != cfg.mic.as_deref();
+                // Whose settings the radios show: the running chain's, or
+                // with none, the device a start would use (from this
+                // tick's snapshot — no extra probe).
+                let shown_device = match controller.active_profile() {
+                    Some(p) => Some(p.device.clone()),
+                    None => dump.as_deref().map(|d| {
+                        let mic =
+                            pipewire::resolve_effective_mic(cfg.mic.as_deref(), nodes.as_deref());
+                        let followed = pipewire::followed_default(d, None);
+                        let device =
+                            hushmic::config::profile_owner(mic.as_deref(), followed.as_deref())
+                                .map(str::to_string);
+                        target_cache = Some((cfg.mic.clone(), device.clone()));
+                        device
+                    }),
+                };
+                let profile = shown_device.map(|d| cfg.profile_for(d.as_deref()));
                 let _ = handle.update(move |t: &mut HushMicTray| {
                     t.status = status;
                     t.testing = testing_now;
                     t.fallback_active = fallback_now;
+                    if let Some(p) = profile {
+                        t.profile = p;
+                    }
                 });
             }
             Event::Shutdown => {

@@ -25,8 +25,12 @@ pub struct Report {
     pub enabled: bool,
     pub preferred_mic: Option<String>,
     pub active_mic: Option<String>,
+    /// The model and strength in effect (the active profile's, see
+    /// `Config::active_profile`) and the device whose saved profile that
+    /// is, by display name; None = the defaults apply.
     pub model: String,
     pub attn_limit: f32,
+    pub profile: Option<String>,
     pub set_default: bool,
     /// Saved per-mic profiles (config `mic_prefs` entries).
     pub mic_profiles: usize,
@@ -80,7 +84,25 @@ pub fn collect() -> Report {
     let prefix = std::env::current_exe()
         .ok()
         .and_then(|e| crate::controller::prefix_of(&e));
-    let model_path = paths.model_dir.join(format!("{}.onnx", cfg.model));
+    let prior_default = crate::controller::persisted_prior_default();
+    // With our own node as the default, a follow-default chain runs on the
+    // pre-takeover device — its profile is the one in effect.
+    let target =
+        crate::pipewire::resolve_chain_target(cfg.mic.as_deref(), prior_default.as_deref());
+    let profile = cfg.profile_for(target.profile_device.as_deref());
+    let profile_name = profile
+        .device
+        .as_deref()
+        .filter(|_| profile.saved)
+        .map(|d| {
+            target
+                .sources
+                .as_deref()
+                .and_then(|v| crate::pipewire::description_of(v, d))
+                .unwrap_or(d)
+                .to_string()
+        });
+    let model_path = paths.model_dir.join(format!("{}.onnx", profile.model));
     // Momentarily acquiring the lock is harmless (LOCK_NB; drop releases):
     // acquired = nothing was holding it. Err (unreadable path, foreign
     // owner) reads as "not running" — conservative, since the node-absent
@@ -104,8 +126,9 @@ pub fn collect() -> Report {
         enabled: cfg.enabled,
         preferred_mic: cfg.mic.clone(),
         active_mic: crate::pipewire::resolve_effective_mic(cfg.mic.as_deref(), snapshot.as_deref()),
-        model: cfg.model.clone(),
-        attn_limit: cfg.attn_limit,
+        model: profile.model.clone(),
+        attn_limit: profile.attn_limit,
+        profile: profile_name,
         set_default: cfg.set_default,
         mic_profiles: cfg.mic_prefs.len(),
         sources: snapshot.as_deref().map(|v| {
@@ -149,7 +172,7 @@ pub fn collect() -> Report {
         latency_reported: crate::pipewire::chain_reported_latency(),
         capture_feeders: crate::pipewire::pw_dump()
             .map(|d| crate::pipewire::parse_feeders(&d, "hushmic_input")),
-        prior_default: crate::controller::persisted_prior_default(),
+        prior_default,
         chain_quantum_pin: dump
             .as_deref()
             .and_then(crate::pipewire::chain_pins_quantum),
@@ -221,6 +244,14 @@ pub fn render(r: &Report) -> (String, usize) {
         &mut out,
         false,
         format!("  attenuation limit: {} dB", r.attn_limit),
+    );
+    line(
+        &mut out,
+        false,
+        match &r.profile {
+            Some(p) => format!("  settings: {p} profile"),
+            None => "  settings: defaults".to_string(),
+        },
     );
     line(&mut out, false, format!("  set default: {}", r.set_default));
     line(
@@ -678,6 +709,7 @@ mod tests {
             active_mic: None,
             model: "dpdfnet8_48khz_hr".into(),
             attn_limit: 100.0,
+            profile: Some("RODE NT-USB".into()),
             set_default: true,
             mic_profiles: 1,
             sources: Some(vec!["RODE NT-USB".into(), "Webcam C920".into()]),
@@ -916,9 +948,19 @@ mod tests {
             "pw-dump",
             "chain up",
             "per-mic profiles: 1",
+            "settings: RODE NT-USB profile",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn settings_line_says_whose_settings_apply() {
+        let mut r = healthy();
+        r.profile = None;
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0);
+        assert!(text.contains("  settings: defaults\n"), "{text}");
     }
 
     #[test]

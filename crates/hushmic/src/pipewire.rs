@@ -201,9 +201,25 @@ pub fn parse_feeders(stdout: &str, node_name: &str) -> Vec<String> {
 /// streams to — over the `configured` preference: live dumps can carry
 /// either key alone. Pure — no I/O.
 pub fn parse_default_source(stdout: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let (effective, configured) = parse_default_keys(stdout);
+    effective.or(configured)
+}
+
+/// The CONFIGURED default source of a `pw-dump` snapshot (the user's
+/// pick, as opposed to the effective one WirePlumber computed). Pure.
+pub fn parse_configured_default_source(stdout: &str) -> Option<String> {
+    parse_default_keys(stdout).1
+}
+
+/// Both default-source keys of a `pw-dump` snapshot: (effective,
+/// configured). Pure.
+fn parse_default_keys(stdout: &str) -> (Option<String>, Option<String>) {
+    let Ok(serde_json::Value::Array(v)) = serde_json::from_str(stdout) else {
+        return (None, None);
+    };
+    let mut effective = None;
     let mut configured = None;
-    for o in v.as_array()? {
+    for o in &v {
         if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Metadata") {
             continue;
         }
@@ -223,10 +239,8 @@ pub fn parse_default_source(stdout: &str) -> Option<String> {
                 .and_then(|v| v.get("name"))
                 .and_then(|n| n.as_str());
             match e.get("key").and_then(|k| k.as_str()) {
-                Some("default.audio.source") => {
-                    if let Some(n) = name {
-                        return Some(n.to_string());
-                    }
+                Some("default.audio.source") if effective.is_none() => {
+                    effective = name.map(str::to_string);
                 }
                 Some("default.configured.audio.source") => {
                     configured = name.map(str::to_string);
@@ -235,7 +249,7 @@ pub fn parse_default_source(stdout: &str) -> Option<String> {
             }
         }
     }
-    configured
+    (effective, configured)
 }
 
 /// The mic the capture stream is EXPECTED to be fed by: the pinned mic,
@@ -610,6 +624,86 @@ pub fn resolve_effective_mic(cfg_mic: Option<&str>, snapshot: Option<&[Source]>)
         (Some(m), None) => Some(m.to_string()),
         (Some(m), Some(srcs)) => srcs.iter().any(|s| s.name == m).then(|| m.to_string()),
     }
+}
+
+/// The source a chain that follows the system default captures from, as
+/// far as per-mic profiles go: the snapshot's effective default (the one
+/// WirePlumber links streams to), else the configured one. When the
+/// CONFIGURED default is our own node, the answer is `fallback` (with
+/// "Set as default microphone" on, the pre-takeover device the chain
+/// follows) if the snapshot has it, or nobody: the effective key may name any device while our
+/// node comes and goes, and which one would be a race. Never a node that
+/// cannot own a profile. Pure.
+pub fn followed_default(dump: &str, fallback: Option<&str>) -> Option<String> {
+    let usable = |d: &String| crate::config::can_own_profile(d);
+    // Only a device that is there: an unplugged pre-takeover default is
+    // not what the chain captures from (WirePlumber fell back to another
+    // one), and naming it would make every tick see a change.
+    let fallback = || {
+        fallback
+            .map(str::to_string)
+            .filter(usable)
+            .filter(|f| parse_pwdump_nodes(dump).iter().any(|s| &s.name == f))
+    };
+    let (effective, configured) = parse_default_keys(dump);
+    if configured
+        .as_deref()
+        .is_some_and(|d| d.starts_with("hushmic_"))
+    {
+        return fallback();
+    }
+    effective
+        .filter(usable)
+        .or_else(|| configured.filter(usable))
+        .or_else(fallback)
+}
+
+/// What a chain started now runs on.
+pub struct ChainTarget {
+    /// The effective mic (see [`resolve_effective_mic`]); None = follows
+    /// the default source.
+    pub mic: Option<String>,
+    /// The device whose settings apply (see `config::profile_owner`).
+    pub profile_device: Option<String>,
+    /// The snapshot both came from; None = probe failed.
+    pub sources: Option<Vec<Source>>,
+}
+
+/// Resolve [`ChainTarget`] from one pw-dump; follow-default as in
+/// [`followed_default`], with `restore_target` the pre-takeover default.
+/// Without a snapshot, the configured default alone decides.
+pub fn resolve_chain_target(cfg_mic: Option<&str>, restore_target: Option<&str>) -> ChainTarget {
+    let usable = |d: &String| crate::config::can_own_profile(d);
+    let dump = pw_dump();
+    let sources = dump.as_deref().map(parse_pwdump_nodes);
+    let mic = resolve_effective_mic(cfg_mic, sources.as_deref());
+    let followed = if mic.is_some() {
+        None
+    } else {
+        let restore = || restore_target.map(str::to_string).filter(usable);
+        match dump.as_deref() {
+            Some(d) => followed_default(d, restore_target),
+            None => match get_default_source() {
+                Some(c) if c.starts_with("hushmic_") => restore(),
+                c => c.filter(usable).or_else(restore),
+            },
+        }
+    };
+    let profile_device =
+        crate::config::profile_owner(mic.as_deref(), followed.as_deref()).map(str::to_string);
+    ChainTarget {
+        mic,
+        profile_device,
+        sources,
+    }
+}
+
+/// A source's description for display, when the snapshot has it.
+pub fn description_of<'a>(sources: &'a [Source], name: &str) -> Option<&'a str> {
+    sources
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.description.as_str())
 }
 
 /// Whether the running PipeWire honors `target.object` in a filter-chain

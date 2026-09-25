@@ -530,6 +530,72 @@ fn default_source_parses_from_the_dump_metadata() {
     assert_eq!(parse_default_source("not json"), None);
 }
 
+/// "Set as default microphone" active: our node is both keys.
+const META_DUMP_TAKEN: &str = r#"[
+  { "id": 46, "type": "PipeWire:Interface:Node",
+    "info": { "props": { "media.class": "Audio/Source",
+      "node.name": "alsa_input.rode", "node.description": "RODE NT-USB" } } },
+  { "type": "PipeWire:Interface:Metadata", "id": 30,
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      { "subject": 0, "key": "default.configured.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "hushmic_source" } },
+      { "subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "hushmic_source" } }
+    ] }
+]"#;
+
+/// Our node configured as the default, but the effective key still names
+/// another device (our node restarting): which one is a race.
+const META_DUMP_TAKEN_RACING: &str = r#"[
+  { "id": 46, "type": "PipeWire:Interface:Node",
+    "info": { "props": { "media.class": "Audio/Source",
+      "node.name": "alsa_input.rode", "node.description": "RODE NT-USB" } } },
+  { "type": "PipeWire:Interface:Metadata", "id": 30,
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      { "subject": 0, "key": "default.configured.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "hushmic_source" } },
+      { "subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON",
+        "value": { "name": "alsa_input.whatever" } }
+    ] }
+]"#;
+
+#[test]
+fn profile_default_is_a_real_device_or_the_fallback() {
+    use hushmic::pipewire::followed_default;
+    let s = |v: &str| Some(v.to_string());
+    // A real device as the default: that device.
+    assert_eq!(
+        followed_default(META_DUMP_CONFIGURED_ONLY, Some("x")),
+        s("alsa_input.usb-mic")
+    );
+    // Effective key on our node, configured on a device: the device.
+    assert_eq!(followed_default(META_DUMP, None), s("stale_configured"));
+    // Our node configured: the pre-takeover device the chain follows, or
+    // nobody (the defaults) — never whatever the effective key says.
+    for dump in [META_DUMP_TAKEN, META_DUMP_TAKEN_RACING] {
+        assert_eq!(
+            followed_default(dump, Some("alsa_input.rode")),
+            s("alsa_input.rode")
+        );
+        assert_eq!(followed_default(dump, None), None);
+        assert_eq!(followed_default(dump, Some("hushmic_source")), None);
+    }
+    // The pre-takeover device unplugged (a docked mic, undocked): not
+    // what the chain captures from — nobody, never the absent device.
+    let undocked = META_DUMP_TAKEN.replace("alsa_input.rode", "alsa_input.other");
+    assert_eq!(followed_default(&undocked, Some("alsa_input.rode")), None);
+    // No default at all: the fallback when it is there; no dump: nothing.
+    let no_default = r#"[
+  { "id": 46, "type": "PipeWire:Interface:Node",
+    "info": { "props": { "media.class": "Audio/Source", "node.name": "a" } } }
+]"#;
+    assert_eq!(followed_default(no_default, s("a").as_deref()), s("a"));
+    assert_eq!(followed_default("[]", s("a").as_deref()), None);
+    assert_eq!(followed_default("not json", None), None);
+}
+
 #[test]
 fn repin_expectation_never_resolves_to_our_own_node() {
     use hushmic::pipewire::repin_want;

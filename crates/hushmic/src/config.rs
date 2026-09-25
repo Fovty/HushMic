@@ -54,13 +54,60 @@ impl<'de> Deserialize<'de> for TrayIcon {
     }
 }
 
-/// One microphone's remembered settings. Keyed by
-/// `node.name` in [`Config::mic_prefs`]; the globals stay as the
-/// System-default settings and the fallback for mics without an entry.
+/// One microphone's remembered settings. Keyed by `node.name` in
+/// [`Config::mic_prefs`]; the globals are the settings for every device
+/// without an entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MicPrefs {
     pub model: String,
     pub attn_limit: f32,
+}
+
+/// Whose model and strength are in effect: the device they belong to and
+/// the values. Built by [`Config::profile_for`] / [`Config::active_profile`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveProfile {
+    /// The device in use (node.name); None when no device can own a
+    /// profile (default source unknown, or our own node). Where edits land
+    /// is [`Config::edit_target`].
+    pub device: Option<String>,
+    /// `device` has a saved entry; false = it runs on the globals.
+    pub saved: bool,
+    pub model: String,
+    pub attn_limit: f32,
+}
+
+impl ActiveProfile {
+    /// The log's description, e.g. `RODE NT-USB profile
+    /// (dpdfnet8, 100 dB)`; `name` is the device's display name.
+    pub fn describe(&self, name: Option<&str>) -> String {
+        let short = self.model.split('_').next().unwrap_or(&self.model);
+        let whose = match (name.or(self.device.as_deref()), self.saved) {
+            (Some(n), true) => format!("{n} profile"),
+            (Some(n), false) => format!("defaults for {n}"),
+            (None, _) => "defaults".to_string(),
+        };
+        format!("{whose} ({short}, {} dB)", self.attn_limit)
+    }
+}
+
+/// Whether a source may own a per-mic profile: a real capture device, never
+/// one of HushMic's own nodes (with "Set as default microphone" on, the
+/// default source IS our output) nor a monitor.
+pub fn can_own_profile(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with("hushmic_") && !name.ends_with(".monitor")
+}
+
+/// The device whose settings apply: the pinned mic the chain runs on, else
+/// the default source it follows. Pinned wins even without a profile — the
+/// default source is not in use then.
+pub fn profile_owner<'a>(
+    effective_mic: Option<&'a str>,
+    followed_default: Option<&'a str>,
+) -> Option<&'a str> {
+    effective_mic
+        .or(followed_default)
+        .filter(|d| can_own_profile(d))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,52 +219,79 @@ impl Config {
             p.attn_limit = clamp(p.attn_limit);
         }
     }
-    /// Select a mic (or System default): sets `mic`, and when the pick has
-    /// a saved profile, loads it into the tray-visible `model`/`attn_limit`.
-    /// A pick WITHOUT a profile keeps the current values and creates no
-    /// entry (entries appear only when settings are changed under a mic).
+    /// Select a mic (or System default). Only `mic` changes: the pick's
+    /// saved profile (or the defaults) applies through [`Self::profile_for`]
+    /// once the chain restarts on it, so the defaults for devices without a
+    /// profile never pick up another device's values.
     pub fn apply_mic_selection(&mut self, pick: Option<String>) {
-        if let Some(p) = pick.as_deref().and_then(|m| self.mic_prefs.get(m)) {
-            self.model = p.model.clone();
-            self.attn_limit = p.attn_limit;
-        }
         self.mic = pick;
     }
 
-    /// After a `model`/`attn_limit` change: upsert the selected mic's
-    /// profile. No-op in System-default mode — globals are that profile.
-    pub fn remember_selected_prefs(&mut self) {
-        if let Some(m) = &self.mic {
-            self.mic_prefs.insert(
-                m.clone(),
-                MicPrefs {
-                    model: self.model.clone(),
-                    attn_limit: self.attn_limit,
-                },
-            );
+    /// The settings `device` runs with: its saved profile, or the globals
+    /// when it has none (or when no device can own a profile at all).
+    pub fn profile_for(&self, device: Option<&str>) -> ActiveProfile {
+        let device = device.filter(|d| can_own_profile(d));
+        match device.and_then(|d| self.mic_prefs.get(d)) {
+            Some(p) => ActiveProfile {
+                device: device.map(str::to_string),
+                saved: true,
+                model: p.model.clone(),
+                attn_limit: p.attn_limit,
+            },
+            None => ActiveProfile {
+                device: device.map(str::to_string),
+                saved: false,
+                model: self.model.clone(),
+                attn_limit: self.attn_limit,
+            },
         }
     }
 
-    /// The (model, attn_limit) the chain should run with, following the
-    /// ACTIVE device: the pinned mic's profile; in follow-default mode the
-    /// current default source's profile if one exists; otherwise the
-    /// globals. The only place profile lookup happens.
-    pub fn effective_settings(
+    /// The profile in effect for a chain on `effective_mic` (None = it
+    /// follows the default source, which is `followed_default`). The one
+    /// place that decides whose settings apply — the chain, the tray,
+    /// `status` and `--doctor` all come through here.
+    pub fn active_profile(
         &self,
         effective_mic: Option<&str>,
-        default_source: Option<&str>,
-    ) -> (String, f32) {
-        let profile = match effective_mic {
-            // Pinned: the mic's own profile or the globals — never the
-            // default source's (that device is not in use).
-            Some(m) => self.mic_prefs.get(m),
-            // Follow-default (incl. recovery fallback): the active device
-            // IS the default source; honor its profile when known.
-            None => default_source.and_then(|d| self.mic_prefs.get(d)),
-        };
-        match profile {
-            Some(p) => (p.model.clone(), p.attn_limit),
-            None => (self.model.clone(), self.attn_limit),
+        followed_default: Option<&str>,
+    ) -> ActiveProfile {
+        self.profile_for(profile_owner(effective_mic, followed_default))
+    }
+
+    /// Where a model/strength edit for the device in use lands: that
+    /// device's profile when it has one, or when it is the pinned mic (the
+    /// edit then creates its profile); None = the defaults, which every
+    /// device without a profile runs with.
+    pub fn edit_target<'a>(&self, device: Option<&'a str>) -> Option<&'a str> {
+        device.filter(|d| {
+            can_own_profile(d)
+                && (self.mic_prefs.contains_key(*d) || self.mic.as_deref() == Some(d))
+        })
+    }
+
+    /// A model change from the tray or `config set`, for the device in
+    /// use; see [`Self::edit_target`].
+    pub fn set_model_for(&mut self, device: Option<&str>, model: String) {
+        *self.settings_mut(device).0 = model;
+    }
+
+    /// A strength change; same routing as [`Self::set_model_for`].
+    pub fn set_attn_for(&mut self, device: Option<&str>, attn_limit: f32) {
+        *self.settings_mut(device).1 = attn_limit;
+    }
+
+    fn settings_mut(&mut self, device: Option<&str>) -> (&mut String, &mut f32) {
+        match self.edit_target(device) {
+            Some(d) => {
+                let seed = MicPrefs {
+                    model: self.model.clone(),
+                    attn_limit: self.attn_limit,
+                };
+                let p = self.mic_prefs.entry(d.to_string()).or_insert(seed);
+                (&mut p.model, &mut p.attn_limit)
+            }
+            None => (&mut self.model, &mut self.attn_limit),
         }
     }
 
@@ -369,80 +443,149 @@ mod tests {
     }
 
     #[test]
-    fn selection_loads_the_profile_and_keeps_values_otherwise() {
+    fn selection_changes_only_the_mic() {
         let mut c = with_entry("rode", "dpdfnet2_48khz_hr", 24.0);
-        c.model = "dpdfnet8_48khz_hr".into();
-        c.attn_limit = 100.0;
         c.apply_mic_selection(Some("rode".into()));
         assert_eq!(c.mic.as_deref(), Some("rode"));
-        assert_eq!(c.model, "dpdfnet2_48khz_hr");
-        assert_eq!(c.attn_limit, 24.0);
-        // A mic without a profile: values carry over, no phantom entry.
+        // The profile applies through the resolver, not by being copied
+        // into the defaults every other device runs with.
+        assert_eq!(c.model, "dpdfnet8_48khz_hr");
+        assert_eq!(c.attn_limit, 100.0);
+        assert_eq!(c.active_profile(Some("rode"), None).attn_limit, 24.0);
         c.apply_mic_selection(Some("webcam".into()));
-        assert_eq!(c.model, "dpdfnet2_48khz_hr");
-        assert_eq!(c.attn_limit, 24.0);
         assert!(!c.mic_prefs.contains_key("webcam"));
-        // Back to System default: globals untouched by the switch itself.
         c.apply_mic_selection(None);
         assert_eq!(c.mic, None);
-        assert_eq!(c.attn_limit, 24.0);
     }
 
-    #[test]
-    fn changes_upsert_only_under_a_pinned_mic() {
-        let mut c = Config {
-            mic: Some("rode".into()),
-            attn_limit: 24.0,
-            ..Config::default()
-        };
-        c.remember_selected_prefs();
-        assert_eq!(c.mic_prefs["rode"].attn_limit, 24.0);
-        c.attn_limit = 12.0;
-        c.remember_selected_prefs();
-        assert_eq!(c.mic_prefs["rode"].attn_limit, 12.0);
-        // System-default mode: globals ARE the profile — no entry appears.
-        c.mic = None;
-        c.attn_limit = 6.0;
-        c.remember_selected_prefs();
-        assert_eq!(c.mic_prefs.len(), 1);
-        assert_eq!(c.mic_prefs["rode"].attn_limit, 12.0);
-    }
-
-    #[test]
-    fn effective_settings_follow_the_active_device() {
-        let mut c = with_entry("rode", "dpdfnet2_48khz_hr", 24.0);
+    /// The reported setup: nothing pinned, defaults dpdfnet2/24, a RODE
+    /// profile dpdfnet8/100 and a Jabra profile dpdfnet2/24.
+    fn reported_setup() -> Config {
+        let mut c = with_entry("rode", "dpdfnet8_48khz_hr", 100.0);
         c.mic_prefs.insert(
-            "builtin".into(),
+            "jabra".into(),
             MicPrefs {
-                model: "dpdfnet8_48khz_hr".into(),
-                attn_limit: 6.0,
+                model: "dpdfnet2_48khz_hr".into(),
+                attn_limit: 24.0,
             },
         );
-        c.model = "dpdfnet8_48khz_hr".into();
-        c.attn_limit = 100.0;
-        // Pinned with a profile.
+        c.model = "dpdfnet2_48khz_hr".into();
+        c.attn_limit = 24.0;
+        c
+    }
+
+    #[test]
+    fn active_profile_in_every_mode() {
+        let c = reported_setup();
+        let p = |m: &str, a: f32| (m.to_string(), a);
+        let got = |ap: ActiveProfile| (ap.model, ap.attn_limit);
+        // Follow-default: the default source's profile.
+        let a = c.active_profile(None, Some("rode"));
+        assert_eq!((a.device.as_deref(), a.saved), (Some("rode"), true));
+        assert_eq!(got(a), p("dpdfnet8_48khz_hr", 100.0));
         assert_eq!(
-            c.effective_settings(Some("rode"), Some("builtin")),
-            ("dpdfnet2_48khz_hr".into(), 24.0)
+            got(c.active_profile(None, Some("jabra"))),
+            p("dpdfnet2_48khz_hr", 24.0)
         );
-        // Pinned without a profile: globals (NOT the default's profile).
+        // Follow-default on a device without a profile: the defaults, but
+        // the device is still the one in use (edits will land there).
+        let a = c.active_profile(None, Some("webcam"));
+        assert_eq!((a.device.as_deref(), a.saved), (Some("webcam"), false));
+        assert_eq!(got(a), p("dpdfnet2_48khz_hr", 24.0));
+        // Pinned: the pinned mic's profile — never the default source's.
         assert_eq!(
-            c.effective_settings(Some("webcam"), Some("builtin")),
-            ("dpdfnet8_48khz_hr".into(), 100.0)
+            got(c.active_profile(Some("rode"), Some("jabra"))),
+            p("dpdfnet8_48khz_hr", 100.0)
         );
-        // Follow-default with the default's profile (recovery fallback).
+        let a = c.active_profile(Some("webcam"), Some("rode"));
+        assert_eq!((a.device.as_deref(), a.saved), (Some("webcam"), false));
+        assert_eq!(got(a), p("dpdfnet2_48khz_hr", 24.0));
+        // Unknown default, our own node, a monitor: nobody owns the
+        // settings, the defaults apply.
+        for d in [None, Some("hushmic_source"), Some("alsa_output.x.monitor")] {
+            let a = c.active_profile(None, d);
+            assert_eq!(a.device, None, "{d:?}");
+            assert!(!a.saved);
+            assert_eq!(got(a), p("dpdfnet2_48khz_hr", 24.0), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn edits_land_in_the_settings_in_effect() {
+        let mut c = reported_setup();
+        // The reported bug: RODE is the default, the tray edit must reach
+        // the RODE profile the chain runs — not the defaults.
+        c.set_attn_for(Some("rode"), 12.0);
+        assert_eq!(c.mic_prefs["rode"].attn_limit, 12.0);
+        assert_eq!(c.attn_limit, 24.0);
+        assert_eq!(c.active_profile(None, Some("rode")).attn_limit, 12.0);
+        c.set_model_for(Some("rode"), "dpdfnet2_48khz_hr".into());
+        assert_eq!(c.mic_prefs["rode"].model, "dpdfnet2_48khz_hr");
+        assert_eq!(c.mic_prefs["rode"].attn_limit, 12.0);
+        // Following the default onto a device without a profile: the
+        // defaults are in effect, so the edit changes them.
+        c.set_attn_for(Some("webcam"), 6.0);
+        assert!(!c.mic_prefs.contains_key("webcam"));
+        assert_eq!(c.attn_limit, 6.0);
+        assert_eq!(c.mic_prefs["jabra"].attn_limit, 24.0);
+    }
+
+    #[test]
+    fn an_edit_on_the_pinned_mic_creates_its_profile() {
+        let mut c = reported_setup();
+        c.mic = Some("webcam".into());
+        assert_eq!(c.edit_target(Some("webcam")), Some("webcam"));
+        c.set_attn_for(Some("webcam"), 6.0);
+        // Seeded from the defaults it ran with: only the edit differs.
         assert_eq!(
-            c.effective_settings(None, Some("builtin")),
-            ("dpdfnet8_48khz_hr".into(), 6.0)
+            c.mic_prefs["webcam"],
+            MicPrefs {
+                model: "dpdfnet2_48khz_hr".into(),
+                attn_limit: 6.0
+            }
         );
-        // Follow-default without a profile / unknown default: globals.
+        assert_eq!(c.attn_limit, 24.0);
+        // Pinned mic unplugged, chain on the default: that device's
+        // profile or the defaults, never a new entry.
+        assert_eq!(c.edit_target(Some("other")), None);
+        assert_eq!(c.edit_target(Some("jabra")), Some("jabra"));
+    }
+
+    #[test]
+    fn edits_without_an_owner_change_the_defaults() {
+        let mut c = reported_setup();
+        let before = c.mic_prefs.clone();
+        for d in [None, Some("hushmic_source"), Some("x.monitor"), Some("")] {
+            // Not even when pinned: our own node never gets a profile.
+            c.mic = d.map(str::to_string);
+            c.set_attn_for(d, 6.0);
+            c.set_model_for(d, "dpdfnet8_48khz_hr".into());
+        }
+        assert_eq!(c.mic_prefs, before, "no profile for our node or None");
+        assert_eq!(c.attn_limit, 6.0);
+        assert_eq!(c.model, "dpdfnet8_48khz_hr");
+    }
+
+    #[test]
+    fn describe_names_whose_settings_apply() {
+        let c = reported_setup();
         assert_eq!(
-            c.effective_settings(None, Some("other")),
-            ("dpdfnet8_48khz_hr".into(), 100.0)
+            c.active_profile(None, Some("rode"))
+                .describe(Some("RODE NT-USB")),
+            "RODE NT-USB profile (dpdfnet8, 100 dB)"
         );
         assert_eq!(
-            c.effective_settings(None, None),
-            ("dpdfnet8_48khz_hr".into(), 100.0)
+            c.active_profile(None, Some("jabra")).describe(None),
+            "jabra profile (dpdfnet2, 24 dB)"
+        );
+        assert_eq!(
+            c.active_profile(None, Some("webcam"))
+                .describe(Some("Webcam")),
+            "defaults for Webcam (dpdfnet2, 24 dB)"
+        );
+        assert_eq!(
+            c.active_profile(None, None).describe(None),
+            "defaults (dpdfnet2, 24 dB)"
         );
     }
 }

@@ -174,6 +174,13 @@ notify-running-again-body = The virtual microphone is back up.
 notify-reroute-summary = Another app is re-routing HushMic's microphone
 notify-reroute-body = A running audio tool (EasyEffects?) keeps redirecting HushMic's input to itself. In EasyEffects, disable "Process All Input Streams" (or exclude hushmic_input), then restart HushMic.
 
+# The user (or another app) switched the system default microphone away
+# from HushMic while "Set as default microphone" was on; $device is the
+# new default's name. "Set as default microphone" is the tray entry
+# (tray-set-default) — keep the two in sync.
+notify-default-released-summary = HushMic is no longer the default microphone
+notify-default-released-body = Apps now use { $device } directly. Turn suppression off and on, or tick "Set as default microphone", to switch back.
+
 notify-mic-fallback-body = Your microphone was disconnected — HushMic is following the system default for now.
 notify-mic-return-body = Your microphone is back — HushMic switched back to it.
 

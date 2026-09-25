@@ -304,10 +304,10 @@ fn per_mic_profile_drives_the_rendered_conf() {
             attn_limit: 24.0,
         },
     );
-    let (model, attn) = cfg.effective_settings(cfg.mic.as_deref(), None);
+    let p = cfg.active_profile(cfg.mic.as_deref(), None);
     let adjusted = Config {
-        model,
-        attn_limit: attn,
+        model: p.model,
+        attn_limit: p.attn_limit,
         ..cfg.clone()
     };
     let paths = Paths {

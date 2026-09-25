@@ -2,7 +2,7 @@
 // is kept intentionally as forward-compat across ksni versions.
 #![allow(clippy::needless_update)]
 
-use crate::config::{Config, TrayIcon};
+use crate::config::{ActiveProfile, Config, TrayIcon};
 use crate::controller::RunMode;
 use crate::diagnostics::EngineTier;
 use crate::pipewire::Source;
@@ -143,6 +143,9 @@ fn sni_icon_name(status: TrayStatus, style: IconStyle, app_id: Option<&str>) -> 
 
 pub struct HushMicTray {
     pub cfg: Config,
+    /// Whose model and strength the Model and Strength radios show and
+    /// edit: the running chain's profile, not the defaults in `cfg`.
+    pub profile: ActiveProfile,
     pub mics: Vec<Source>,
     pub cmd_tx: Sender<TrayCmd>,
     pub status: TrayStatus,
@@ -190,11 +193,9 @@ impl HushMicTray {
         }
         let light_in_use = self.engine == Some(EngineTier::Light) && !self.engine_light_configured;
         let is_light = id.starts_with("dpdfnet2");
-        // Which entry describes what the chain actually loaded. Not
-        // `cfg.model == id`: a per-mic profile can run a different model
-        // than the global setting, and then the global one would be
-        // annotated while the running one looked idle. `engine_light_
-        // configured` is the running chain's own model, so it decides.
+        // Which entry describes what the chain actually loaded: the
+        // running chain's own model (`engine_light_configured`), which a
+        // fresh profile edit can briefly be ahead of.
         let running = is_light == self.engine_light_configured;
         match self.engine {
             Some(EngineTier::Passthrough) if running => {
@@ -325,11 +326,11 @@ impl Tray for HushMicTray {
 
         let model_selected = MODELS
             .iter()
-            .position(|id| *id == self.cfg.model)
+            .position(|id| *id == self.profile.model)
             .unwrap_or(0);
         let attn_selected = ATTN_PRESETS
             .iter()
-            .position(|v| (*v - self.cfg.attn_limit).abs() < 0.5)
+            .position(|v| (*v - self.profile.attn_limit).abs() < 0.5)
             .unwrap_or(0);
 
         let mode_selected = if !self.cfg.enabled {
@@ -429,7 +430,7 @@ impl Tray for HushMicTray {
                     selected: model_selected,
                     select: Box::new(|t: &mut Self, idx| {
                         let id = MODELS[idx].to_string();
-                        t.cfg.model = id.clone();
+                        t.profile.model = id.clone();
                         let _ = t.cmd_tx.send(TrayCmd::SelectModel(id));
                     }),
                     options: MODELS
@@ -451,7 +452,7 @@ impl Tray for HushMicTray {
                     selected: attn_selected,
                     select: Box::new(|t: &mut Self, idx| {
                         let v = ATTN_PRESETS[idx];
-                        t.cfg.attn_limit = v;
+                        t.profile.attn_limit = v;
                         let _ = t.cmd_tx.send(TrayCmd::SetAttn(v));
                     }),
                     options: ATTN_PRESETS
@@ -779,7 +780,7 @@ mod tests {
         // The selection stays on the configured model; the entry in use
         // says so while the chain is on another tier (issue #14).
         let mut tray = test_tray(false);
-        tray.cfg.model = "dpdfnet8_48khz_hr".into();
+        tray.profile.model = "dpdfnet8_48khz_hr".into();
         tray.status = TrayStatus::Active;
         let plain = vec![
             "High quality (dpdfnet8)".to_string(),
@@ -806,15 +807,14 @@ mod tests {
         tray.status = TrayStatus::Bypass;
         assert_eq!(model_labels(&tray), plain);
         tray.status = TrayStatus::Active;
-        tray.cfg.model = "dpdfnet2_48khz_hr".into();
+        tray.profile.model = "dpdfnet2_48khz_hr".into();
         tray.engine = Some(EngineTier::Light);
         tray.engine_light_configured = true;
         assert_eq!(model_labels(&tray), plain);
-        // Per-mic profile: the global setting is the quality model, the
-        // chain runs the light one for this microphone. Passthrough pauses
-        // the model the chain actually loaded, so the light entry is the
-        // one that says so.
-        tray.cfg.model = "dpdfnet8_48khz_hr".into();
+        // The selection ahead of the running chain (a model click, the
+        // restart still under way): passthrough pauses the model the chain
+        // actually loaded, so the light entry is the one that says so.
+        tray.profile.model = "dpdfnet8_48khz_hr".into();
         tray.engine = Some(EngineTier::Passthrough);
         tray.engine_light_configured = true;
         assert_eq!(
@@ -824,6 +824,72 @@ mod tests {
                 "Light / low-CPU (dpdfnet2) (paused, mic on without filtering)".to_string(),
             ]
         );
+    }
+
+    fn radio_selected(tray: &HushMicTray, submenu: &str) -> usize {
+        tray.menu()
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::SubMenu(s) if s.label == submenu => Some(s),
+                _ => None,
+            })
+            .expect("submenu")
+            .submenu
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::RadioGroup(g) => Some(g.selected),
+                _ => None,
+            })
+            .expect("radio group")
+    }
+
+    /// The reported bug: the defaults say light/24 dB, the RODE profile in
+    /// effect says quality/maximum — the radios must show the profile.
+    #[test]
+    fn radios_show_the_active_profile_not_the_defaults() {
+        let mut tray = test_tray(false);
+        tray.cfg.model = "dpdfnet2_48khz_hr".into();
+        tray.cfg.attn_limit = 24.0;
+        tray.profile = ActiveProfile {
+            device: Some("alsa_input.test".into()),
+            saved: true,
+            model: "dpdfnet8_48khz_hr".into(),
+            attn_limit: 100.0,
+        };
+        assert_eq!(radio_selected(&tray, "Model"), 0);
+        assert_eq!(radio_selected(&tray, "Suppression strength"), 0);
+        tray.profile.attn_limit = 12.0;
+        tray.profile.model = "dpdfnet2_48khz_hr".into();
+        assert_eq!(radio_selected(&tray, "Model"), 1);
+        assert_eq!(radio_selected(&tray, "Suppression strength"), 2);
+    }
+
+    #[test]
+    fn model_and_strength_clicks_update_the_profile_shown() {
+        crate::i18n::pin_english();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tray = test_tray(false);
+        tray.cmd_tx = tx;
+        let defaults = (tray.cfg.model.clone(), tray.cfg.attn_limit);
+        for (menu, idx) in [("Model", 1), ("Suppression strength", 1)] {
+            let items = tray.menu();
+            let sub = items
+                .iter()
+                .find_map(|i| match i {
+                    MenuItem::SubMenu(s) if s.label == menu => Some(s),
+                    _ => None,
+                })
+                .unwrap();
+            let MenuItem::RadioGroup(g) = &sub.submenu[0] else {
+                panic!("radio group")
+            };
+            (g.select)(&mut tray, idx);
+        }
+        assert_eq!(tray.profile.model, "dpdfnet2_48khz_hr");
+        assert_eq!(tray.profile.attn_limit, 24.0);
+        assert_eq!((tray.cfg.model.clone(), tray.cfg.attn_limit), defaults);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SelectModel(m)) if m == "dpdfnet2_48khz_hr"));
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SetAttn(v)) if v == 24.0));
     }
 
     fn mode_radio(menu: &[MenuItem<HushMicTray>]) -> &RadioGroup<HushMicTray> {
@@ -864,6 +930,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),
+            profile: Config::default().profile_for(None),
             mics: vec![],
             cmd_tx: tx,
             status: TrayStatus::Active,
@@ -920,6 +987,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         HushMicTray {
             cfg: Config::default(),
+            profile: Config::default().profile_for(None),
             mics: vec![Source {
                 name: "alsa_input.test".into(),
                 description: "Test Mic".into(),
@@ -1021,6 +1089,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),
+            profile: Config::default().profile_for(None),
             mics: vec![],
             cmd_tx: tx,
             status: TrayStatus::Off,
@@ -1048,6 +1117,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),
+            profile: Config::default().profile_for(None),
             mics: vec![],
             cmd_tx: tx,
             status: TrayStatus::Off,
@@ -1109,6 +1179,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tray = HushMicTray {
             cfg: Config::default(),
+            profile: Config::default().profile_for(None),
             mics: vec![],
             cmd_tx: tx,
             status: TrayStatus::Off,
