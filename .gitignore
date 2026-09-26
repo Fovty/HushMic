@@ -4,6 +4,7 @@
 
 # Bundled binary assets — provisioned locally via scripts/setup-assets.sh, not tracked in git
 /assets/models/*.onnx
+/assets/models/*.weights.f32
 /assets/lib/*.so*
 /tests/fixtures/*.wav
 
