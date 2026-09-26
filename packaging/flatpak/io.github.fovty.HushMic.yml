@@ -229,6 +229,9 @@ modules:
     build-commands:
       - install -Dm644 dpdfnet8_48khz_hr.onnx /app/share/hushmic/models/dpdfnet8_48khz_hr.onnx
       - install -Dm644 dpdfnet2_48khz_hr.onnx /app/share/hushmic/models/dpdfnet2_48khz_hr.onnx
+      # native engine weights, from the DPDFNet commit the C runtime is vendored from
+      - install -Dm644 dpdfnet8_48khz_hr.weights.f32 /app/share/hushmic/models/dpdfnet8_48khz_hr.weights.f32
+      - install -Dm644 dpdfnet2_48khz_hr.weights.f32 /app/share/hushmic/models/dpdfnet2_48khz_hr.weights.f32
     sources:
       - type: file
         url: https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet8_48khz_hr.onnx
@@ -236,6 +239,20 @@ modules:
       - type: file
         url: https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet2_48khz_hr.onnx
         sha256: 7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b
+      - type: file
+        url: https://raw.githubusercontent.com/ceva-ip/DPDFNet/6a5dbd3ea5dbea88c30a2be8e7c689b5eb26b533/native_inference/artifacts/v1/dpdfnet8_48khz_hr/weights.f32
+        sha256: 5a5bb67a8619090c54dc2793536fe813fe38123b236d445f3433aafe3075529d
+        # the same file attached to every HushMic release since 0.10
+        mirror-urls:
+          - https://github.com/Fovty/hushmic/releases/download/v0.10.0/dpdfnet8_48khz_hr.weights.f32
+        dest-filename: dpdfnet8_48khz_hr.weights.f32
+      - type: file
+        url: https://raw.githubusercontent.com/ceva-ip/DPDFNet/6a5dbd3ea5dbea88c30a2be8e7c689b5eb26b533/native_inference/artifacts/v1/dpdfnet2_48khz_hr/weights.f32
+        sha256: cb7248b8fccbff7b32f254ec2ed0061e604514b2ccd98d997cd081a876424e7b
+        # the same file attached to every HushMic release since 0.10
+        mirror-urls:
+          - https://github.com/Fovty/hushmic/releases/download/v0.10.0/dpdfnet2_48khz_hr.weights.f32
+        dest-filename: dpdfnet2_48khz_hr.weights.f32
 
   - name: hushmic
     buildsystem: simple

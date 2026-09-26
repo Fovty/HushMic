@@ -21,6 +21,9 @@ pub struct Denoiser {
     gain: GainRamp,
     mode: Mode,
     attn_limit_db: f32,
+    /// Why a native engine was asked for but ONNX runs.
+    #[cfg(feature = "native")]
+    fallback_reason: Option<String>,
 }
 
 impl Denoiser {
@@ -47,6 +50,49 @@ impl Denoiser {
         Ok(Denoiser::with_model(model))
     }
 
+    /// Load a model file and run it on the engine `inference` selects
+    /// (feature `native`). The native engine reads the packed weights
+    /// `<model>.weights.f32` from the model's directory and checks them
+    /// before use. Every native failure — a model file without a native
+    /// build, missing or damaged weights, a CPU without AVX2/FMA for INT8 —
+    /// falls back to ONNX; [`Denoiser::fallback_reason`] then says why.
+    /// Errors are those of [`Denoiser::from_file`] (the ONNX path).
+    ///
+    /// The native engine does not need ONNX Runtime, but the ONNX fallback
+    /// does, so the runtime handling is the same as in `from_file`.
+    #[cfg(feature = "native")]
+    pub fn from_file_with(
+        model_path: impl AsRef<Path>,
+        inference: crate::Inference,
+    ) -> Result<Denoiser, Error> {
+        let model_path = model_path.as_ref();
+        if inference == crate::Inference::Onnx {
+            return Denoiser::from_file(model_path);
+        }
+        match crate::native::NativeModel::load(model_path, inference) {
+            Ok((m, init_state)) => Ok(Denoiser::with_model(Model::native(m, init_state))),
+            Err(why) => {
+                let mut d = Denoiser::from_file(model_path)?;
+                d.fallback_reason = Some(why);
+                Ok(d)
+            }
+        }
+    }
+
+    /// The engine this instance runs on (feature `native`).
+    #[cfg(feature = "native")]
+    pub fn engine(&self) -> crate::Engine {
+        self.model.engine()
+    }
+
+    /// Why this instance runs ONNX although [`Denoiser::from_file_with`]
+    /// asked for a native engine (feature `native`); `None` when it got the
+    /// engine it asked for.
+    #[cfg(feature = "native")]
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.fallback_reason.as_deref()
+    }
+
     fn with_model(model: Model) -> Denoiser {
         let state = model.init_state.clone();
         let state_out = vec![0f32; model.state_size];
@@ -62,6 +108,8 @@ impl Denoiser {
             gain: GainRamp::new(),
             mode: Mode::Process,
             attn_limit_db: f32::INFINITY,
+            #[cfg(feature = "native")]
+            fallback_reason: None,
         }
     }
 

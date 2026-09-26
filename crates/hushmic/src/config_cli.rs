@@ -4,7 +4,7 @@
 //! and the CLI (no daemon) both go through here, so `set` behaves the same
 //! whether or not HushMic is running.
 
-use crate::config::{Config, TrayIcon};
+use crate::config::{Config, Inference, TrayIcon};
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -17,6 +17,7 @@ pub enum Key {
     Tray,
     TrayIcon,
     Notifications,
+    Inference,
     Enabled,
     ShortcutsSetup,
     MicPrefs,
@@ -24,7 +25,7 @@ pub enum Key {
 
 /// The one key table: listing order (what a user asks about first,
 /// app-managed keys last), the file/CLI name, and whether `set` takes it.
-const KEYS: [(Key, &str, bool); 11] = [
+const KEYS: [(Key, &str, bool); 12] = [
     (Key::Enabled, "enabled", false),
     (Key::Mic, "mic", true),
     (Key::Model, "model", true),
@@ -34,6 +35,7 @@ const KEYS: [(Key, &str, bool); 11] = [
     (Key::Tray, "tray", true),
     (Key::TrayIcon, "tray_icon", true),
     (Key::Notifications, "notifications", true),
+    (Key::Inference, "inference", true),
     (Key::ShortcutsSetup, "shortcuts_setup", false),
     (Key::MicPrefs, "mic_prefs", false),
 ];
@@ -92,6 +94,7 @@ pub enum Value {
     Attn(f32),
     Bool(bool),
     Icon(TrayIcon),
+    Inference(Inference),
 }
 
 /// Named strengths — the tray's presets (tray.rs ATTN_PRESETS).
@@ -157,6 +160,14 @@ pub fn parse_value(key: Key, raw: &str, model_dir: &Path) -> Result<Value, Strin
                     TrayIcon::VALUES.join(" or ")
                 )
             }),
+        Key::Inference => Inference::parse(&raw.to_ascii_lowercase())
+            .map(Value::Inference)
+            .ok_or_else(|| {
+                format!(
+                    "inference must be {}, not '{raw}'",
+                    Inference::VALUES.join(" or ")
+                )
+            }),
         Key::SetDefault | Key::Autostart | Key::Tray | Key::Notifications => {
             match raw.to_ascii_lowercase().as_str() {
                 "true" | "on" | "yes" | "1" => Ok(Value::Bool(true)),
@@ -201,6 +212,7 @@ pub fn apply(cfg: &mut Config, key: Key, value: Value, device: Option<&str>) {
         (Key::Tray, Value::Bool(b)) => cfg.tray = b,
         (Key::TrayIcon, Value::Icon(v)) => cfg.tray_icon = v,
         (Key::Notifications, Value::Bool(b)) => cfg.notifications = b,
+        (Key::Inference, Value::Inference(v)) => cfg.inference = v,
         (k, v) => unreachable!("parse_value produced {v:?} for {k:?}"),
     }
 }
@@ -225,6 +237,7 @@ pub fn get(cfg: &Config, key: Key, device: Option<&str>) -> String {
         Key::Tray => cfg.tray.to_string(),
         Key::TrayIcon => cfg.tray_icon.as_str().to_string(),
         Key::Notifications => cfg.notifications.to_string(),
+        Key::Inference => cfg.inference.as_str().to_string(),
         Key::Enabled => cfg.enabled.to_string(),
         Key::ShortcutsSetup => cfg.shortcuts_setup.to_string(),
         Key::MicPrefs => {
@@ -260,6 +273,7 @@ fn json_value(cfg: &Config, key: Key, device: Option<&str>) -> serde_json::Value
         Key::Tray => json!(cfg.tray),
         Key::TrayIcon => json!(cfg.tray_icon.as_str()),
         Key::Notifications => json!(cfg.notifications),
+        Key::Inference => json!(cfg.inference.as_str()),
         Key::Enabled => json!(cfg.enabled),
         Key::ShortcutsSetup => json!(cfg.shortcuts_setup),
         Key::MicPrefs => serde_json::Value::Object(
@@ -306,8 +320,8 @@ pub fn set_qualifier(key: Key, daemon_running: bool) -> &'static str {
 /// field, not just the ones `set` can touch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Diff {
-    /// enabled / mic / model / attn_limit / set_default / mic_prefs: the
-    /// filter chain re-renders.
+    /// enabled / mic / model / attn_limit / set_default / mic_prefs /
+    /// inference: the filter chain re-renders.
     pub chain: bool,
     pub autostart: bool,
     pub notifications: bool,
@@ -320,7 +334,8 @@ pub fn diff(old: &Config, new: &Config) -> Diff {
             || old.model != new.model
             || old.attn_limit != new.attn_limit
             || old.set_default != new.set_default
-            || old.mic_prefs != new.mic_prefs,
+            || old.mic_prefs != new.mic_prefs
+            || old.inference != new.inference,
         autostart: old.autostart != new.autostart,
         notifications: old.notifications != new.notifications,
     }
@@ -459,8 +474,9 @@ mod tests {
         assert!(e.contains("hushmic mode"), "{e}");
         assert!(parse_settable_key("mic_prefs").is_err());
         assert!(parse_settable_key("shortcuts_setup").is_err());
-        assert_eq!(listed().count(), 11);
-        assert_eq!(listed().filter(|k| k.settable()).count(), 8);
+        assert_eq!(listed().count(), 12);
+        assert_eq!(listed().filter(|k| k.settable()).count(), 9);
+        assert_eq!(parse_settable_key("inference"), Ok(Key::Inference));
         assert_eq!(parse_key("tray_icon"), Ok(Key::TrayIcon));
         assert_eq!(parse_settable_key("tray_icon"), Ok(Key::TrayIcon));
         for k in listed() {
@@ -548,6 +564,21 @@ mod tests {
         assert!(e.contains("auto or color or symbolic"), "{e}");
         assert!(e.contains("mono"), "{e}");
         assert!(parse_value(Key::TrayIcon, "", &md).is_err());
+        for (raw, want) in [
+            ("auto", Inference::Auto),
+            ("onnx", Inference::Onnx),
+            (" ONNX ", Inference::Onnx),
+        ] {
+            assert_eq!(
+                parse_value(Key::Inference, raw, &md),
+                Ok(Value::Inference(want)),
+                "{raw}"
+            );
+        }
+        // The native engines are debugging overrides (HUSHMIC_INFERENCE),
+        // not settings.
+        let e = parse_value(Key::Inference, "native-int8", &md).unwrap_err();
+        assert!(e.contains("auto or onnx"), "{e}");
         assert!(parse_value(Key::Enabled, "true", &md).is_err());
     }
 
@@ -617,6 +648,7 @@ mod tests {
         assert!(plain.contains("mic = default\n"), "{plain}");
         assert!(plain.contains("tray = true\n"), "{plain}");
         assert!(plain.contains("tray_icon = auto\n"), "{plain}");
+        assert!(plain.contains("inference = auto\n"), "{plain}");
         assert!(plain.contains("attn_limit = 100\n"), "{plain}");
         assert!(plain.contains("mic_prefs = (none)\n"), "{plain}");
         let v: serde_json::Value = serde_json::from_str(&render_all_json(&c, None)).unwrap();
@@ -624,6 +656,7 @@ mod tests {
         assert_eq!(v["attn_limit"], 100.0);
         assert_eq!(v["tray"], true);
         assert_eq!(v["tray_icon"], "auto");
+        assert_eq!(v["inference"], "auto");
         assert!(v["mic_prefs"].is_object());
         let one: serde_json::Value =
             serde_json::from_str(&render_one_json(&c, Key::Model, None)).unwrap();
@@ -683,6 +716,16 @@ mod tests {
         c.tray = false;
         let d = diff(&a, &c);
         assert!(!d.chain && d.autostart && d.notifications);
+        let mut f = a.clone();
+        apply(
+            &mut f,
+            Key::Inference,
+            Value::Inference(Inference::Onnx),
+            None,
+        );
+        assert_eq!(f.inference, Inference::Onnx);
+        assert!(diff(&a, &f).chain, "the engine choice restarts the chain");
+        assert_eq!(set_qualifier(Key::Inference, true), "");
         let mut e = a.clone();
         e.enabled = false;
         assert!(

@@ -26,7 +26,7 @@ Measured on the July 2026 build in the speech pauses of each clip: keyboard nois
 
 ## CPU cost
 
-The quality model (`dpdfnet8_48khz_hr`) runs at roughly 0.3 times real time on one desktop core; this is an informal measurement, not a guarantee for your machine. The light model (`dpdfnet2_48khz_hr`) is cheaper at some cost in suppression. Latency is the same for both: 80 ms, see [troubleshooting.md](troubleshooting.md#latency-and-cpu).
+On CPUs with AVX2 the native engine runs the quality model (`dpdfnet8_48khz_hr`) at roughly 0.15 times real time on one desktop core, and ONNX Runtime at roughly 0.3; these are informal measurements, not a guarantee for your machine. The light model (`dpdfnet2_48khz_hr`) is cheaper at some cost in suppression. Latency is the same for both: 80 ms, see [troubleshooting.md](troubleshooting.md#latency-and-cpu).
 
 ## About DPDFNet
 

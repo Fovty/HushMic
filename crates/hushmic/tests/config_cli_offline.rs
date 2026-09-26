@@ -72,6 +72,21 @@ fn config_set_and_get_work_on_the_file_without_a_daemon() {
     let (code, out, _) = run(&home, &["config", "set", "tray", "off"]);
     assert_eq!(code, 0);
     assert!(out.starts_with("tray = false"), "{out}");
+    // inference: auto | onnx; the native engines are not settings.
+    let (code, _, err) = run(&home, &["config", "set", "inference", "native-int8"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("auto or onnx"), "{err}");
+    let (code, out, err) = run(&home, &["config", "set", "inference", "onnx"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.starts_with("inference = onnx"), "{out}");
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(text.contains("inference = \"onnx\""), "{text}");
+    let (code, out, _) = run(&home, &["config", "get", "inference"]);
+    assert_eq!((code, out.trim()), (0, "onnx"));
+    let (code, _, _) = run(&home, &["config", "set", "inference", "auto"]);
+    assert_eq!(code, 0);
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(!text.contains("inference"), "auto is not written: {text}");
     // autostart is the one offline key with a side effect: the entry.
     let entry = home.join(".config/autostart/hushmic.desktop");
     let (code, out, err) = run(&home, &["config", "set", "autostart", "true"]);

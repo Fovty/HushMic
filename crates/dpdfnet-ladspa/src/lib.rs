@@ -1,8 +1,9 @@
 //! hushmic DPDFNet LADSPA plugin: a thin PipeWire-facing wrapper around the
 //! `hushmic-denoiser` engine crate. Everything here is host plumbing —
 //! control-port mapping, the inference worker + alignment ledger that
-//! decouple the DSP from the host's cycle (issue #10), and the bundled
-//! ONNX Runtime's baked default paths.
+//! decouple the DSP from the host's cycle (issue #10), the inference
+//! engine choice (issue #18), and the bundled ONNX Runtime's baked default
+//! paths.
 pub mod adaptive;
 pub mod align;
 pub mod ladder;
@@ -86,6 +87,81 @@ fn pinned_tier(value: Option<&str>, tiers: &[Tier]) -> Option<Tier> {
     }
 }
 
+/// The engine `HUSHMIC_INFERENCE` asks for: unset or empty is `auto`; an
+/// unknown word is an `Err` carrying the reason ONNX runs instead.
+#[cfg(feature = "native")]
+pub fn inference_from(value: Option<&str>) -> Result<hushmic_denoiser::Inference, String> {
+    use hushmic_denoiser::Inference;
+    match value.unwrap_or("") {
+        "" => Ok(Inference::Auto),
+        w => Inference::parse(w).ok_or_else(|| {
+            format!("HUSHMIC_INFERENCE={w} is not auto, onnx, native-int8 or native-fp32")
+        }),
+    }
+}
+
+/// The inference contract line for one model: `inference: native int8 for
+/// <model>` or `inference: onnx (<reason>) for <model>`. The app parses it
+/// for `status` and `--doctor`; it must never start with `engine: `, which
+/// is the tier contract.
+pub fn inference_line(model: &str, engine: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(why) => format!("inference: {engine} ({why}) for {model}"),
+        None => format!("inference: {engine} for {model}"),
+    }
+}
+
+fn model_name(path: &std::path::Path) -> &str {
+    path.file_stem().and_then(|f| f.to_str()).unwrap_or("?")
+}
+
+/// Load one model on the engine `HUSHMIC_INFERENCE` asks for (default
+/// auto: native INT8 where the CPU and the installed weights allow it).
+/// Every native failure falls back to ONNX; one contract line per model
+/// says what runs and, for ONNX, why.
+#[cfg(feature = "native")]
+pub fn load_denoiser(path: &std::path::Path) -> Result<Denoiser, hushmic_denoiser::Error> {
+    let requested = inference_from(std::env::var("HUSHMIC_INFERENCE").ok().as_deref());
+    load_denoiser_with(path, requested)
+}
+
+/// `load_denoiser` with the request given (tests pick the engine here).
+#[cfg(feature = "native")]
+pub fn load_denoiser_with(
+    path: &std::path::Path,
+    requested: Result<hushmic_denoiser::Inference, String>,
+) -> Result<Denoiser, hushmic_denoiser::Error> {
+    use hushmic_denoiser::Inference;
+    let (inference, note) = match requested {
+        Ok(i) => (i, None),
+        Err(why) => (Inference::Onnx, Some(why)),
+    };
+    let d = Denoiser::from_file_with(path, inference)?;
+    let reason = match (&note, d.fallback_reason(), inference) {
+        (Some(why), _, _) => Some(why.as_str()),
+        (None, Some(why), _) => Some(why),
+        (None, None, Inference::Onnx) => Some("requested"),
+        (None, None, _) => None,
+    };
+    log::contract_line(&inference_line(
+        model_name(path),
+        &d.engine().to_string(),
+        reason,
+    ));
+    Ok(d)
+}
+
+#[cfg(not(feature = "native"))]
+pub fn load_denoiser(path: &std::path::Path) -> Result<Denoiser, hushmic_denoiser::Error> {
+    let d = Denoiser::from_file(path)?;
+    log::contract_line(&inference_line(
+        model_name(path),
+        "onnx",
+        Some("built without the native engine"),
+    ));
+    Ok(d)
+}
+
 fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
     let pin = std::env::var("HUSHMIC_DSP_TIER").ok();
     if let Some(t) = pinned_tier(pin.as_deref(), tiers) {
@@ -110,7 +186,10 @@ fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
 ///
 /// `HUSHMIC_FALLBACK_MODEL_PATH` names the light model; when it loads, the
 /// adaptive engine can fall back to it under CPU pressure (issue #14). Both
-/// loads happen here, on the instantiate thread, before the worker exists.
+/// loads happen here, on the instantiate thread, before the worker exists,
+/// and both go through `load_denoiser`, so both tiers run on the selected
+/// engine. The runtime is committed even when both models end up native:
+/// any fallback to ONNX needs it.
 fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
     let dylib = std::env::var("ORT_DYLIB_PATH")
         .ok()
@@ -130,7 +209,7 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
         Ok(_) => {}
     }
     let main_path = model_path();
-    let main = match Denoiser::from_file(&main_path) {
+    let main = match load_denoiser(&main_path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[dpdfnet-ladspa] engine init failed: {e}");
@@ -148,7 +227,7 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
     let light = std::env::var_os("HUSHMIC_FALLBACK_MODEL_PATH")
         .map(PathBuf::from)
         .filter(|p| main_tier != Tier::Light && !same_file(p))
-        .and_then(|p| match Denoiser::from_file(&p) {
+        .and_then(|p| match load_denoiser(&p) {
             Ok(d) => Some(d),
             Err(e) => {
                 eprintln!("[dpdfnet-ladspa] light model unavailable: {e}");
@@ -418,6 +497,38 @@ mod tests {
         assert_eq!(pinned_tier(Some("quality"), &lr), None);
         assert_eq!(pinned_tier(Some("bogus"), &qlr), None);
         assert_eq!(pinned_tier(None, &qlr), None);
+    }
+
+    #[test]
+    fn inference_lines_never_look_like_the_tier_contract() {
+        assert_eq!(
+            inference_line("dpdfnet8_48khz_hr", "native int8", None),
+            "inference: native int8 for dpdfnet8_48khz_hr"
+        );
+        assert_eq!(
+            inference_line("dpdfnet2_48khz_hr", "onnx", Some("requested")),
+            "inference: onnx (requested) for dpdfnet2_48khz_hr"
+        );
+        assert!(!inference_line("m", "onnx", None).starts_with("engine: "));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn inference_env_words() {
+        use hushmic_denoiser::Inference;
+        assert_eq!(inference_from(None), Ok(Inference::Auto));
+        assert_eq!(inference_from(Some("")), Ok(Inference::Auto));
+        assert_eq!(inference_from(Some("onnx")), Ok(Inference::Onnx));
+        assert_eq!(
+            inference_from(Some("native-int8")),
+            Ok(Inference::NativeInt8)
+        );
+        assert_eq!(
+            inference_from(Some("native-fp32")),
+            Ok(Inference::NativeFp32)
+        );
+        let e = inference_from(Some("tensorrt")).unwrap_err();
+        assert!(e.contains("HUSHMIC_INFERENCE=tensorrt"), "{e}");
     }
 
     #[test]

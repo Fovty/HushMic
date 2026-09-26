@@ -33,13 +33,14 @@ jobs:
 
       - name: Install system dependencies
         # dbus provides dbus-daemon for the notification round-trip test
-        # (tests/notify_dbus.rs), which self-skips without it.
+        # (tests/notify_dbus.rs), which self-skips without it. build-essential:
+        # the plugin's default feature compiles the native engine's C sources.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            python3 python3-venv python3-pip curl ca-certificates dbus
+            build-essential python3 python3-venv python3-pip curl ca-certificates dbus
 
-      - name: Provision assets (DPDFNet models + ONNX Runtime)
+      - name: Provision assets (DPDFNet models, native weights, ONNX Runtime)
         run: bash scripts/setup-assets.sh
 
       - name: rustfmt
@@ -52,6 +53,15 @@ jobs:
         # ASSERT_ASSETS: on CI a missing asset or an unexpectedly dlopen-able
         # system ONNX Runtime must FAIL the asset-gated tests, never skip them.
         run: cargo test --workspace
+        env:
+          HUSHMIC_ASSERT_ASSETS: "1"
+
+      - name: hushmic-denoiser without the native feature
+        # The workspace build turns the native engine on (the plugin's
+        # default feature); the embeddable crate must also work without it.
+        run: |
+          cargo clippy -p hushmic-denoiser --all-targets -- -D warnings
+          cargo test -p hushmic-denoiser
         env:
           HUSHMIC_ASSERT_ASSETS: "1"
 

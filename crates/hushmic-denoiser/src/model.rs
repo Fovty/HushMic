@@ -4,6 +4,9 @@
 //! model's custom metadata (`erb_norm_init` + `spec_norm_init`), and runs one hop:
 //!   inputs : `spec` `[1,1,481,2]` (f32 interleaved re/im) + `state_in` `[state_size]`
 //!   outputs: `spec_e` `[1,1,481,2]` + `state_out` `[state_size]`
+//!
+//! With the `native` feature the same contract can be served by the native
+//! engine instead (see native.rs); callers only see `Model::run`.
 
 use crate::stft::{FREQ_BINS, SPEC_LEN};
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -11,9 +14,16 @@ use ort::value::TensorRef;
 use std::path::Path;
 
 pub struct Model {
-    session: Session,
+    engine: Engine,
     pub state_size: usize,
     pub init_state: Vec<f32>,
+}
+
+/// What runs the graph. Without the `native` feature this is always ONNX.
+enum Engine {
+    Onnx(Session),
+    #[cfg(feature = "native")]
+    Native(crate::native::NativeModel),
 }
 
 fn parse_csv_f32(s: &str) -> Vec<f32> {
@@ -104,10 +114,27 @@ impl Model {
         }
 
         Ok(Model {
-            session,
+            engine: Engine::Onnx(session),
             state_size,
             init_state,
         })
+    }
+
+    #[cfg(feature = "native")]
+    pub fn native(model: crate::native::NativeModel, init_state: Vec<f32>) -> Model {
+        Model {
+            state_size: model.state_size(),
+            engine: Engine::Native(model),
+            init_state,
+        }
+    }
+
+    #[cfg(feature = "native")]
+    pub fn engine(&self) -> crate::native::Engine {
+        match &self.engine {
+            Engine::Onnx(_) => crate::native::Engine::Onnx,
+            Engine::Native(n) => n.engine,
+        }
     }
 
     pub fn run(
@@ -117,12 +144,18 @@ impl Model {
         spec_e: &mut [f32; SPEC_LEN],
         state_out: &mut Vec<f32>,
     ) -> Result<(), String> {
+        // A single-arm match without the `native` feature.
+        #[cfg_attr(not(feature = "native"), allow(clippy::infallible_destructuring_match))]
+        let session = match &mut self.engine {
+            Engine::Onnx(s) => s,
+            #[cfg(feature = "native")]
+            Engine::Native(n) => return n.run(spec, state_in, spec_e, state_out),
+        };
         let spec_t = TensorRef::from_array_view(([1usize, 1, FREQ_BINS, 2], spec.as_slice()))
             .map_err(|e| e.to_string())?;
         let state_t =
             TensorRef::from_array_view(([state_in.len()], state_in)).map_err(|e| e.to_string())?;
-        let outputs = self
-            .session
+        let outputs = session
             .run(ort::inputs! { "spec" => spec_t, "state_in" => state_t })
             .map_err(|e| e.to_string())?;
 

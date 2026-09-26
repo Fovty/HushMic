@@ -357,6 +357,11 @@ ensure_dir "$DEST_MODELS"
 for m in "$PAYLOAD"/share/hushmic/models/*.onnx; do
   install_file "$m" "$DEST_MODELS" 644
 done
+# Native engine weights (a payload without them still works, on ONNX).
+for m in "$PAYLOAD"/share/hushmic/models/*.weights.f32; do
+  [ -f "$m" ] || continue
+  install_file "$m" "$DEST_MODELS" 644
+done
 
 # Heal dirs left 0700 by the pre-v0.1.3 umask-sensitive installer: ensure_dir
 # deliberately never rewrites EXISTING dirs, so upgraders would keep the broken

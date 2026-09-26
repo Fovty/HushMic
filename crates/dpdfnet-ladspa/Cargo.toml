@@ -7,9 +7,17 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the test suites
 
+[features]
+# The native inference engine (hushmic-denoiser's feature of the same name):
+# on by default so every release build of the plugin carries it; which
+# engine runs is still decided per model at load time, with ONNX as the
+# fallback. `--no-default-features` builds an ONNX-only plugin.
+default = ["native"]
+native = ["hushmic-denoiser/native"]
+
 [dependencies]
 ladspa = "0.3.4"
-hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.9.1" }
+hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.10.0" }
 rtrb = "0.4.0"
 libc = "0.2"
 

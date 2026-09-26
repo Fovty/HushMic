@@ -172,15 +172,53 @@ pub struct Status {
     /// The configured model is already the light one, so a `light` tier is
     /// not a degradation.
     pub configured_light: bool,
+    /// What the model on the live tier runs on (issue #18), see
+    /// [`live_model`]; None before the plugin said so, in passthrough, or
+    /// with the chain down.
+    pub inference: Option<crate::diagnostics::Inference>,
 }
 
-/// The human wording of the engine line.
-fn engine_words(tier: EngineTier, configured_light: bool) -> &'static str {
+/// The model file the live tier runs: the chain's own model, or the light
+/// model it falls back to; None in passthrough.
+pub fn live_model(
+    tier: Option<EngineTier>,
+    chain_model: &str,
+    configured_light: bool,
+) -> Option<String> {
     match tier {
-        EngineTier::Quality => "quality model",
-        EngineTier::Light if configured_light => "light model",
-        EngineTier::Light => "light model (fallback)",
-        EngineTier::Passthrough => "passthrough (fallback)",
+        Some(EngineTier::Passthrough) => None,
+        Some(EngineTier::Light) if !configured_light => {
+            Some(crate::controller::LIGHT_MODEL.to_string())
+        }
+        _ => Some(chain_model.to_string()),
+    }
+}
+
+/// The human wording of the engine line, e.g. `quality model (native
+/// int8)` or `light model (fallback, onnx)`.
+fn engine_words(
+    tier: EngineTier,
+    configured_light: bool,
+    inference: Option<&crate::diagnostics::Inference>,
+) -> String {
+    let (base, note) = match tier {
+        EngineTier::Quality => ("quality model", None),
+        EngineTier::Light if configured_light => ("light model", None),
+        EngineTier::Light => ("light model", Some("fallback")),
+        EngineTier::Passthrough => ("passthrough", Some("fallback")),
+    };
+    let notes: Vec<&str> = note
+        .into_iter()
+        .chain(
+            inference
+                .filter(|_| tier != EngineTier::Passthrough)
+                .map(|i| i.engine.as_str()),
+        )
+        .collect();
+    if notes.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} ({})", notes.join(", "))
     }
 }
 
@@ -206,7 +244,17 @@ pub fn render_status_human(s: &Status) -> String {
         }
     };
     let engine = match (s.chain_running, s.engine) {
-        (true, Some(t)) => format!("engine: {}\n", engine_words(t, s.configured_light)),
+        (true, Some(t)) => format!(
+            "engine: {}\n",
+            engine_words(t, s.configured_light, s.inference.as_ref())
+        ),
+        // The inference line arrives at load, the first tier line a moment
+        // later: show what is known, as --json does.
+        (true, None) => s
+            .inference
+            .as_ref()
+            .map(|i| format!("engine: {}\n", i.engine))
+            .unwrap_or_default(),
         _ => String::new(),
     };
     format!(
@@ -253,6 +301,11 @@ pub fn render_status_json(s: &Status) -> String {
             "attn_limit": s.defaults_attn_limit,
         },
         "engine": s.chain_running.then_some(s.engine).flatten().map(EngineTier::word),
+        "inference": s.inference.as_ref().filter(|_| s.chain_running).map(|i| serde_json::json!({
+            "model": i.model,
+            "engine": i.engine,
+            "reason": i.reason,
+        })),
         "latency_samples": crate::controller::LATENCY_SAMPLES,
         "tray": tray_word(s.tray_sni),
         "chain": {
@@ -663,7 +716,67 @@ mod tests {
             tray_sni: true,
             engine: Some(EngineTier::Quality),
             configured_light: false,
+            inference: None,
         }
+    }
+
+    fn inference(engine: &str, reason: Option<&str>) -> crate::diagnostics::Inference {
+        crate::diagnostics::Inference {
+            model: "dpdfnet8_48khz_hr".into(),
+            engine: engine.into(),
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn status_names_the_inference_engine_of_the_live_tier() {
+        let mut s = demo_status();
+        s.inference = Some(inference("native int8", None));
+        assert!(
+            render_status_human(&s).contains("engine: quality model (native int8)\n"),
+            "{}",
+            render_status_human(&s)
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert_eq!(v["engine"], "quality");
+        assert_eq!(v["inference"]["engine"], "native int8");
+        assert_eq!(v["inference"]["model"], "dpdfnet8_48khz_hr");
+        assert!(v["inference"]["reason"].is_null());
+        s.engine = Some(EngineTier::Light);
+        s.inference = Some(inference("onnx", Some("requested")));
+        assert!(render_status_human(&s).contains("engine: light model (fallback, onnx)\n"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert_eq!(v["inference"]["reason"], "requested");
+        s.engine = Some(EngineTier::Passthrough);
+        assert!(render_status_human(&s).contains("engine: passthrough (fallback)\n"));
+        // Before the first tier line: the engine alone, like --json.
+        s.engine = None;
+        s.inference = Some(inference("native int8", None));
+        assert!(render_status_human(&s).contains("engine: native int8\n"));
+        s.chain_running = false;
+        assert!(!render_status_human(&s).contains("engine:"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert!(v["inference"].is_null());
+    }
+
+    #[test]
+    fn the_live_model_follows_the_tier() {
+        let q = "dpdfnet8_48khz_hr";
+        let light = crate::controller::LIGHT_MODEL;
+        assert_eq!(
+            live_model(Some(EngineTier::Quality), q, false).as_deref(),
+            Some(q)
+        );
+        assert_eq!(live_model(None, q, false).as_deref(), Some(q));
+        assert_eq!(
+            live_model(Some(EngineTier::Light), q, false).as_deref(),
+            Some(light)
+        );
+        assert_eq!(
+            live_model(Some(EngineTier::Light), light, true).as_deref(),
+            Some(light)
+        );
+        assert_eq!(live_model(Some(EngineTier::Passthrough), q, false), None);
     }
 
     #[test]

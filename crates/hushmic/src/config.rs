@@ -54,6 +54,49 @@ impl<'de> Deserialize<'de> for TrayIcon {
     }
 }
 
+/// Which inference engine the filter chain may use (issue #18). `Auto`
+/// lets the plugin pick the native engine where the CPU and the installed
+/// weights allow it, ONNX otherwise; `Onnx` keeps it on ONNX Runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Inference {
+    #[default]
+    Auto,
+    Onnx,
+}
+
+impl Inference {
+    /// The words the file and the CLI accept, in listing order.
+    pub const VALUES: [&'static str; 2] = ["auto", "onnx"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "onnx" => Some(Self::Onnx),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Onnx => "onnx",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+impl<'de> Deserialize<'de> for Inference {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Lenient like TrayIcon: a typo costs this field, not the file.
+        let raw = toml::Value::deserialize(d)?;
+        Ok(raw.as_str().and_then(Self::parse).unwrap_or_default())
+    }
+}
+
 /// One microphone's remembered settings. Keyed by `node.name` in
 /// [`Config::mic_prefs`]; the globals are the settings for every device
 /// without an entry.
@@ -141,6 +184,10 @@ pub struct Config {
     /// so existing files stay byte-identical.
     #[serde(skip_serializing_if = "TrayIcon::is_default")]
     pub tray_icon: TrayIcon,
+    /// The inference engine choice handed to the plugin. Skipped while
+    /// `auto` so existing files stay byte-identical.
+    #[serde(skip_serializing_if = "Inference::is_default")]
+    pub inference: Inference,
 }
 
 fn is_true(b: &bool) -> bool {
@@ -164,6 +211,7 @@ impl Default for Config {
             tray: true,
             notifications: true,
             tray_icon: TrayIcon::Auto,
+            inference: Inference::Auto,
         }
     }
 }
@@ -415,6 +463,31 @@ mod tests {
                 });
             assert_eq!(c.tray_icon, TrayIcon::Auto, "{bad}");
             assert_eq!(c.attn_limit, 24.0, "{bad}");
+        }
+    }
+
+    #[test]
+    fn inference_defaults_to_auto_stays_absent_and_is_lenient() {
+        let d = Config::default();
+        assert_eq!(d.inference, Inference::Auto);
+        assert!(!toml::to_string_pretty(&d).unwrap().contains("inference"));
+        let c = Config {
+            inference: Inference::Onnx,
+            ..Config::default()
+        };
+        let s = toml::to_string_pretty(&c).unwrap();
+        assert!(s.contains("inference = \"onnx\""), "{s}");
+        assert_eq!(
+            toml::from_str::<Config>(&s).unwrap().inference,
+            Inference::Onnx
+        );
+        for bad in ["inference = \"native\"\n", "inference = false\n"] {
+            let c: Config = toml::from_str(&format!("attn_limit = 24.0\n{bad}")).unwrap();
+            assert_eq!(c.inference, Inference::Auto, "{bad}");
+            assert_eq!(c.attn_limit, 24.0, "{bad}");
+        }
+        for w in Inference::VALUES {
+            assert_eq!(Inference::parse(w).map(Inference::as_str), Some(w));
         }
     }
 

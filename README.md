@@ -49,8 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.
 **Debian / Ubuntu**:
 
 ```bash
-curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.9.1-1_amd64.deb
-sudo apt install ./hushmic_0.9.1-1_amd64.deb
+curl -fsSLO https://github.com/Fovty/hushmic/releases/latest/download/hushmic_0.10.0-1_amd64.deb
+sudo apt install ./hushmic_0.10.0-1_amd64.deb
 ```
 
 **Arch Linux** (AUR):
@@ -128,7 +128,7 @@ Three clips are not a formal benchmark, but the source audio is public. Method, 
 
 ## How it works
 
-- [`hushmic-denoiser`](crates/hushmic-denoiser) runs the DPDFNet ONNX model on 48 kHz mono audio. It is a plain Rust library you can embed in your own app.
+- [`hushmic-denoiser`](crates/hushmic-denoiser) runs the DPDFNet model on 48 kHz mono audio, on ONNX Runtime or the native engine. It is a plain Rust library you can embed in your own app.
 - `dpdfnet-ladspa` wraps it as a LADSPA plugin.
 - `hushmic` writes a PipeWire `module-filter-chain` config and runs it as a child process. PipeWire owns the real-time scheduling, so no `setcap` is needed. A watchdog recreates the virtual mic after a PipeWire restart or suspend, and quitting restores your previous default input.
 
@@ -136,7 +136,7 @@ Three clips are not a formal benchmark, but the source audio is public. Method, 
 
 **Does my audio go anywhere?** No. Everything runs on the CPU and nothing is uploaded.
 
-**How much latency and CPU?** 80 ms of processing (10 ms framing, 40 ms model context, 30 ms scheduling margin) plus PipeWire's own buffering. On PipeWire 1.6 and later the latency is reported to the graph, so apps like OBS can compensate. The quality model takes about a third of one core; the light model is cheaper.
+**How much latency and CPU?** 80 ms of processing (10 ms framing, 40 ms model context, 30 ms scheduling margin) plus PipeWire's own buffering. On PipeWire 1.6 and later the latency is reported to the graph, so apps like OBS can compensate. On CPUs with AVX2 (most Intel Core and AMD Ryzen CPUs since 2015) the models run on a native engine that needs roughly half the CPU of ONNX Runtime. CPUs without it, including many older Pentium, Celeron and Atom chips, use ONNX Runtime: there the quality model takes about a third of a fast desktop core and more than a whole core on slow chips, where HushMic runs the cheaper light model on its own.
 
 **No tray icon on GNOME?** Install the *AppIndicator and KStatusNotifierItem Support* extension. HushMic keeps running without it.
 
@@ -154,7 +154,7 @@ More: [docs/troubleshooting.md](docs/troubleshooting.md).
 ```bash
 git clone https://github.com/Fovty/hushmic
 cd hushmic
-./scripts/setup-assets.sh        # fetch the DPDFNet models and ONNX Runtime
+./scripts/setup-assets.sh        # fetch the DPDFNet models, native weights and ONNX Runtime
 cargo build --release
 ```
 
@@ -170,4 +170,4 @@ MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)
 
 ## Credits
 
-[DPDFNet](https://github.com/ceva-ip/DPDFNet) by Ceva (Apache-2.0) is the speech-enhancement model. The real-time plugin follows the architecture of [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet). Built with [PipeWire](https://pipewire.org), [ort](https://github.com/pykeio/ort), [rustfft](https://github.com/ejmahler/RustFFT) and [ksni](https://github.com/iovxw/ksni). Demo voice: "After Love" by Sara Teasdale, read by a LibriVox volunteer (public domain); keyboard by C40115 and fan hum by Gravity Sound (CC BY 4.0); café ambience public domain. Details in [docs/demo/ASSETS.md](docs/demo/ASSETS.md).
+[DPDFNet](https://github.com/ceva-ip/DPDFNet) by Ceva (Apache-2.0) is the speech-enhancement model; the native engine is its authors' C runtime, included unmodified in [crates/hushmic-denoiser/native](crates/hushmic-denoiser/native) under the same license. The real-time plugin follows the architecture of [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet). Built with [PipeWire](https://pipewire.org), [ort](https://github.com/pykeio/ort), [rustfft](https://github.com/ejmahler/RustFFT) and [ksni](https://github.com/iovxw/ksni). Demo voice: "After Love" by Sara Teasdale, read by a LibriVox volunteer (public domain); keyboard by C40115 and fan hum by Gravity Sound (CC BY 4.0); café ambience public domain. Details in [docs/demo/ASSETS.md](docs/demo/ASSETS.md).

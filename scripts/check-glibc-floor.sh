@@ -25,4 +25,7 @@ for f in "$REPO_ROOT/target/release/hushmic" \
     fail=1
   fi
 done
+# The same builds must load: imports only from glibc/libgcc, LADSPA-only
+# exports (the native engine's C linked in, not left undefined).
+bash "$REPO_ROOT/scripts/check-plugin-symbols.sh" "$REPO_ROOT/target/release/libdpdfnet_ladspa.so" || fail=1
 exit "$fail"

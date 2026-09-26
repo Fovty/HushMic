@@ -49,6 +49,11 @@ pub struct Report {
     pub commands: Vec<(&'static str, bool)>,
     /// Tail of the filter-chain log; None = no log file yet.
     pub log_tail: Option<String>,
+    /// The configured engine choice (config `inference`).
+    pub inference_setting: String,
+    /// What the last chain's plugin ran each model on, from the whole
+    /// filter-chain log; None = no log file yet.
+    pub inference: Option<Vec<Inference>>,
     /// The filter-chain binary can declare latency (PipeWire >= 1.6).
     pub latency_supported: bool,
     /// Live read-back of what the running chain reports; None = nothing
@@ -107,6 +112,7 @@ pub fn collect() -> Report {
     // acquired = nothing was holding it. Err (unreadable path, foreign
     // owner) reads as "not running" — conservative, since the node-absent
     // problem only fires while an instance IS running.
+    let log = std::fs::read_to_string(log_path()).ok();
     let instance_running = matches!(
         crate::lock::try_lock(&crate::lock::default_lock_path()),
         Ok(None)
@@ -165,9 +171,9 @@ pub fn collect() -> Report {
             .into_iter()
             .map(|c| (c, on_path(c)))
             .collect(),
-        log_tail: std::fs::read_to_string(log_path())
-            .ok()
-            .map(|s| tail(&s, 40)),
+        log_tail: log.as_deref().map(|s| tail(s, 40)),
+        inference_setting: cfg.inference.as_str().to_string(),
+        inference: log.as_deref().map(inference_from_log),
         latency_supported: crate::pipewire::supports_latency_report(),
         latency_reported: crate::pipewire::chain_reported_latency(),
         capture_feeders: crate::pipewire::pw_dump()
@@ -258,6 +264,11 @@ pub fn render(r: &Report) -> (String, usize) {
         &mut out,
         false,
         format!("  per-mic profiles: {}", r.mic_profiles),
+    );
+    line(
+        &mut out,
+        false,
+        format!("  inference: {}", r.inference_setting),
     );
     line(
         &mut out,
@@ -383,6 +394,22 @@ pub fn render(r: &Report) -> (String, usize) {
             (false, format!("capture fed by: {}", feeders.join(", ")))
         };
         line(&mut out, bad, s);
+    }
+    // Which engine the last chain ran each model on (issue #18). A fact,
+    // never a problem: ONNX is a supported engine, and the reason says
+    // what would change it.
+    match &r.inference {
+        Some(v) if v.is_empty() => line(
+            &mut out,
+            false,
+            "inference: (not in the filter-chain log)".into(),
+        ),
+        Some(v) => {
+            for i in v {
+                line(&mut out, false, format!("inference: {i}"));
+            }
+        }
+        None => {}
     }
     match &r.sources {
         Some(s) if s.is_empty() => line(&mut out, false, "sources: 0".into()),
@@ -627,6 +654,118 @@ pub fn parse_engine_line(line: &[u8]) -> Option<EngineTier> {
     }
 }
 
+/// What the plugin runs one model on (issue #18), from its contract line
+/// `[dpdfnet-ladspa] inference: <engine>[ (<reason>)] for <model>`, e.g.
+/// `native int8` or `onnx (native weights not installed (...))`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inference {
+    pub model: String,
+    pub engine: String,
+    /// Why ONNX runs; None for a native engine.
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for Inference {
+    /// The plugin's own wording, without the head.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            Some(r) => write!(f, "{} ({r}) for {}", self.engine, self.model),
+            None => write!(f, "{} for {}", self.engine, self.model),
+        }
+    }
+}
+
+/// Parse an inference contract line. Like the tier line, the head is found
+/// anywhere in the line (a torn line can start with someone else's
+/// write) and the last occurrence wins.
+pub fn parse_inference_line(line: &[u8]) -> Option<Inference> {
+    const HEAD: &[u8] = b"[dpdfnet-ladspa] inference: ";
+    let head_at = (0..line.len().saturating_sub(HEAD.len()) + 1)
+        .rev()
+        .find(|&i| line[i..].starts_with(HEAD))?;
+    let rest = std::str::from_utf8(&line[head_at + HEAD.len()..]).ok()?;
+    let rest = rest.trim_end_matches(['\n', '\r']);
+    // `<engine> for <model>` or `<engine> (<reason>) for <model>`: the
+    // engine has no parentheses and the reason's are balanced, so the
+    // model is whatever follows the first " for " outside them (a model
+    // id may contain spaces or the word "for"; a reason may say "for").
+    let (engine, reason, model) = match rest.split_once(" (") {
+        Some((e, r)) if !e.contains(" for ") => {
+            let mut depth = 1usize;
+            let close = r.char_indices().find_map(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(i)
+            })?;
+            let model = r[close + 1..].strip_prefix(" for ")?;
+            (e, Some(r[..close].to_string()), model)
+        }
+        _ => {
+            let (e, m) = rest.split_once(" for ")?;
+            (e, None, m)
+        }
+    };
+    if model.trim().is_empty() {
+        return None;
+    }
+    if engine.is_empty() {
+        return None;
+    }
+    Some(Inference {
+        model: model.to_string(),
+        engine: engine.to_string(),
+        reason,
+    })
+}
+
+/// The running chain's inference lines, one per model, stamped with the
+/// generation that reported them (the same generations as the tier: a
+/// retired chain's entries are simply never read again).
+static INFERENCE: std::sync::Mutex<(u64, Vec<Inference>)> = std::sync::Mutex::new((0, Vec::new()));
+
+fn current_generation() -> u64 {
+    ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire) >> 8
+}
+
+fn store_inference(generation: u64, i: Inference) {
+    let mut g = INFERENCE.lock().unwrap_or_else(|e| e.into_inner());
+    if generation != current_generation() {
+        return;
+    }
+    if g.0 != generation {
+        *g = (generation, Vec::new());
+    }
+    g.1.retain(|old| old.model != i.model);
+    g.1.push(i);
+}
+
+/// What the running chain reports running `model` on; None before the
+/// plugin said so (or with a plugin that predates the line).
+pub fn inference_for(model: &str) -> Option<Inference> {
+    let g = INFERENCE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.0 != current_generation() {
+        return None;
+    }
+    g.1.iter().find(|i| i.model == model).cloned()
+}
+
+/// Every model's last inference line in a log, in first-seen order.
+pub fn inference_from_log(text: &str) -> Vec<Inference> {
+    let mut out: Vec<Inference> = Vec::new();
+    for line in text.lines() {
+        if let Some(i) = parse_inference_line(line.as_bytes()) {
+            match out.iter_mut().find(|o| o.model == i.model) {
+                Some(o) => *o = i,
+                None => out.push(i),
+            }
+        }
+    }
+    out
+}
+
 fn tee_with_cap(
     reader: impl std::io::Read + Send + 'static,
     log: std::path::PathBuf,
@@ -661,6 +800,9 @@ fn tee_with_cap(
             let _ = std::io::stderr().write_all(&line);
             if let Some(t) = parse_engine_line(&line) {
                 store_engine_tier(generation, t);
+            }
+            if let Some(i) = parse_inference_line(&line) {
+                store_inference(generation, i);
             }
             if let Some(f) = file.as_mut() {
                 if written + line.len() as u64 <= cap {
@@ -731,7 +873,131 @@ mod tests {
             prior_default: Some("alsa_input.usb-mic".into()),
             chain_quantum_pin: Some(crate::controller::PINNED_QUANTUM),
             forced_quantum: None,
+            inference_setting: "auto".into(),
+            inference: Some(vec![]),
         }
+    }
+
+    #[test]
+    fn inference_lines_parse_with_and_without_a_reason() {
+        assert_eq!(
+            parse_inference_line(
+                b"[dpdfnet-ladspa] inference: native int8 for dpdfnet8_48khz_hr\n"
+            ),
+            Some(Inference {
+                model: "dpdfnet8_48khz_hr".into(),
+                engine: "native int8".into(),
+                reason: None,
+            })
+        );
+        let i = parse_inference_line(
+            b"[pw] xrun[dpdfnet-ladspa] inference: onnx (native weights not installed \
+              (/usr/share/hushmic/models/dpdfnet2_48khz_hr.weights.f32)) for dpdfnet2_48khz_hr\r\n",
+        )
+        .unwrap();
+        assert_eq!(i.engine, "onnx");
+        assert_eq!(i.model, "dpdfnet2_48khz_hr");
+        assert_eq!(
+            i.reason.as_deref(),
+            Some("native weights not installed (/usr/share/hushmic/models/dpdfnet2_48khz_hr.weights.f32)")
+        );
+        // A reason may itself say "for".
+        let i = parse_inference_line(
+            b"[dpdfnet-ladspa] inference: onnx (CPU lacks AVX2/FMA for native int8) for m\n",
+        )
+        .unwrap();
+        assert_eq!(
+            i.reason.as_deref(),
+            Some("CPU lacks AVX2/FMA for native int8")
+        );
+        assert_eq!(
+            i.to_string(),
+            "onnx (CPU lacks AVX2/FMA for native int8) for m"
+        );
+        // A model id with spaces, or with "for" in it.
+        let i = parse_inference_line(
+            b"[dpdfnet-ladspa] inference: onnx (no native build of this model file) for my model for calls\n",
+        )
+        .unwrap();
+        assert_eq!(i.model, "my model for calls");
+        assert_eq!(
+            i.reason.as_deref(),
+            Some("no native build of this model file")
+        );
+        let i = parse_inference_line(b"[dpdfnet-ladspa] inference: native int8 for a b\n").unwrap();
+        assert_eq!(
+            (i.engine.as_str(), i.model.as_str()),
+            ("native int8", "a b")
+        );
+        for torn in [
+            &b"[dpdfnet-ladspa] inference: native int8"[..],
+            b"[dpdfnet-ladspa] inference: native int8 for \n",
+            b"[dpdfnet-ladspa] inference: onnx (no close for m\n",
+            b"[dpdfnet-ladspa] engine: quality (cost 0.42)\n",
+            b"inference: native int8 for m\n",
+        ] {
+            assert_eq!(
+                parse_inference_line(torn),
+                None,
+                "{}",
+                String::from_utf8_lossy(torn)
+            );
+        }
+        // The two contracts never read each other's lines.
+        assert_eq!(
+            parse_engine_line(b"[dpdfnet-ladspa] inference: native int8 for m\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_log_keeps_each_models_last_inference_line() {
+        let log = "[dpdfnet-ladspa] inference: native int8 for q\n\
+                   [dpdfnet-ladspa] inference: onnx (requested) for l\n\
+                   [dpdfnet-ladspa] engine: quality (cost 0.30)\n\
+                   [dpdfnet-ladspa] inference: onnx (requested) for q\n";
+        let v = inference_from_log(log);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].model.as_str(), v[0].engine.as_str()), ("q", "onnx"));
+        assert_eq!(v[1].model, "l");
+        assert!(inference_from_log("[hushmic] chain up\n").is_empty());
+    }
+
+    #[test]
+    fn doctor_reports_the_setting_and_each_models_engine_as_facts() {
+        let mut r = healthy();
+        r.inference = Some(vec![
+            Inference {
+                model: "dpdfnet8_48khz_hr".into(),
+                engine: "native int8".into(),
+                reason: None,
+            },
+            Inference {
+                model: "dpdfnet2_48khz_hr".into(),
+                engine: "onnx".into(),
+                reason: Some("CPU lacks AVX2/FMA for native int8".into()),
+            },
+        ]);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("  inference: auto\n"), "{text}");
+        assert!(
+            text.contains("inference: native int8 for dpdfnet8_48khz_hr\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "inference: onnx (CPU lacks AVX2/FMA for native int8) for dpdfnet2_48khz_hr\n"
+            ),
+            "{text}"
+        );
+        r.inference = Some(vec![]);
+        assert!(render(&r)
+            .0
+            .contains("inference: (not in the filter-chain log)"));
+        r.inference = None;
+        let (text, _) = render(&r);
+        assert!(!text.contains("inference: ("), "{text}");
     }
 
     #[test]
@@ -1202,5 +1468,33 @@ mod tests {
         assert_eq!(engine_tier(), Some(EngineTier::Quality));
         store_engine_tier(new_gen, EngineTier::Passthrough);
         assert_eq!(engine_tier(), Some(EngineTier::Quality));
+
+        // Inference lines follow the same generations.
+        let line = |engine: &str| Inference {
+            model: "q".into(),
+            engine: engine.into(),
+            reason: None,
+        };
+        store_inference(live, line("native int8"));
+        assert_eq!(inference_for("q"), Some(line("native int8")));
+        assert_eq!(inference_for("l"), None);
+        store_inference(new_gen, line("onnx"));
+        assert_eq!(inference_for("q"), Some(line("native int8")));
+        let next = new_engine_generation();
+        assert_eq!(inference_for("q"), None, "a new chain starts unreported");
+        store_inference(live, line("onnx"));
+        assert_eq!(
+            inference_for("q"),
+            None,
+            "a retired tee wrote the live engine"
+        );
+        let handle = tee_with_cap(
+            std::io::Cursor::new(b"[dpdfnet-ladspa] inference: native fp32 for q\n".to_vec()),
+            dir.join("tee-inference.log"),
+            LOG_CAP_BYTES,
+            next,
+        );
+        handle.join().unwrap();
+        assert_eq!(inference_for("q"), Some(line("native fp32")));
     }
 }

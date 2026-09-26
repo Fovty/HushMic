@@ -3,6 +3,7 @@
 #   * hushmic-<ver>-x86_64.tar.gz   (portable tarball + install.sh)
 #   * hushmic_<ver>-1_amd64.deb     (Debian/Ubuntu package)
 #   * hushmic-x86_64.AppImage       (self-contained AppImage)
+#   * <model>.onnx, <model>.weights.f32 (standalone models + native weights)
 #   * sha256sums.txt                (checksums over the above)
 #
 # Runnable locally and by CI. Requires: rust/cargo, cargo-deb, python3 (optional),
@@ -79,6 +80,12 @@ install -m 644 "$PLUGIN" "$STAGE/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$STAGE/lib/hushmic/"
 chmod 755 "$STAGE/lib/hushmic/"libonnxruntime.so*
 install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$STAGE/share/hushmic/models/"
+# Native engine weights (issue #18), next to the models they belong to.
+# Explicit names so a missing file fails the build: without them every
+# install silently runs ONNX.
+install -m 644 "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.weights.f32" \
+               "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.weights.f32" \
+               "$STAGE/share/hushmic/models/"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$STAGE/share/applications/hushmic.desktop"
 install -d -m 755 "$STAGE/lib/systemd/user"
 install -m 644 "$REPO_ROOT/packaging/systemd/hushmic.service" "$STAGE/lib/systemd/user/hushmic.service"
@@ -135,6 +142,9 @@ install -m 644 "$PLUGIN" "$APPDIR/usr/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$APPDIR/usr/lib/"
 chmod 755 "$APPDIR/usr/lib/"libonnxruntime.so*
 install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$APPDIR/usr/share/hushmic/models/"
+install -m 644 "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.weights.f32" \
+               "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.weights.f32" \
+               "$APPDIR/usr/share/hushmic/models/"
 # Tray status icons: AppRun points HUSHMIC_TRAY_THEME_DIR at this tree so SNI
 # hosts can resolve the names outside the system hicolor theme.
 for size in $TRAY_SIZES; do
@@ -235,12 +245,16 @@ echo "  -> dist/hushmic-${ARCH}.AppImage"
 log "Copying model assets"
 cp "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.onnx" \
    "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.onnx" "$DIST/"
+# The native weights too: a mirror of the pinned upstream files that the
+# source builds (setup-assets.sh, Flatpak, Nix) fall back to.
+install -m 644 "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.weights.f32" \
+               "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.weights.f32" "$DIST/"
 
 # ---------------------------------------------------------------------------
 # 5. Checksums
 # ---------------------------------------------------------------------------
 log "Computing checksums"
-( cd "$DIST" && sha256sum ./*.tar.gz ./*.deb ./*.AppImage ./*.onnx > sha256sums.txt )
+( cd "$DIST" && sha256sum ./*.tar.gz ./*.deb ./*.AppImage ./*.onnx ./*.weights.f32 > sha256sums.txt )
 cat "$DIST/sha256sums.txt"
 
 log "Done. Artifacts in dist/:"

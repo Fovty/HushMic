@@ -604,7 +604,7 @@ settings (applied live while running, saved to the file otherwise):
        hushmic config path
        hushmic devices [--json]          microphones usable as `mic`
        hushmic service install|uninstall systemd user unit for this install
-  keys: mic model attn_limit set_default autostart tray tray_icon notifications
+  keys: mic model attn_limit set_default autostart tray tray_icon notifications inference
 
 exit codes: 0 ok, 1 usage/failed, 2 not running (control commands only)
 "
@@ -1136,6 +1136,15 @@ fn main() {
                             settings_device(&cfg, &controller, &mut target_cache).as_deref(),
                         );
                         let saved = profile.device.clone().filter(|_| profile.saved);
+                        let engine = controller
+                            .is_running()
+                            .then(hushmic::diagnostics::engine_tier)
+                            .flatten();
+                        let configured_light = controller.active_model_is_light();
+                        let inference = controller
+                            .active_model()
+                            .and_then(|m| control::live_model(engine, m, configured_light))
+                            .and_then(|m| hushmic::diagnostics::inference_for(&m));
                         let s = control::Status {
                             version: env!("CARGO_PKG_VERSION").to_string(),
                             mode: cfg.enabled.then(|| controller.mode()),
@@ -1155,11 +1164,9 @@ fn main() {
                             chain_running: controller.is_running(),
                             node_present: last_node_present,
                             tray_sni: handle.is_sni(),
-                            engine: controller
-                                .is_running()
-                                .then(hushmic::diagnostics::engine_tier)
-                                .flatten(),
-                            configured_light: controller.active_model_is_light(),
+                            engine,
+                            configured_light,
+                            inference,
                         };
                         let payload = if json {
                             control::render_status_json(&s)

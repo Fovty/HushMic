@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.10.0" date="2026-09-26">
+      <description>
+        <p>
+          On CPUs with AVX2 both models now run on the DPDFNet authors'
+          native INT8 engine, using about half the CPU with unchanged
+          quality. Model and strength now always follow the microphone in
+          use.
+        </p>
+      </description>
+    </release>
     <release version="0.9.1" date="2026-09-22">
       <description>
         <p>

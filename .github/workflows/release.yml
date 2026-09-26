@@ -87,6 +87,8 @@ jobs:
             dist/hushmic-*-x86_64.tar.gz
             dist/dpdfnet8_48khz_hr.onnx
             dist/dpdfnet2_48khz_hr.onnx
+            dist/dpdfnet8_48khz_hr.weights.f32
+            dist/dpdfnet2_48khz_hr.weights.f32
             dist/sha256sums.txt
           generate_release_notes: true
           # A tag with a suffix is a test build: marked as a prerelease (so it

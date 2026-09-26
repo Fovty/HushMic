@@ -83,6 +83,9 @@ assets = [
   ["../../assets/lib/libonnxruntime.so", "usr/lib/hushmic/", "644"],
   ["../../assets/models/dpdfnet8_48khz_hr.onnx", "usr/share/hushmic/models/", "644"],
   ["../../assets/models/dpdfnet2_48khz_hr.onnx", "usr/share/hushmic/models/", "644"],
+  # Native engine weights (issue #18), beside the models they belong to.
+  ["../../assets/models/dpdfnet8_48khz_hr.weights.f32", "usr/share/hushmic/models/", "644"],
+  ["../../assets/models/dpdfnet2_48khz_hr.weights.f32", "usr/share/hushmic/models/", "644"],
   ["../../packaging/hushmic.desktop", "usr/share/applications/", "644"],
   # User unit (not the `systemd-units` key: that generates SYSTEM-unit
   # maintainer scripts). Enabled per user with `systemctl --user enable`.

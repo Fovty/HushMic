@@ -435,6 +435,17 @@ context.modules = [
 /// The light model's id: the plugin's fallback tier under CPU pressure.
 pub const LIGHT_MODEL: &str = "dpdfnet2_48khz_hr";
 
+/// What the chain's `HUSHMIC_INFERENCE` should be set to for the
+/// configured engine choice (issue #18): only `onnx` needs saying, since
+/// the plugin's default is auto. A value already in our own environment is
+/// a debugging override and is inherited unchanged.
+pub fn plugin_inference(
+    setting: crate::config::Inference,
+    inherited: bool,
+) -> Option<&'static str> {
+    (setting == crate::config::Inference::Onnx && !inherited).then_some("onnx")
+}
+
 pub const LATENCY_SAMPLES: u32 = 3840;
 
 /// The graph quantum the chain pins while it runs (issue #10). With
@@ -749,6 +760,10 @@ impl Controller {
             .arg(&path)
             .env("HUSHMIC_MODEL_PATH", &model)
             .env("ORT_DYLIB_PATH", &self.paths.dylib);
+        let inherited = std::env::var_os("HUSHMIC_INFERENCE").is_some_and(|v| !v.is_empty());
+        if let Some(word) = plugin_inference(adjusted.inference, inherited) {
+            command.env("HUSHMIC_INFERENCE", word);
+        }
         // The light model is the plugin's fallback tier under CPU pressure
         // (issue #14); a chain already on it, or a stripped install, gets no
         // fallback model and the plugin degrades to raw audio instead.
@@ -980,5 +995,19 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         let _ = self.disable(); // clean teardown + default restore on quit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Inference;
+
+    #[test]
+    fn only_onnx_is_passed_on_and_an_override_wins() {
+        assert_eq!(plugin_inference(Inference::Onnx, false), Some("onnx"));
+        assert_eq!(plugin_inference(Inference::Auto, false), None);
+        assert_eq!(plugin_inference(Inference::Onnx, true), None);
+        assert_eq!(plugin_inference(Inference::Auto, true), None);
     }
 }

@@ -21,12 +21,18 @@
 //!   a distro package works out of the box; bundling apps call
 //!   [`init_runtime`] first. Build with `default-features = false` to pick
 //!   your own `ort` linking strategy instead.
+//!
+//! The optional `native` feature adds the DPDFNet authors' C runtime as a
+//! second engine (INT8 on x86-64 CPUs with AVX2 and FMA, about half the CPU
+//! per hop); see `Denoiser::from_file_with`. ONNX stays the fallback.
 
 mod attn;
 mod denoiser;
 mod error;
 mod mode;
 mod model;
+#[cfg(feature = "native")]
+mod native;
 mod runtime;
 mod stft;
 mod stream;
@@ -34,6 +40,8 @@ mod stream;
 pub use denoiser::Denoiser;
 pub use error::Error;
 pub use mode::{GainRamp, Mode, MUTE_RAMP_SAMPLES};
+#[cfg(feature = "native")]
+pub use native::{Engine, Inference};
 #[cfg(feature = "load-dynamic")]
 pub use runtime::{init_runtime, RuntimeInit};
 pub use stream::StreamDenoiser;
@@ -61,5 +69,8 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<crate::Denoiser>();
         assert_send::<crate::StreamDenoiser>();
+        // The native engine keeps the auto traits the ONNX one has.
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<crate::Denoiser>();
     }
 }

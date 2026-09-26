@@ -16,6 +16,13 @@ categories = ["multimedia::audio"]
 # features are additive and could never subtract it.
 default = ["load-dynamic"]
 load-dynamic = ["ort/load-dynamic", "dep:libloading"]
+# The DPDFNet authors' C runtime (vendored under native/) as a second
+# inference engine: about half the CPU of ONNX Runtime per hop with INT8 on
+# x86-64 CPUs with AVX2, chosen per model at load time with ONNX as the
+# fallback (Denoiser::from_file_with). Needs a C compiler at build time.
+# Off by default so the crate's default API and build needs stay as they
+# are; HushMic's plugin turns it on.
+native = ["dep:cc", "dep:sha2"]
 
 [dependencies]
 rustfft = "6"
@@ -27,6 +34,11 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 # For the pre-flight dylib check (see runtime.rs): ort rc.12's own failure
 # path deadlocks, so the library must be validated before ort touches it.
 libloading = { version = "0.9", optional = true }
+# native: recognizing model files and verifying the weight files.
+sha2 = { version = "0.11", optional = true }
+
+[build-dependencies]
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 hound = "3.5"
@@ -46,9 +58,17 @@ required-features = ["load-dynamic"]
 name = "parity"
 required-features = ["load-dynamic"]
 
+[[test]]
+name = "native"
+required-features = ["load-dynamic", "native"]
+
 # Self-exec harness: the ONNX Runtime environment commit is process-global and
 # first-wins, so each lifecycle sequence needs a fresh subprocess.
 [[test]]
 name = "runtime_lifecycle"
 harness = false
 required-features = ["load-dynamic"]
+
+[[example]]
+name = "bench_native"
+required-features = ["load-dynamic", "native"]

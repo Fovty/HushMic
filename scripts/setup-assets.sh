@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Provision the gitignored binary assets that the build needs:
 #   1. ONNX models   -> assets/models/{dpdfnet8_48khz_hr,dpdfnet2_48khz_hr}.onnx
-#   2. ONNX Runtime  -> assets/lib/libonnxruntime.so{,.1,.1.27.0}
+#   2. Native weights -> assets/models/<model>.weights.f32 (native engine)
+#   3. ONNX Runtime  -> assets/lib/libonnxruntime.so{,.1,.1.27.0}
 #
 # Self-sufficient for a fresh CI checkout, and SUPPLY-CHAIN PINNED: the dpdfnet
 # package version, every model file, and the ONNX Runtime tarball are verified
@@ -26,6 +27,23 @@ MODELS=(dpdfnet8_48khz_hr dpdfnet2_48khz_hr)
 declare -A MODEL_SHA256=(
   [dpdfnet8_48khz_hr]="7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631"
   [dpdfnet2_48khz_hr]="7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+)
+
+# Packed FP32 weights for the native engine, from the DPDFNet repository at
+# the commit whose C sources are vendored in crates/hushmic-denoiser/native/
+# (keep the two in step). The sums are upstream's SHA256SUMS; the runtime
+# checks them again before loading.
+DPDFNET_NATIVE_COMMIT="6a5dbd3ea5dbea88c30a2be8e7c689b5eb26b533"
+DPDFNET_NATIVE_URL="https://raw.githubusercontent.com/ceva-ip/DPDFNet/${DPDFNET_NATIVE_COMMIT}/native_inference/artifacts/v1"
+# Fallback: every HushMic release since 0.10 attaches the same files. The
+# workspace version's release first, then the latest one (a tree bumped
+# ahead of its release has no assets yet); the sha256 pins below still
+# decide what is accepted.
+HUSHMIC_VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+HUSHMIC_RELEASES="https://github.com/Fovty/hushmic/releases"
+declare -A WEIGHTS_SHA256=(
+  [dpdfnet8_48khz_hr]="5a5bb67a8619090c54dc2793536fe813fe38123b236d445f3433aafe3075529d"
+  [dpdfnet2_48khz_hr]="cb7248b8fccbff7b32f254ec2ed0061e604514b2ccd98d997cd081a876424e7b"
 )
 
 mkdir -p "$REPO_ROOT/assets/lib" "$REPO_ROOT/assets/models"
@@ -114,7 +132,41 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. ONNX Runtime shared library (pinned ${ORT_VERSION}) for ort's load-dynamic.
+# 2. Native engine weights: fetched from the pinned commit, hash-verified.
+# ---------------------------------------------------------------------------
+for m in "${MODELS[@]}"; do
+  dest="$REPO_ROOT/assets/models/$m.weights.f32"
+  if file_ok "$dest" "${WEIGHTS_SHA256[$m]}"; then
+    continue
+  fi
+  echo "Downloading native weights for $m..."
+  fetched=""
+  for url in "$DPDFNET_NATIVE_URL/$m/weights.f32" \
+             "$HUSHMIC_RELEASES/download/v$HUSHMIC_VERSION/$m.weights.f32" \
+             "$HUSHMIC_RELEASES/latest/download/$m.weights.f32"; do
+    rm -f "$dest.dl"
+    if ! curl -fsSL "$url" -o "$dest.dl"; then
+      echo "  not available from $url" >&2
+      continue
+    fi
+    if file_ok "$dest.dl" "${WEIGHTS_SHA256[$m]}"; then
+      fetched=1
+      break
+    fi
+    echo "  $url does not match the pinned sha256; ignored" >&2
+  done
+  if [ -z "$fetched" ]; then
+    rm -f "$dest.dl"
+    echo "ERROR: no source served $m weights matching their pinned sha256; aborting." >&2
+    exit 1
+  fi
+  chmod 644 "$dest.dl"
+  mv -f "$dest.dl" "$dest"
+  echo "  fetched + verified $m.weights.f32"
+done
+
+# ---------------------------------------------------------------------------
+# 3. ONNX Runtime shared library (pinned ${ORT_VERSION}) for ort's load-dynamic.
 #    We keep ONE real file (libonnxruntime.so.1.27.0) plus the two symlinks
 #    (.so.1 -> .so.1.27.0, .so -> .so.1) that ort/loaders expect.
 # ---------------------------------------------------------------------------

@@ -42,6 +42,11 @@ package() {
     "$pkgdir/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx"
   install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.onnx \
     "$pkgdir/usr/share/hushmic/models/dpdfnet2_48khz_hr.onnx"
+  # Native engine weights, next to the models they belong to.
+  install -Dm644 share/hushmic/models/dpdfnet8_48khz_hr.weights.f32 \
+    "$pkgdir/usr/share/hushmic/models/dpdfnet8_48khz_hr.weights.f32"
+  install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.weights.f32 \
+    "$pkgdir/usr/share/hushmic/models/dpdfnet2_48khz_hr.weights.f32"
 
   install -Dm644 lib/systemd/user/hushmic.service \
     "$pkgdir/usr/lib/systemd/user/hushmic.service"

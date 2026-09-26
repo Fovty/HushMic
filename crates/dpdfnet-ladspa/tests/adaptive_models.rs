@@ -1,6 +1,9 @@
 //! Asset-gated pins for the adaptive engine with the real models: a pinned
 //! model tier must be the bare `Denoiser`, bit for bit (the wrapper adds
 //! nothing to the audio), and the raw tier must be the exact delayed input.
+//! Models load the way the plugin loads them: on the product default engine
+//! (native INT8 where the CPU has it), with the pinned-tier pins repeated
+//! on ONNX.
 
 mod common;
 
@@ -26,7 +29,44 @@ fn fixture() -> Vec<f32> {
     read_flac_mono_f32(&common::repo_root().join("tests/fixtures/noisy_public_48k.flac"))
 }
 
+/// Which engine a test's models run on.
+#[derive(Clone, Copy)]
+enum Engine {
+    /// What the plugin runs without HUSHMIC_INFERENCE.
+    Default,
+    Onnx,
+}
+
 fn dev_denoiser(model: &str) -> Option<Denoiser> {
+    dev_denoiser_on(model, Engine::Default)
+}
+
+#[cfg(feature = "native")]
+fn dev_denoiser_on(model: &str, engine: Engine) -> Option<Denoiser> {
+    use hushmic_denoiser::Inference;
+    let mp = common::model_path(model)?;
+    let rt = common::runtime_path()?;
+    hushmic_denoiser::init_runtime(rt).expect("bundled runtime must load");
+    let inference = match engine {
+        Engine::Default => Inference::Auto,
+        Engine::Onnx => Inference::Onnx,
+    };
+    let d = dpdfnet_ladspa::load_denoiser_with(&mp, Ok(inference)).expect("denoiser");
+    // With the weights provisioned on an AVX2 machine the default must
+    // really be native, or this suite silently tests ONNX twice.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(engine, Engine::Default)
+        && std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && mp.with_extension("weights.f32").exists()
+    {
+        assert!(d.engine().is_native(), "{:?}", d.fallback_reason());
+    }
+    Some(d)
+}
+
+#[cfg(not(feature = "native"))]
+fn dev_denoiser_on(model: &str, _engine: Engine) -> Option<Denoiser> {
     let mp = common::model_path(model)?;
     let rt = common::runtime_path()?;
     hushmic_denoiser::init_runtime(rt).expect("bundled runtime must load");
@@ -45,11 +85,13 @@ fn stream(engine: &mut dyn HopEngine, input: &[f32]) -> Vec<f32> {
     out
 }
 
-fn pinned_tier_matches_bare(main: &str, other: &str, tier: Tier) {
+fn pinned_tier_matches_bare(main: &str, other: &str, tier: Tier, engine: Engine) {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (Some(mut bare), Some(a), Some(b)) =
-        (dev_denoiser(main), dev_denoiser(main), dev_denoiser(other))
-    else {
+    let (Some(mut bare), Some(a), Some(b)) = (
+        dev_denoiser_on(main, engine),
+        dev_denoiser_on(main, engine),
+        dev_denoiser_on(other, engine),
+    ) else {
         eprintln!("skipping: dev assets not provisioned");
         return;
     };
@@ -72,20 +114,26 @@ fn pinned_tier_matches_bare(main: &str, other: &str, tier: Tier) {
 
 #[test]
 fn pinned_quality_is_the_bare_quality_denoiser() {
-    pinned_tier_matches_bare(
-        "dpdfnet8_48khz_hr.onnx",
-        "dpdfnet2_48khz_hr.onnx",
-        Tier::Quality,
-    );
+    for engine in [Engine::Default, Engine::Onnx] {
+        pinned_tier_matches_bare(
+            "dpdfnet8_48khz_hr.onnx",
+            "dpdfnet2_48khz_hr.onnx",
+            Tier::Quality,
+            engine,
+        );
+    }
 }
 
 #[test]
 fn pinned_light_is_the_bare_light_denoiser() {
-    pinned_tier_matches_bare(
-        "dpdfnet2_48khz_hr.onnx",
-        "dpdfnet8_48khz_hr.onnx",
-        Tier::Light,
-    );
+    for engine in [Engine::Default, Engine::Onnx] {
+        pinned_tier_matches_bare(
+            "dpdfnet2_48khz_hr.onnx",
+            "dpdfnet8_48khz_hr.onnx",
+            Tier::Light,
+            engine,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

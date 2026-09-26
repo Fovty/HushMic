@@ -26,7 +26,7 @@ release tag:
 
 ```toml
 [dependencies]
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.9.1" }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.0" }
 ```
 
 ## What you need at runtime
@@ -58,9 +58,39 @@ feature and configure [`ort`](https://crates.io/crates/ort) yourself; cargo
 merges the features:
 
 ```toml
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.9.1", default-features = false }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.0", default-features = false }
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 ```
+
+## Native engine (optional)
+
+The `native` feature adds a second engine: the DPDFNet authors' C
+runtime, included in this crate (`native/`) and compiled by `build.rs`, so
+it needs a C compiler. On x86-64 CPUs with AVX2 and FMA it runs the models
+with 8-bit matrix math in roughly half the CPU time of ONNX Runtime, with
+no measurable difference in quality.
+
+```toml
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.0", features = ["native"] }
+```
+
+```rust
+use hushmic_denoiser::{Denoiser, Inference};
+
+let denoiser = Denoiser::from_file_with("dpdfnet8_48khz_hr.onnx", Inference::Auto)?;
+println!("running on {}", denoiser.engine()); // "native int8" or "onnx"
+```
+
+The engine needs the model's packed weights, `<model>.weights.f32`, in the
+same directory as the `.onnx` file. They come from the DPDFNet repository
+at the commit the C sources are taken from, and every HushMic release
+since 0.10.0 attaches the same files (`<model>.weights.f32`, listed in its
+`sha256sums.txt`); `scripts/setup-assets.sh` in the HushMic repository
+downloads and verifies them. The model file itself
+is still needed: it identifies the model, and ONNX Runtime is the fallback
+whenever the native engine cannot run (no AVX2, missing or damaged
+weights, an unrecognized model file). `Denoiser::fallback_reason` says
+why. `Inference::NativeFp32` is also available for comparisons.
 
 ## Example
 
@@ -73,6 +103,7 @@ WAV.
 
 ## License
 
-MIT OR Apache-2.0, like the rest of HushMic. The DPDFNet models and reference
-implementation are by [Ceva](https://github.com/ceva-ip/DPDFNet)
-(Apache-2.0).
+MIT OR Apache-2.0, like the rest of HushMic. The DPDFNet models, reference
+implementation and native runtime are by
+[Ceva](https://github.com/ceva-ip/DPDFNet) (Apache-2.0); `native/README.md`
+lists the included files and their origin.

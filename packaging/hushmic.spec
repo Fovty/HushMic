@@ -73,6 +73,11 @@ install -Dm644 share/hushmic/models/dpdfnet8_48khz_hr.onnx \
   %{buildroot}%{_datadir}/hushmic/models/dpdfnet8_48khz_hr.onnx
 install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.onnx \
   %{buildroot}%{_datadir}/hushmic/models/dpdfnet2_48khz_hr.onnx
+# Native engine weights, next to the models they belong to.
+install -Dm644 share/hushmic/models/dpdfnet8_48khz_hr.weights.f32 \
+  %{buildroot}%{_datadir}/hushmic/models/dpdfnet8_48khz_hr.weights.f32
+install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.weights.f32 \
+  %{buildroot}%{_datadir}/hushmic/models/dpdfnet2_48khz_hr.weights.f32
 
 install -Dm644 share/applications/hushmic.desktop \
   %{buildroot}%{_datadir}/applications/hushmic.desktop
