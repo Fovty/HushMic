@@ -766,7 +766,7 @@ impl Controller {
         }
         // The light model is the plugin's fallback tier under CPU pressure
         // (issue #14); a chain already on it, or a stripped install, gets no
-        // fallback model and the plugin degrades to raw audio instead.
+        // fallback model and the plugin keeps the selected model.
         let light = self.paths.model_dir.join(format!("{LIGHT_MODEL}.onnx"));
         if adjusted.model != LIGHT_MODEL && light.exists() {
             command.env("HUSHMIC_FALLBACK_MODEL_PATH", &light);
