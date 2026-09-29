@@ -1,9 +1,0 @@
-tray-title = HushMic
-tray-title-error = HushMic (errore)
-tray-title-light = HushMic (modello leggero)
-tray-test-mic = Test del microfono…
-tray-mode = Modalità
-tray-mode-suppress = Cancellazione del rumore
-tray-microphone = Microfono
-tray-model = Modello
-tray-set-default = Imposta come microfono predefinito
