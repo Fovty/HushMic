@@ -418,6 +418,10 @@ pub fn spawn_listener(listener: UnixListener, tx: Sender<ControlReq>) {
     });
 }
 
+/// `client_run`'s output when the tray took the request but never
+/// answered (exit 1, like a refused request — this tells them apart).
+pub const NO_REPLY: &str = "no reply from HushMic";
+
 /// Run one CLI command against the socket at `path`. Returns
 /// `(exit code, output)`; the caller prints the output (stdout on 0,
 /// stderr otherwise) and exits with the code. Usage errors exit 1 without
@@ -450,7 +454,7 @@ pub fn client_run_at(path: &Path, words: &[String]) -> (i32, String) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut raw = String::new();
     if stream.read_to_string(&mut raw).is_err() || raw.is_empty() {
-        return (1, "no reply from HushMic".to_string());
+        return (1, NO_REPLY.to_string());
     }
     let (ok, payload) = decode_response(&raw);
     (if ok { 0 } else { 1 }, payload)

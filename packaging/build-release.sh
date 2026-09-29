@@ -2,7 +2,7 @@
 # Build all hushmic release artifacts into dist/ (version from Cargo.toml):
 #   * hushmic-<ver>-x86_64.tar.gz   (portable tarball + install.sh)
 #   * hushmic_<ver>-1_amd64.deb     (Debian/Ubuntu package)
-#   * hushmic-x86_64.AppImage       (self-contained AppImage)
+#   * hushmic-x86_64.AppImage       (self-contained AppImage, + .zsync)
 #   * <model>.onnx, <model>.weights.f32 (standalone models + native weights)
 #   * sha256sums.txt                (checksums over the above)
 #
@@ -141,6 +141,15 @@ install -m 755 "$BIN" "$APPDIR/usr/bin/hushmic"
 install -m 644 "$PLUGIN" "$APPDIR/usr/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$APPDIR/usr/lib/"
 chmod 755 "$APPDIR/usr/lib/"libonnxruntime.so*
+# winit dlopens libxkbcommon-x11 for its X11 windows; minimal X11 systems
+# (and the AppImage catalog's test runner) lack it and the A/B and About
+# windows panic on open. Bundle it with its libxcb-xkb dependency; NOT
+# libxkbcommon itself, which is everywhere and must match the host's.
+for lib in libxkbcommon-x11.so.0 libxcb-xkb.so.1; do
+  src=$(ldconfig -p | awk -v l="$lib" '$1 == l && /x86-64/ { print $NF; exit }')
+  [ -n "$src" ] || { echo "error: $lib not found on the build host (apt install libxkbcommon-x11-0 libxcb-xkb1)" >&2; exit 1; }
+  install -m 644 "$(readlink -f "$src")" "$APPDIR/usr/lib/$lib"
+done
 install -m 644 "$REPO_ROOT"/assets/models/*.onnx "$APPDIR/usr/share/hushmic/models/"
 install -m 644 "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.weights.f32" \
                "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.weights.f32" \
@@ -163,6 +172,20 @@ for size in $TRAY_SYMBOLIC_DIRS; do
 done
 install -m755 "$REPO_ROOT/packaging/AppRun" "$APPDIR/AppRun"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$APPDIR/hushmic.desktop"
+# AppStream metainfo (the AppImage catalog reads summary, license and
+# screenshot from it): the Flatpak copy, launchable pointed at our desktop id.
+# The catalog only picks up the *.appdata.xml spelling.
+install -d -m 755 "$APPDIR/usr/share/metainfo"
+# vcs-browser is dropped: the catalog's older appstreamcli rejects it.
+sed -e 's|<launchable type="desktop-id">io.github.fovty.HushMic.desktop</launchable>|<launchable type="desktop-id">hushmic.desktop</launchable>|' \
+    -e '/<url type="vcs-browser">/d' \
+  "$REPO_ROOT/packaging/flatpak/io.github.fovty.HushMic.metainfo.xml" \
+  > "$APPDIR/usr/share/metainfo/io.github.fovty.HushMic.appdata.xml"
+install -d -m 755 "$APPDIR/usr/share/applications"
+install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$APPDIR/usr/share/applications/hushmic.desktop"
+grep -q '<launchable type="desktop-id">hushmic.desktop</launchable>' \
+  "$APPDIR/usr/share/metainfo/io.github.fovty.HushMic.appdata.xml" \
+  || { echo "error: AppImage metainfo launchable was not rewritten" >&2; exit 1; }
 
 # Icon: use the repo icon if present, else decode the embedded placeholder.
 if [ -f "$REPO_ROOT/packaging/hushmic.png" ]; then
@@ -229,12 +252,19 @@ fi
 # --appimage-extract-and-run avoids needing FUSE in CI/sandboxes.
 # appimagetool reads the target arch from $ARCH.
 export ARCH
-"$APPIMAGETOOL" --appimage-extract-and-run \
+# Update information lets AppImageUpdate (and the catalog) fetch only the
+# changed blocks of the latest release. appimagetool writes the matching
+# .zsync into its WORKING directory (not next to the output), hence the cd;
+# it is published alongside the AppImage.
+( cd "$DIST" && "$APPIMAGETOOL" --appimage-extract-and-run \
   --runtime-file "$RUNTIME_FILE" \
-  --no-appstream "$APPDIR" "$DIST/hushmic-${ARCH}.AppImage"
+  -u "gh-releases-zsync|Fovty|HushMic|latest|hushmic-${ARCH}.AppImage.zsync" \
+  --no-appstream "$APPDIR" "$DIST/hushmic-${ARCH}.AppImage" )
 chmod +x "$DIST/hushmic-${ARCH}.AppImage"
+[ -s "$DIST/hushmic-${ARCH}.AppImage.zsync" ] \
+  || { echo "error: appimagetool wrote no .zsync file (an appimagetool without its bundled zsyncmake?)" >&2; exit 1; }
 rm -rf "$APPDIR"
-echo "  -> dist/hushmic-${ARCH}.AppImage"
+echo "  -> dist/hushmic-${ARCH}.AppImage (+ .zsync)"
 
 # ---------------------------------------------------------------------------
 # 4. Standalone model files (for hushmic-denoiser library consumers)
@@ -254,7 +284,7 @@ install -m 644 "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.weights.f32" \
 # 5. Checksums
 # ---------------------------------------------------------------------------
 log "Computing checksums"
-( cd "$DIST" && sha256sum ./*.tar.gz ./*.deb ./*.AppImage ./*.onnx ./*.weights.f32 > sha256sums.txt )
+( cd "$DIST" && sha256sum ./*.tar.gz ./*.deb ./*.AppImage ./*.AppImage.zsync ./*.onnx ./*.weights.f32 > sha256sums.txt )
 cat "$DIST/sha256sums.txt"
 
 log "Done. Artifacts in dist/:"

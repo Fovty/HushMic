@@ -86,7 +86,8 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config git curl ca-certificates binutils file \
-            python3.11 python3.11-venv squashfs-tools desktop-file-utils
+            python3.11 python3.11-venv squashfs-tools desktop-file-utils \
+            libxkbcommon-x11-0 libxcb-xkb1
 
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

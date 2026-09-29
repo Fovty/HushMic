@@ -1,3 +1,4 @@
+use hushmic::abtest::types::{LaunchGate, LAUNCH_ENV};
 use hushmic::config::Config;
 use hushmic::control;
 use hushmic::controller::{self, Controller, Paths, RunMode};
@@ -220,11 +221,35 @@ fn spawn_child_window(
     c.spawn()
 }
 
+/// The spawned A/B test window child (PDEATHSIG-bound to the tray).
+struct AbWindow {
+    child: std::process::Child,
+    spawned: Instant,
+    /// The USER asked for a mic test (tray click): only that path may
+    /// escalate to the audio-only fallback recording when the window
+    /// cannot start (no GL, headless). Launch-driven windows (plain
+    /// `hushmic`, relaunch forwarding) must not: they would turn "open the
+    /// app" into an unsolicited microphone recording.
+    user_initiated: bool,
+    /// Opened by a launch with suppression off: its overlay waits for
+    /// exactly the off→on switch (see `closes_ab_window`).
+    awaits_suppression: bool,
+}
+
+/// Whether a tray command closes the open A/B window. A chain mutation
+/// normally does (the window would compare the old mic against the new
+/// output), except the off→on switch a suppression-off launch window is
+/// waiting for: that window was opened without a chain, and its backend
+/// picks the new nodes up by itself. Pure.
+fn closes_ab_window(mutates_chain: bool, off_to_on: bool, awaits_suppression: bool) -> bool {
+    mutates_chain && !(off_to_on && awaits_suppression)
+}
+
 /// SIGTERM a still-live A/B window child, reap it, and sweep the transient
 /// WAVs its detached backend may not get to delete. Its pw children die via
 /// PDEATHSIG. No-op on an already-exited (or absent) child.
-fn close_ab_window(ab_window: &mut Option<(std::process::Child, Instant, bool)>) {
-    if let Some((child, ..)) = ab_window.as_mut() {
+fn close_ab_window(ab_window: &mut Option<AbWindow>) {
+    if let Some(AbWindow { child, .. }) = ab_window.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
             unsafe {
                 libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
@@ -405,7 +430,7 @@ fn apply_config(
     apply: &dyn Fn(&mut Controller, &Config) -> Result<(), String>,
     testing: bool,
     mictest_cancel: &Option<Arc<AtomicBool>>,
-    ab_window: &mut Option<(std::process::Child, Instant, bool)>,
+    ab_window: &mut Option<AbWindow>,
     gate: &mut FailureGate,
 ) -> Result<(), String> {
     let d = hushmic::config_cli::diff(cfg, &new);
@@ -742,38 +767,40 @@ fn main() {
     if test_window {
         // The child sends its own notifications: honour the same switch.
         notify::set_enabled(Config::load().notifications);
-        // pw-cat before the mid-2022 rework (Ubuntu 22.04 ships 0.3.48) cannot
-        // stream a capture to a pipe — which is how the live view reads audio —
-        // so the A/B window can only sit at −∞ there. Explain and exit 1: the
-        // tray then runs the file-based recording test (pw-cat writes a real
-        // file fine on every version), reusing the same path as the no-GL
-        // fallback. Standalone `--test-window` just prints the reason and exits.
+        // A plain launch opens the window even when the mic test is blocked
+        // (suppression off, PipeWire unreachable); the tray says which.
+        let gate = std::env::var(LAUNCH_ENV)
+            .map(|v| LaunchGate::from_env(&v))
+            .unwrap_or_default();
+        // Old pw-cat cannot stream a capture to a pipe (see
+        // exit_needs_newer_pipewire). The probe is inconclusive — and so
+        // optimistic — without hushmic_source or pw-record, so a gated
+        // launch passes here and its backend re-checks once the virtual
+        // mic is up. Standalone `--test-window` just prints the reason and
+        // exits.
         if !pipewire::supports_pipe_capture() {
-            eprintln!("hushmic: The live A/B view needs a newer PipeWire on this system.");
-            // Bounded wait, not fire-and-forget: the detached send worker dies
-            // with the process on the exit below and the notification would be
-            // lost (same reason main()'s could-not-start path uses this).
-            notify::send_and_wait(
-                Slot::MicTest,
-                "audio-input-microphone",
-                &tr!("notify-mictest-title"),
-                &tr!("notify-old-pipewire-body"),
-                Duration::from_secs(2),
-            );
-            std::process::exit(1);
+            hushmic::abtest::exit_needs_newer_pipewire();
         }
         // Companion window to a RUNNING tray instance: no single-instance
         // lock (it owns no mic), no signal plumbing (closing the window is
         // the teardown; children die via PDEATHSIG on abnormal exit).
         let (raw, filtered) = resolve_ab_nodes();
-        let result = hushmic::abtest::run_window(raw, filtered);
+        let result = hushmic::abtest::run_window(raw, filtered, gate);
         // The backend thread's own on-close WAV deletion is detached and
         // races process exit (it loses whenever a sample is playing):
         // sweep synchronously before returning — idempotent with it.
         hushmic::mictest::remove_recordings();
-        if let Err(e) = result {
-            eprintln!("hushmic: test window failed: {e}");
-            std::process::exit(1);
+        match result {
+            Ok(hushmic::abtest::WindowEnd::Closed) => {}
+            // Deferred old-pw-cat verdict (see abtest::audio): exits from
+            // here, after the event loop let go of the GL context.
+            Ok(hushmic::abtest::WindowEnd::NeedsNewerPipewire) => {
+                hushmic::abtest::exit_needs_newer_pipewire()
+            }
+            Err(e) => {
+                eprintln!("hushmic: test window failed: {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -1055,13 +1082,8 @@ fn main() {
     // the loop cancel the test when the filter-chain is mutated under it.
     let mut testing = false;
     let mut mictest_cancel: Option<Arc<AtomicBool>> = None;
-    // The spawned A/B test window child (PDEATHSIG-bound to this process).
-    // The bool records whether the USER asked for a MIC TEST (tray click) —
-    // only that path may escalate to the audio-only fallback recording when
-    // the window cannot start (no GL, headless). Launch-driven windows
-    // (plain `hushmic`, relaunch forwarding) must not: they would turn
-    // "open the app" into an unsolicited microphone recording.
-    let mut ab_window: Option<(std::process::Child, Instant, bool)> = None;
+    // The spawned A/B test window child (see AbWindow).
+    let mut ab_window: Option<AbWindow> = None;
     // A plain launch ends in a visible window: the A/B view doubles as the
     // best possible "it's working" moment, and the desktop entry counts on
     // it (the store rejects tray-only launchers). Queue it through the same
@@ -1402,7 +1424,9 @@ fn main() {
                 // against the NEW output (and "already open" would steer
                 // the user back to it). Close it — reopening gets a fresh
                 // trace.
-                if mutates_chain {
+                let off_to_on = !cfg.enabled && matches!(cmd, TrayCmd::SetMode(Some(_)));
+                let awaits = ab_window.as_ref().is_some_and(|w| w.awaits_suppression);
+                if closes_ab_window(mutates_chain, off_to_on, awaits) {
                     close_ab_window(&mut ab_window);
                 }
                 let mut applied: Result<(), String> = Ok(());
@@ -1486,7 +1510,7 @@ fn main() {
                     TrayCmd::TestMic => {
                         let window_alive = ab_window
                             .as_mut()
-                            .is_some_and(|(c, ..)| matches!(c.try_wait(), Ok(None)));
+                            .is_some_and(|w| matches!(w.child.try_wait(), Ok(None)));
                         // Same gate as the audio-only flow: an intentionally
                         // disabled suppression or a missing chain must get
                         // the actionable message, not a window whose device
@@ -1521,7 +1545,14 @@ fn main() {
                             );
                         } else {
                             match spawn_child_window("--test-window", &[]) {
-                                Ok(child) => ab_window = Some((child, Instant::now(), true)),
+                                Ok(child) => {
+                                    ab_window = Some(AbWindow {
+                                        child,
+                                        spawned: Instant::now(),
+                                        user_initiated: true,
+                                        awaits_suppression: false,
+                                    })
+                                }
                                 Err(e) => {
                                     // No window (headless, exec failure):
                                     // the audio-only flow still works.
@@ -1636,10 +1667,14 @@ fn main() {
                     3,
                     Duration::from_millis(400),
                 );
-                // Same gate as a tray-menu mic test: a disabled chain or a
-                // missing node gets the actionable notification, not a
-                // window whose device overlay misdiagnoses it.
-                if let Err(blocked) = mictest::precondition(cfg.enabled, node_present, testing) {
+                // Unlike a tray-menu mic test, a launch always ends in a
+                // window (a desktop without a tray or a notification daemon
+                // would otherwise show nothing): a blocked one opens with
+                // an overlay naming the blocker. A missing node needs none
+                // (the settle overlay covers a chain still starting). Only
+                // a running audio-only test keeps the notification.
+                let precondition = mictest::precondition(cfg.enabled, node_present, testing);
+                if let Err(blocked @ mictest::Blocked::AlreadyRunning) = precondition {
                     // Journal breadcrumb: without it, a declined reopen is
                     // indistinguishable from a spawn that died instantly.
                     eprintln!("[hushmic] not reopening the A/B window: {blocked:?}");
@@ -1650,12 +1685,28 @@ fn main() {
                         &blocked.message(),
                     );
                 } else {
+                    let gate = LaunchGate {
+                        suppression_off: !cfg.enabled,
+                        pipewire_down: node_present.is_none(),
+                    };
+                    let mut env = env;
+                    if let Some(v) = gate.to_env() {
+                        eprintln!("[hushmic] opening the A/B window blocked ({v})");
+                        env.push((LAUNCH_ENV.to_string(), v));
+                    } else if let Err(blocked) = precondition {
+                        eprintln!("[hushmic] opening the A/B window early: {blocked:?}");
+                    }
                     match spawn_child_window("--test-window", &env) {
                         // Not user_initiated: never escalate a launch into
                         // the audio-only recording (see ab_window above).
                         Ok(child) => {
                             eprintln!("[hushmic] A/B window opened (pid {})", child.id());
-                            ab_window = Some((child, Instant::now(), false));
+                            ab_window = Some(AbWindow {
+                                child,
+                                spawned: Instant::now(),
+                                user_initiated: false,
+                                awaits_suppression: gate.suppression_off,
+                            });
                         }
                         Err(e) => eprintln!("hushmic: could not open the A/B window: {e}"),
                     }
@@ -1763,7 +1814,13 @@ fn main() {
                 // audio-only mic test instead so the click still does
                 // something.
                 let mut window_quick_fail = None;
-                if let Some((child, spawned, user_initiated)) = ab_window.as_mut() {
+                if let Some(AbWindow {
+                    child,
+                    spawned,
+                    user_initiated,
+                    ..
+                }) = ab_window.as_mut()
+                {
                     if let Ok(Some(status)) = child.try_wait() {
                         eprintln!(
                             "[hushmic] A/B window exited ({status}) after {:.1}s",
@@ -2247,6 +2304,23 @@ fn main() {
 mod tests {
     use super::{EngineCache, EngineView};
     use hushmic::diagnostics::EngineTier;
+
+    #[test]
+    fn off_to_on_spares_only_the_window_waiting_for_it() {
+        use super::closes_ab_window;
+        // The suppression-off launch window survives the switch it asked
+        // for (its Turn on button, the tray radio, a shortcut, the CLI).
+        assert!(!closes_ab_window(true, true, true));
+        // Any other window is closed by the same switch, as before.
+        assert!(closes_ab_window(true, true, false));
+        // Every other chain mutation (mic, model, strength, default, off)
+        // still closes the waiting window too.
+        assert!(closes_ab_window(true, false, true));
+        assert!(closes_ab_window(true, false, false));
+        // Non-mutating commands never close.
+        assert!(!closes_ab_window(false, false, true));
+        assert!(!closes_ab_window(false, true, true));
+    }
 
     /// A tray that is not there yet (TrayLink::Pending) drops the update.
     /// The cache must not record it as shown, or the tier the tray finally

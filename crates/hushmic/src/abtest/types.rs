@@ -111,6 +111,58 @@ pub enum Frame {
     /// Non-fatal backend failure surfaced as a toast (e.g. playback failed
     /// to start).
     Warn(String),
+    /// A window launched with PipeWire unreachable got its first good
+    /// probe: sent once, never flipped back (a later transient pw-dump
+    /// failure under graph churn is not "PipeWire went away").
+    PipewireReachable,
+    /// The device came up, but pw-cat is too old to stream a capture to a
+    /// pipe: the window closes and the process exits with the
+    /// old-PipeWire notification (from the main thread, after the event
+    /// loop has let go of the GL context).
+    NeedsNewerPipewire,
+}
+
+/// Env var the tray passes to a launch-opened window: what stood in the
+/// way of the mic test at launch (see `LaunchGate`). Unset = a normal open.
+pub const LAUNCH_ENV: &str = "HUSHMIC_AB_LAUNCH";
+
+/// What blocked the mic test when a plain launch opened the window anyway
+/// (a launch always ends in a visible window). The window shows a
+/// dedicated overlay per blocker and clears it once the blocker is gone.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct LaunchGate {
+    /// Noise suppression is off (no chain, no `hushmic_source`).
+    pub suppression_off: bool,
+    /// PipeWire could not be probed (not running, or its tools absent).
+    pub pipewire_down: bool,
+}
+
+impl LaunchGate {
+    pub fn is_open(self) -> bool {
+        self == LaunchGate::default()
+    }
+
+    /// The `LAUNCH_ENV` value ("off", "no-pipewire" or both, comma
+    /// separated); None when nothing blocks.
+    pub fn to_env(self) -> Option<String> {
+        let words: Vec<&str> = [
+            (self.suppression_off, "off"),
+            (self.pipewire_down, "no-pipewire"),
+        ]
+        .into_iter()
+        .filter_map(|(on, w)| on.then_some(w))
+        .collect();
+        (!words.is_empty()).then(|| words.join(","))
+    }
+
+    /// Parse a `LAUNCH_ENV` value; unknown words are ignored.
+    pub fn from_env(v: &str) -> Self {
+        let has = |w: &str| v.split(',').any(|t| t.trim() == w);
+        LaunchGate {
+            suppression_off: has("off"),
+            pipewire_down: has("no-pipewire"),
+        }
+    }
 }
 
 /// UI → backend commands (the record length is backend policy, not UI
@@ -125,4 +177,38 @@ pub enum Command {
     Play(Channel),
     /// Error-overlay "Retry detection".
     RetryDevice,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_gate_env_round_trips() {
+        for gate in [
+            LaunchGate::default(),
+            LaunchGate {
+                suppression_off: true,
+                pipewire_down: false,
+            },
+            LaunchGate {
+                suppression_off: false,
+                pipewire_down: true,
+            },
+            LaunchGate {
+                suppression_off: true,
+                pipewire_down: true,
+            },
+        ] {
+            let env = gate.to_env();
+            assert_eq!(env.is_none(), gate.is_open());
+            assert_eq!(LaunchGate::from_env(env.as_deref().unwrap_or("")), gate);
+        }
+        assert_eq!(
+            LaunchGate::from_env("off").to_env().as_deref(),
+            Some("off"),
+            "the CI step greps for exactly this value"
+        );
+        assert!(LaunchGate::from_env("bogus").is_open());
+    }
 }

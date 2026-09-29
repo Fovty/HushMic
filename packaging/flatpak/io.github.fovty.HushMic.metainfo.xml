@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.10.1" date="2026-09-29">
+      <description>
+        <p>
+          Starting HushMic from the app menu now always opens the mic test
+          window, also without a tray. If noise suppression is off or
+          PipeWire can't be reached, the window says so, and a button turns
+          suppression on.
+        </p>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-09-26">
       <description>
         <p>

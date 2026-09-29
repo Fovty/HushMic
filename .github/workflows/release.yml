@@ -25,7 +25,8 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config git curl ca-certificates binutils file \
-            python3.11 python3.11-venv squashfs-tools desktop-file-utils
+            python3.11 python3.11-venv squashfs-tools desktop-file-utils \
+            libxkbcommon-x11-0 libxcb-xkb1
 
       # Actions are pinned to commit SHAs: a hijacked mutable tag on a
       # third-party action (esp. the release-publishing one, which holds a
@@ -83,6 +84,7 @@ jobs:
         with:
           files: |
             dist/hushmic-x86_64.AppImage
+            dist/hushmic-x86_64.AppImage.zsync
             dist/hushmic_*_amd64.deb
             dist/hushmic-*-x86_64.tar.gz
             dist/dpdfnet8_48khz_hr.onnx

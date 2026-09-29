@@ -4,7 +4,7 @@
 //! backend are authoritative and may override. Frames that do not match the
 //! current mode (e.g. a stale `PlaybackProgress` after Stop) are ignored.
 
-use crate::abtest::types::{Channel, Command, Frame, SampleMetrics, RECORD_SECS};
+use crate::abtest::types::{Channel, Command, Frame, LaunchGate, SampleMetrics, RECORD_SECS};
 use crate::tr;
 
 /// Toast auto-dismiss time.
@@ -43,6 +43,21 @@ pub enum Status {
     NoInput,
 }
 
+/// The full-window overlay over the dimmed panes (none while the device
+/// is fine). Launch blockers win over the device states: they name the
+/// actual cause instead of a generic missing input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    /// PipeWire unreachable at launch; Retry detection re-probes.
+    NoPipewire,
+    /// Suppression off at launch; offers to turn it on.
+    SuppressionOff,
+    /// "Connecting to your microphone…" (see `SETTLE_SECS`).
+    Settle,
+    /// The hard "No microphone input" error.
+    NoInput,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Timeline {
     pub label: String,
@@ -65,6 +80,10 @@ pub struct WindowState {
     /// as the hard error.
     pub settle_deadline: std::time::Instant,
     pub device_name: String,
+    /// Launch blockers (see `LaunchGate`): each raises its own overlay
+    /// until the blocker is gone. Both only ever clear.
+    pub suppression_off: bool,
+    pub pipewire_down: bool,
     pub metrics: Option<SampleMetrics>,
     pub toast: Option<(String, f32)>, // message + seconds remaining
     /// Seconds of live monitoring since going live (local clock; the Live
@@ -85,12 +104,41 @@ impl WindowState {
             settle_deadline: std::time::Instant::now()
                 + std::time::Duration::from_secs(SETTLE_SECS),
             device_name: String::new(),
+            suppression_off: false,
+            pipewire_down: false,
             metrics: None,
             toast: None,
             elapsed: 0.0,
             rec_secs_done: 0.0,
             play_pos: 0.0,
         }
+    }
+
+    /// A launch-opened window with its blockers. The device reads as
+    /// missing until the backend says otherwise, so no pane ever shows a
+    /// live state the blocker rules out.
+    pub fn gated(gate: LaunchGate) -> Self {
+        let mut s = WindowState::new();
+        s.suppression_off = gate.suppression_off;
+        s.pipewire_down = gate.pipewire_down;
+        if !gate.is_open() {
+            s.device_ok = false;
+        }
+        s
+    }
+
+    /// Suppression is on now (our request went through, or the tray/CLI
+    /// switched it): the chain needs a few seconds to come up, so the
+    /// settle window restarts rather than jumping to the hard error.
+    pub fn suppression_on(&mut self, now: std::time::Instant) {
+        if self.suppression_off {
+            self.suppression_off = false;
+            self.restart_settle(now);
+        }
+    }
+
+    fn restart_settle(&mut self, now: std::time::Instant) {
+        self.settle_deadline = now + std::time::Duration::from_secs(SETTLE_SECS);
     }
 
     /// Optimistic transition on a user command (backend confirms via frames).
@@ -189,6 +237,12 @@ impl WindowState {
             Frame::Device { ok, name } => {
                 self.device_ok = *ok;
                 self.device_name = name.clone();
+                // Both nodes present: whatever blocked the launch is gone
+                // (the chain is up, so suppression is on and PipeWire runs).
+                if *ok {
+                    self.suppression_off = false;
+                    self.pipewire_down = false;
+                }
                 // Recovery never changes the mode here: the UI decides when
                 // to auto-send StartMonitor (only in the sample-less view).
                 if !ok {
@@ -196,8 +250,18 @@ impl WindowState {
                 }
             }
             Frame::Warn(msg) => self.toast = Some((msg.clone(), TOAST_SECS)),
+            // The chain may still be starting behind a PipeWire that just
+            // came up: connecting, not the hard error.
+            Frame::PipewireReachable => {
+                if self.pipewire_down {
+                    self.pipewire_down = false;
+                    self.restart_settle(std::time::Instant::now());
+                }
+            }
             // Spectrum/level frames feed the panels directly, not the state.
             Frame::Spectrum { .. } | Frame::Level { .. } => {}
+            // The UI closes the window; nothing to show for it.
+            Frame::NeedsNewerPipewire => {}
         }
     }
 
@@ -230,6 +294,21 @@ impl WindowState {
     /// should read as "connecting" rather than as the hard error.
     pub fn settling(&self, now: std::time::Instant) -> bool {
         !self.device_ok && now < self.settle_deadline
+    }
+
+    /// Which overlay covers the window right now, if any.
+    pub fn overlay(&self, now: std::time::Instant) -> Option<Overlay> {
+        if self.device_ok {
+            None
+        } else if self.pipewire_down {
+            Some(Overlay::NoPipewire)
+        } else if self.suppression_off {
+            Some(Overlay::SuppressionOff)
+        } else if self.settling(now) {
+            Some(Overlay::Settle)
+        } else {
+            Some(Overlay::NoInput)
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -361,6 +440,100 @@ mod tests {
         // A working device never reports settling.
         let ok = state(Mode::Sample, false, true);
         assert!(!ok.settling(opened));
+    }
+
+    #[test]
+    fn missing_node_recovers_after_the_settle_window() {
+        use std::time::{Duration, Instant};
+        // A slow cold start outlives the settle window: the hard error
+        // shows, but the periodic re-check's Device{ok} still clears it.
+        let mut s = state(Mode::Sample, false, false);
+        let late = Instant::now() + Duration::from_secs(SETTLE_SECS + 5);
+        assert_eq!(s.overlay(late), Some(Overlay::NoInput));
+        s.on_frame(&Frame::Device {
+            ok: true,
+            name: "mic".into(),
+        });
+        assert_eq!(s.overlay(late), None);
+    }
+
+    #[test]
+    fn gated_launch_starts_without_a_device() {
+        let off = WindowState::gated(LaunchGate {
+            suppression_off: true,
+            pipewire_down: false,
+        });
+        assert!(!off.device_ok);
+        assert_eq!(
+            off.overlay(std::time::Instant::now()),
+            Some(Overlay::SuppressionOff)
+        );
+        // An open gate is a normal window.
+        assert!(WindowState::gated(LaunchGate::default()).device_ok);
+    }
+
+    #[test]
+    fn pipewire_overlay_wins_then_yields_to_the_off_overlay() {
+        use std::time::Instant;
+        let mut s = WindowState::gated(LaunchGate {
+            suppression_off: true,
+            pipewire_down: true,
+        });
+        assert_eq!(s.overlay(Instant::now()), Some(Overlay::NoPipewire));
+        s.on_frame(&Frame::PipewireReachable);
+        assert_eq!(s.overlay(Instant::now()), Some(Overlay::SuppressionOff));
+    }
+
+    #[test]
+    fn turning_suppression_on_restarts_the_settle_window() {
+        use std::time::{Duration, Instant};
+        let mut s = WindowState::gated(LaunchGate {
+            suppression_off: true,
+            pipewire_down: false,
+        });
+        // Long after the window opened: the original settle window is over.
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(s.overlay(later), Some(Overlay::SuppressionOff));
+        s.suppression_on(later);
+        assert_eq!(s.overlay(later), Some(Overlay::Settle));
+        assert_eq!(
+            s.overlay(later + Duration::from_secs(SETTLE_SECS + 1)),
+            Some(Overlay::NoInput)
+        );
+        // The virtual mic comes up: live.
+        s.on_frame(&Frame::Device {
+            ok: true,
+            name: "mic".into(),
+        });
+        assert_eq!(s.overlay(later), None);
+    }
+
+    #[test]
+    fn pipewire_coming_up_settles_before_it_alarms() {
+        use std::time::{Duration, Instant};
+        let mut s = WindowState::gated(LaunchGate {
+            suppression_off: false,
+            pipewire_down: true,
+        });
+        s.settle_deadline = Instant::now() - Duration::from_secs(1);
+        s.on_frame(&Frame::PipewireReachable);
+        assert_eq!(s.overlay(Instant::now()), Some(Overlay::Settle));
+    }
+
+    #[test]
+    fn a_present_device_clears_every_launch_blocker() {
+        // Suppression switched on from the tray while the window waited:
+        // the node appearing is proof enough.
+        let mut s = WindowState::gated(LaunchGate {
+            suppression_off: true,
+            pipewire_down: true,
+        });
+        s.on_frame(&Frame::Device {
+            ok: true,
+            name: "mic".into(),
+        });
+        assert!(!s.suppression_off && !s.pipewire_down);
+        assert_eq!(s.overlay(std::time::Instant::now()), None);
     }
 
     fn assert_pct(t: &Timeline, want: f32) {

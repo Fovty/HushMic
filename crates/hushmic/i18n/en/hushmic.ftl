@@ -128,6 +128,17 @@ ab-settle-body = HushMic is bringing up its audio chain. This takes a few second
 ab-no-input-title = No microphone input
 ab-no-input-body = HushMic isn't receiving audio from a microphone. Pick your mic from the tray's Microphone menu (and check it's connected and PipeWire is running), then retry.
 
+# A plain launch opens the window even when the mic test can't run yet.
+ab-off-title = Noise suppression is off
+ab-off-body = Turn it on to hear the difference between your raw and filtered microphone.
+ab-off-turn-on = Turn on noise suppression
+ab-off-turning-on = Turning on…
+ab-off-no-reply = HushMic didn't respond. Try again in a moment.
+# $reason is the tray's own (English) explanation.
+ab-off-refused = Noise suppression has not started: { $reason }
+ab-no-pipewire-title = Can't reach PipeWire
+ab-no-pipewire-body = HushMic needs a running PipeWire with its command line tools (pw-dump, pw-cli). Copy diagnostics in the About window shows what is missing.
+
 
 ## About window
 

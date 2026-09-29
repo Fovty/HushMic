@@ -8,7 +8,9 @@
 
 use crate::abtest::dsp::{LevelMeter, SpectrumAnalyzer};
 use crate::abtest::stream::{F32Reader, Header, SampleEndian, StreamInfo};
-use crate::abtest::types::{Channel, Command, Frame, DB_FLOOR, RECORD_SECS, SAMPLE_RATE};
+use crate::abtest::types::{
+    Channel, Command, Frame, LaunchGate, DB_FLOOR, RECORD_SECS, SAMPLE_RATE,
+};
 use crate::abtest::{metrics, stream};
 use std::path::PathBuf;
 use std::process::{Child, Command as Proc, Stdio};
@@ -20,6 +22,7 @@ use std::time::{Duration, Instant};
 pub struct Backend {
     raw_node: String,
     filtered_node: String,
+    gate: LaunchGate,
     cmd_rx: Receiver<Command>,
     frame_tx: Sender<Frame>,
 }
@@ -76,15 +79,19 @@ struct Sample {
 }
 
 impl Backend {
+    /// `gate` is what blocked the mic test when a launch opened the window
+    /// anyway (see `LaunchGate`); open for a normal window.
     pub fn new(
         raw_node: String,
         filtered_node: String,
+        gate: LaunchGate,
         cmd_rx: Receiver<Command>,
         frame_tx: Sender<Frame>,
     ) -> Self {
         Backend {
             raw_node,
             filtered_node,
+            gate,
             cmd_rx,
             frame_tx,
         }
@@ -119,8 +126,27 @@ fn run_backend(b: Backend, repaint: Arc<dyn Fn() + Send + Sync>) {
     // the device poll re-resolves it so a chain re-route after the window
     // opened (mic recovery, a tray mic change) moves the monitor along.
     let mut raw_node = b.raw_node.clone();
-    let mut device_ok = check_device(&raw_node, &b.filtered_node);
+    let gated = !b.gate.is_open();
+    let first = crate::pipewire::sources_snapshot();
+    // A launch-gated window starts idle: an unknown device (probe failed)
+    // reads as missing, so no capture leg ever starts against a node the
+    // blocker says is absent (no pw-record errors behind the overlay).
+    let mut device_ok = device_present(first.as_deref(), &raw_node, &b.filtered_node, !gated);
+    // Reported to the UI once, the first time a probe succeeds.
+    let mut pw_reachable = first.is_some();
+    // pw-cat too old to stream a capture to a pipe (see
+    // supports_pipe_capture): --test-window checks that at startup, but
+    // needs hushmic_source to probe against — which a window opened before
+    // the chain was up (suppression off, chain still starting) does not
+    // have yet. Deferred to the moment the device first comes up.
+    let mut pipe_probe_pending = !device_ok;
+    // Set once that deferred probe says no: the window is closing, the
+    // backend stays idle.
+    let mut pipe_unsupported = false;
     let mut last_device_poll = Instant::now();
+    if pw_reachable && b.gate.pipewire_down {
+        emit(Frame::PipewireReachable);
+    }
     emit(Frame::Device {
         ok: device_ok,
         name: raw_node.clone(),
@@ -381,9 +407,15 @@ fn run_backend(b: Backend, repaint: Arc<dyn Fn() + Send + Sync>) {
         // freezing on the spawn-time resolution. Retry detection lands
         // here too (it just forces an immediate poll) — which is what
         // lets it recover an empty spawn-time resolution now.
-        if last_device_poll.elapsed() >= DEVICE_POLL {
+        if !pipe_unsupported && last_device_poll.elapsed() >= DEVICE_POLL {
             last_device_poll = Instant::now();
             let dump = crate::pipewire::pw_dump();
+            if !pw_reachable && dump.is_some() {
+                pw_reachable = true;
+                if b.gate.pipewire_down {
+                    emit(Frame::PipewireReachable);
+                }
+            }
             let nodes = dump.as_deref().map(crate::pipewire::parse_pwdump_nodes);
             let exists = |n: &str| nodes.as_ref().map(|v| v.iter().any(|s| s.name == n));
             // Same priority ladder as the spawn-time resolve_ab_nodes; the
@@ -416,6 +448,11 @@ fn run_backend(b: Backend, repaint: Arc<dyn Fn() + Send + Sync>) {
                 // The raw side exists by the switch guard; only the
                 // filtered node can still veto.
                 device_ok = exists(&b.filtered_node) == Some(true);
+                if device_ok && !pipe_capture_ok(&mut pipe_probe_pending) {
+                    device_ok = false;
+                    pipe_unsupported = true;
+                    emit(Frame::NeedsNewerPipewire);
+                }
                 emit(Frame::Device {
                     ok: device_ok,
                     name: raw_node.clone(),
@@ -429,7 +466,10 @@ fn run_backend(b: Backend, repaint: Arc<dyn Fn() + Send + Sync>) {
                     }
                     None => device_ok,
                 };
-                if ok != device_ok {
+                if ok && !device_ok && !pipe_capture_ok(&mut pipe_probe_pending) {
+                    pipe_unsupported = true;
+                    emit(Frame::NeedsNewerPipewire);
+                } else if ok != device_ok {
                     device_ok = ok;
                     if !ok {
                         stop_monitors(&mut monitors, &shared);
@@ -542,16 +582,31 @@ pub fn should_switch_raw(current: &str, fresh: &str, fresh_exists: bool) -> bool
     fresh != current && !fresh.is_empty() && fresh_exists
 }
 
-/// Both required nodes are live PipeWire sources. `None` probes (pw-dump
-/// failure) keep the last known state rather than flapping the overlay.
-fn check_device(raw_node: &str, filtered_node: &str) -> bool {
-    match crate::pipewire::sources_snapshot() {
+/// Both required nodes are live PipeWire sources. A failed probe (`None`)
+/// answers `unknown`: optimistic for a normal window (the tray just saw the
+/// node), pessimistic for a launch-gated one. Pure.
+fn device_present(
+    nodes: Option<&[crate::pipewire::Source]>,
+    raw_node: &str,
+    filtered_node: &str,
+    unknown: bool,
+) -> bool {
+    match nodes {
         Some(nodes) => {
             let has = |n: &str| nodes.iter().any(|s| s.name == n);
             has(raw_node) && has(filtered_node)
         }
-        None => true,
+        None => unknown,
     }
+}
+
+/// The startup old-pw-cat check of --test-window, run once when a device
+/// missing at window open first comes up (only then is there a
+/// `hushmic_source` to probe). False = too old: the window closes and
+/// exits exactly like a normal launch on that system, rather than going
+/// live with capture legs that die at the first sample.
+fn pipe_capture_ok(pending: &mut bool) -> bool {
+    !std::mem::take(pending) || crate::pipewire::supports_pipe_capture()
 }
 
 /// One capture channel: spawn `pw-record`, parse the stream, feed the
@@ -917,6 +972,21 @@ mod tests {
     fn recording_death_defers_to_the_recording_abort_warning() {
         assert_eq!(capture_death_warning(true, true), None);
         assert_eq!(capture_death_warning(true, false), None);
+    }
+
+    #[test]
+    fn unknown_device_state_depends_on_the_launch_gate() {
+        // Normal window: a failed probe keeps the optimistic default.
+        assert!(device_present(None, "mic", "hushmic_source", true));
+        // Gated launch (PipeWire unreachable): stay idle, never start
+        // pw-record against nothing.
+        assert!(!device_present(None, "mic", "hushmic_source", false));
+        let nodes = [crate::pipewire::Source {
+            name: "mic".into(),
+            description: String::new(),
+        }];
+        // Suppression off: the virtual mic is absent.
+        assert!(!device_present(Some(&nodes), "mic", "hushmic_source", true));
     }
 
     #[test]

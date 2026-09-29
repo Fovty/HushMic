@@ -90,6 +90,14 @@ ab-settle-title = Verbindung mit Ihrem Mikrofon wird hergestellt…
 ab-settle-body = HushMic startet seine Audiokette. Das dauert ein paar Sekunden.
 ab-no-input-title = Kein Mikrofonsignal
 ab-no-input-body = HushMic empfängt kein Audio von einem Mikrofon. Wählen Sie Ihr Mikrofon im Menü „Mikrofon“ des Tray-Symbols (und prüfen Sie, ob es angeschlossen ist und PipeWire läuft), und versuchen Sie es dann erneut.
+ab-off-title = Die Rauschunterdrückung ist aus
+ab-off-body = Schalten Sie sie ein, um den Unterschied zwischen dem rohen und dem gefilterten Mikrofonsignal zu hören.
+ab-off-turn-on = Rauschunterdrückung einschalten
+ab-off-turning-on = Wird eingeschaltet…
+ab-off-no-reply = HushMic hat nicht geantwortet. Versuchen Sie es gleich noch einmal.
+ab-off-refused = Die Rauschunterdrückung ist nicht gestartet: { $reason }
+ab-no-pipewire-title = PipeWire ist nicht erreichbar
+ab-no-pipewire-body = HushMic benötigt ein laufendes PipeWire mit seinen Kommandozeilen-Tools (pw-dump, pw-cli). „Diagnose kopieren“ im Fenster „Über HushMic“ zeigt, was fehlt.
 
 about-window-title = Über HushMic
 about-version = Version { $version }

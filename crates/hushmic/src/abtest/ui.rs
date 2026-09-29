@@ -4,8 +4,10 @@
 
 use crate::abtest::audio::Backend;
 use crate::abtest::dsp;
-use crate::abtest::state::{Controls, Mode, Status, WindowState};
-use crate::abtest::types::{Channel, Command, Frame, DB_FLOOR, FREQ_HI, FREQ_LO, RECORD_SECS};
+use crate::abtest::state::{Controls, Mode, Overlay, Status, WindowState};
+use crate::abtest::types::{
+    Channel, Command, Frame, LaunchGate, DB_FLOOR, FREQ_HI, FREQ_LO, RECORD_SECS,
+};
 use crate::tr;
 use eframe::egui::{
     self, pos2, text::LayoutJob, vec2, Align, Align2, Button, Color32, ColorImage, FontId, Id,
@@ -13,7 +15,8 @@ use eframe::egui::{
     StrokeKind, TextFormat, TextureHandle, TextureId, TextureOptions, Ui, Vec2,
 };
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // Fixed window size; the height is pinned by the window_fits_content_height
 // test (no reserved bottom strip — the toast overlays content instead). The
@@ -70,6 +73,62 @@ const FILTERED_METER_HI: Color32 = Color32::from_rgb(0xea, 0xff, 0xfa);
 
 // Below this readout floor the dB label collapses to "−∞ dB".
 const READOUT_INF_DB: f32 = -75.0;
+
+/// How often the suppression-off overlay asks the tray for its mode, so
+/// suppression switched on from the tray or CLI clears it promptly.
+const MODE_POLL: Duration = Duration::from_millis(1500);
+
+/// The suppression-off overlay's line to the tray: turn suppression on,
+/// and ask whether it is on (None = no answer). Injectable so tests never
+/// touch the real control socket. Both calls block; they run off the UI
+/// thread.
+#[derive(Clone)]
+pub struct SuppressionSwitch {
+    pub turn_on: Arc<dyn Fn() -> Result<(), TurnOnError> + Send + Sync>,
+    pub is_on: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+}
+
+impl SuppressionSwitch {
+    /// `hushmic mode suppress` / `hushmic mode` over the control socket.
+    pub fn control_socket() -> Self {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        SuppressionSwitch {
+            turn_on: Arc::new(move || {
+                match crate::control::client_run(&words(&["mode", "suppress"])) {
+                    (0, _) => Ok(()),
+                    // 2 = nobody listening (no tray).
+                    (1, out) if out != crate::control::NO_REPLY => {
+                        Err(TurnOnError::Refused(out.trim().to_string()))
+                    }
+                    _ => Err(TurnOnError::NoReply),
+                }
+            }),
+            is_on: Arc::new(
+                move || match crate::control::client_run(&words(&["mode"])) {
+                    // Any chain-alive mode (bypass, mute) counts: only "off"
+                    // leaves the window without a virtual mic.
+                    (0, out) => Some(out.trim() != "off"),
+                    _ => None,
+                },
+            ),
+        }
+    }
+}
+
+/// Why a turn-on request did not go through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnOnError {
+    /// No tray, or it never answered.
+    NoReply,
+    /// The tray answered and reported why enabling did not work.
+    Refused(String),
+}
+
+/// Replies from the suppression switch's worker threads.
+enum SwitchMsg {
+    TurnedOn(Result<(), TurnOnError>),
+    Mode(bool),
+}
 
 fn with_alpha(c: Color32, a: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0) as u8)
@@ -274,12 +333,39 @@ struct AbApp {
     /// E2E script driver (HUSHMIC_AB_SCRIPT): commands injected as if the
     /// user clicked, so optimistic transitions run through the same path.
     driver_rx: Option<Receiver<Command>>,
+    /// Line to the tray for the suppression-off overlay.
+    switch: SuppressionSwitch,
+    switch_tx: Sender<SwitchMsg>,
+    switch_rx: Receiver<SwitchMsg>,
+    /// A turn-on request is in flight (button disabled).
+    turning_on: bool,
+    mode_poll_started: bool,
+    /// Set on `NeedsNewerPipewire`: the window closes, and `run` reports
+    /// why once the event loop has returned.
+    needs_newer_pipewire: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AbApp {
+    /// A normal (ungated) window.
+    #[cfg(test)]
     fn new(cmd_tx: Sender<Command>, frame_rx: Receiver<Frame>) -> Self {
+        Self::gated(
+            cmd_tx,
+            frame_rx,
+            LaunchGate::default(),
+            SuppressionSwitch::control_socket(),
+        )
+    }
+
+    fn gated(
+        cmd_tx: Sender<Command>,
+        frame_rx: Receiver<Frame>,
+        gate: LaunchGate,
+        switch: SuppressionSwitch,
+    ) -> Self {
+        let (switch_tx, switch_rx) = std::sync::mpsc::channel();
         AbApp {
-            state: WindowState::new(),
+            state: WindowState::gated(gate),
             cmd_tx,
             frame_rx,
             specs: [
@@ -298,6 +384,74 @@ impl AbApp {
             logo_tex: None,
             icon_tex: None,
             driver_rx: None,
+            switch,
+            switch_tx,
+            switch_rx,
+            turning_on: false,
+            mode_poll_started: false,
+            needs_newer_pipewire: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Start watching the tray's mode while the suppression-off overlay is
+    /// up: switched on from the tray or CLI, the overlay gives way to the
+    /// settle overlay without waiting for the virtual mic. One thread,
+    /// ending once suppression is on or the window is gone.
+    fn ensure_mode_poll(&mut self, ctx: &egui::Context) {
+        if self.mode_poll_started || !self.state.suppression_off {
+            return;
+        }
+        self.mode_poll_started = true;
+        let is_on = Arc::clone(&self.switch.is_on);
+        let tx = self.switch_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            let on = is_on() == Some(true);
+            if tx.send(SwitchMsg::Mode(on)).is_err() || on {
+                ctx.request_repaint();
+                return;
+            }
+            std::thread::sleep(MODE_POLL);
+        });
+    }
+
+    /// The off overlay's button: `hushmic mode suppress`, off the UI thread.
+    fn turn_on(&mut self, ctx: &egui::Context) {
+        if self.turning_on {
+            return;
+        }
+        self.turning_on = true;
+        let turn_on = Arc::clone(&self.switch.turn_on);
+        let tx = self.switch_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(SwitchMsg::TurnedOn(turn_on()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn handle_switch_msg(&mut self, m: SwitchMsg) {
+        match m {
+            SwitchMsg::TurnedOn(Ok(())) => {
+                self.turning_on = false;
+                self.state.suppression_on(Instant::now());
+                // The chain is starting: re-check now instead of on the
+                // next poll (the periodic check picks up a slow start).
+                self.send(Command::RetryDevice);
+            }
+            SwitchMsg::TurnedOn(Err(e)) => {
+                eprintln!("hushmic: turning noise suppression on: {e:?}");
+                self.turning_on = false;
+                let msg = match e {
+                    TurnOnError::NoReply => tr!("ab-off-no-reply"),
+                    TurnOnError::Refused(reason) => {
+                        tr!("ab-off-refused", reason = short_reason(&reason))
+                    }
+                };
+                self.state.toast = Some((msg, crate::abtest::state::TOAST_SECS));
+            }
+            SwitchMsg::Mode(true) => self.state.suppression_on(Instant::now()),
+            SwitchMsg::Mode(false) => {}
         }
     }
 
@@ -395,6 +549,10 @@ impl AbApp {
                 raw_db,
                 filtered_db,
             } => self.level_target = [*raw_db, *filtered_db],
+            Frame::NeedsNewerPipewire => {
+                self.needs_newer_pipewire
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             // Fresh boot / post-retry recovery: resume the split view — but
             // never yank the user out of a sample review.
             Frame::Device { ok: true, .. }
@@ -431,6 +589,16 @@ impl AbApp {
         }
         while let Ok(f) = self.frame_rx.try_recv() {
             self.handle_frame(&f);
+        }
+        if self
+            .needs_newer_pipewire
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.ensure_mode_poll(ctx);
+        while let Ok(m) = self.switch_rx.try_recv() {
+            self.handle_switch_msg(m);
         }
 
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
@@ -481,15 +649,28 @@ impl AbApp {
                 });
             });
 
-        if !self.state.device_ok {
-            // A cold launch (chain still spawning) or the watchdog healing
-            // a re-routed capture stream resolves within seconds — present
-            // that as "connecting", not as the hard error.
-            if self.state.settling(std::time::Instant::now()) {
-                self.settle_overlay(ctx);
-            } else {
-                self.error_overlay(ctx);
-            }
+        // A cold launch (chain still spawning) or the watchdog healing a
+        // re-routed capture stream resolves within seconds — presented as
+        // "connecting", not as the hard error. Launch blockers name
+        // themselves.
+        match self.state.overlay(Instant::now()) {
+            Some(Overlay::Settle) => self.settle_overlay(ctx),
+            Some(Overlay::NoInput) => self.error_overlay(
+                ctx,
+                &tr!("ab-no-input-title"),
+                &tr!("ab-no-input-body"),
+                true,
+            ),
+            // No pactl line: without PipeWire's tools it would not run
+            // either.
+            Some(Overlay::NoPipewire) => self.error_overlay(
+                ctx,
+                &tr!("ab-no-pipewire-title"),
+                &tr!("ab-no-pipewire-body"),
+                false,
+            ),
+            Some(Overlay::SuppressionOff) => self.off_overlay(ctx),
+            None => {}
         }
         if let Some((msg, _)) = self.state.toast.clone() {
             toast_overlay(ctx, &msg);
@@ -1007,7 +1188,56 @@ impl AbApp {
             });
     }
 
-    fn error_overlay(&mut self, ctx: &egui::Context) {
+    /// A launch with suppression off: nothing to compare yet. One click
+    /// turns it on; the settle overlay then covers the chain's start.
+    fn off_overlay(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        ctx.layer_painter(LayerId::new(Order::Middle, Id::new("abtest_error_dim")))
+            .rect_filled(screen, 0.0, with_alpha(Color32::from_rgb(7, 11, 18), 0.9));
+        egui::Area::new(Id::new("abtest_off"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(46.0, 46.0), Sense::hover());
+                    let p = ui.painter();
+                    p.circle_filled(rect.center(), 23.0, with_alpha(ACCENT, 0.06));
+                    p.circle_stroke(
+                        rect.center(),
+                        23.0,
+                        Stroke::new(1.0_f32, with_alpha(ACCENT, 0.25)),
+                    );
+                    draw_mic_glyph(p, rect.center(), 22.0, TEXT_SOFT, true);
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(tr!("ab-off-title"))
+                            .size(14.5)
+                            .color(TEXT)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.add(
+                        Label::new(RichText::new(tr!("ab-off-body")).size(12.0).color(MUTED))
+                            .wrap(),
+                    );
+                    ui.add_space(14.0);
+                    ui.spacing_mut().button_padding = vec2(14.0, 7.0);
+                    let label = if self.turning_on {
+                        tr!("ab-off-turning-on")
+                    } else {
+                        tr!("ab-off-turn-on")
+                    };
+                    if primary_button(ui, &label, !self.turning_on).clicked() {
+                        self.turn_on(ui.ctx());
+                    }
+                });
+            });
+    }
+
+    /// The hard error: `title`/`body` name the cause; `pactl_hint` adds
+    /// the source-listing command line.
+    fn error_overlay(&mut self, ctx: &egui::Context, title: &str, body: &str, pactl_hint: bool) {
         let screen = ctx.content_rect();
         // Dim in Order::Middle so the Foreground Area stays interactable
         // above it.
@@ -1029,34 +1259,24 @@ impl AbApp {
                     );
                     draw_mic_glyph(p, rect.center(), 22.0, DANGER, true);
                     ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(tr!("ab-no-input-title"))
-                            .size(14.5)
-                            .color(TEXT)
-                            .strong(),
-                    );
+                    ui.label(RichText::new(title).size(14.5).color(TEXT).strong());
                     ui.add_space(6.0);
-                    ui.add(
-                        Label::new(
-                            RichText::new(tr!("ab-no-input-body"))
-                                .size(12.0)
-                                .color(MUTED),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(10.0);
-                    egui::Frame::new()
-                        .fill(SUB_PANEL_BG)
-                        .stroke(Stroke::new(1.0_f32, border(0.16)))
-                        .corner_radius(6.0)
-                        .inner_margin(Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("$ pactl list sources short")
-                                    .font(FontId::monospace(11.0))
-                                    .color(TEXT_SOFT),
-                            );
-                        });
+                    ui.add(Label::new(RichText::new(body).size(12.0).color(MUTED)).wrap());
+                    if pactl_hint {
+                        ui.add_space(10.0);
+                        egui::Frame::new()
+                            .fill(SUB_PANEL_BG)
+                            .stroke(Stroke::new(1.0_f32, border(0.16)))
+                            .corner_radius(6.0)
+                            .inner_margin(Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("$ pactl list sources short")
+                                        .font(FontId::monospace(11.0))
+                                        .color(TEXT_SOFT),
+                                );
+                            });
+                    }
                     ui.add_space(12.0);
                     // Same breathing room as the transport buttons.
                     ui.spacing_mut().button_padding = vec2(14.0, 7.0);
@@ -1071,6 +1291,16 @@ impl AbApp {
 impl eframe::App for AbApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
+    }
+}
+
+/// The tray's refusal text is a full log line (paths, remedies after an em
+/// dash); a toast only needs its first clause.
+fn short_reason(reason: &str) -> String {
+    let first = reason.split(" — ").next().unwrap_or(reason).trim();
+    match first.char_indices().nth(90) {
+        Some((i, _)) => format!("{}…", &first[..i]),
+        None => first.to_string(),
     }
 }
 
@@ -1416,7 +1646,10 @@ pub fn run(
     backend: Backend,
     cmd_tx: Sender<Command>,
     frame_rx: Receiver<Frame>,
-) -> Result<(), String> {
+    gate: LaunchGate,
+) -> Result<crate::abtest::WindowEnd, String> {
+    let needs_newer_pipewire = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&needs_newer_pipewire);
     let window_title = tr!("ab-window-title");
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(window_title)
@@ -1443,7 +1676,8 @@ pub fn run(
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             let repaint_ctx = cc.egui_ctx.clone();
             backend.start(Box::new(move || repaint_ctx.request_repaint()));
-            let mut app = AbApp::new(cmd_tx, frame_rx);
+            let mut app = AbApp::gated(cmd_tx, frame_rx, gate, SuppressionSwitch::control_socket());
+            app.needs_newer_pipewire = flag;
             // Live from the first frame: monitoring runs from window open,
             // there is no Start button.
             app.send(Command::StartMonitor);
@@ -1484,11 +1718,29 @@ pub fn run(
             Ok(Box::new(app))
         }),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(
+        if needs_newer_pipewire.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::abtest::WindowEnd::NeedsNewerPipewire
+        } else {
+            crate::abtest::WindowEnd::Closed
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn short_reason_keeps_the_first_clause() {
+        assert_eq!(
+            short_reason("plugin missing at /usr/lib — run setup-assets.sh"),
+            "plugin missing at /usr/lib"
+        );
+        assert_eq!(short_reason("x".repeat(200).as_str()).chars().count(), 91);
+        assert_eq!(short_reason("busy"), "busy");
+    }
+
     use super::*;
     use crate::abtest::types::SampleMetrics;
     use egui_kittest::kittest::Queryable;
@@ -1910,6 +2162,271 @@ mod tests {
                 "dead strip in {name}: content ends at {required} px in a {} px window",
                 WINDOW_SIZE[1]
             );
+        }
+    }
+
+    /// A switch whose turn-on answers `result` (counting calls) and whose
+    /// mode query answers `on`.
+    fn fake_switch(
+        result: Result<(), TurnOnError>,
+        on: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> SuppressionSwitch {
+        use std::sync::atomic::Ordering;
+        SuppressionSwitch {
+            turn_on: Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                result.clone()
+            }),
+            is_on: Arc::new(move || Some(on.load(Ordering::SeqCst))),
+        }
+    }
+
+    const OFF: LaunchGate = LaunchGate {
+        suppression_off: true,
+        pipewire_down: false,
+    };
+    const NO_PIPEWIRE: LaunchGate = LaunchGate {
+        suppression_off: false,
+        pipewire_down: true,
+    };
+
+    /// Step the harness until `done` holds (worker threads answer
+    /// asynchronously), bounded at ~2 s.
+    fn step_until(
+        harness: &mut egui_kittest::Harness<'_>,
+        done: impl Fn(&egui_kittest::Harness<'_>) -> bool,
+    ) -> bool {
+        for _ in 0..100 {
+            harness.run_steps(1);
+            if done(harness) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn off_overlay_button_turns_suppression_on_then_goes_live() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        pin_english();
+        let (cmd_tx, cmd_rx) = channel();
+        let (frame_tx, frame_rx) = channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let switch = fake_switch(Ok(()), Arc::new(AtomicBool::new(false)), Arc::clone(&calls));
+        let mut app = AbApp::gated(cmd_tx, frame_rx, OFF, switch);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+            .build(move |ctx| app.ui(ctx));
+        harness.run_steps(2);
+        harness.get_by_label("Noise suppression is off");
+        harness.get_by_label("Turn on noise suppression").click();
+        assert!(
+            step_until(&mut harness, |h| h
+                .query_by_label("Connecting to your microphone…")
+                .is_some()),
+            "a granted request hands over to the settle overlay"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(harness.query_by_label("Noise suppression is off").is_none());
+        // The device is re-checked right away.
+        assert!(cmd_rx.try_iter().any(|c| c == Command::RetryDevice));
+        // The virtual mic comes up: no overlay, monitoring starts.
+        frame_tx
+            .send(Frame::Device {
+                ok: true,
+                name: "mic".into(),
+            })
+            .unwrap();
+        harness.run_steps(2);
+        assert!(harness
+            .query_by_label("Connecting to your microphone…")
+            .is_none());
+        assert!(cmd_rx.try_iter().any(|c| c == Command::StartMonitor));
+    }
+
+    #[test]
+    fn off_overlay_gives_way_when_the_tray_turns_suppression_on() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        pin_english();
+        let (cmd_tx, _cmd_rx) = channel();
+        let (_frame_tx, frame_rx) = channel();
+        let on = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let switch = fake_switch(Ok(()), Arc::clone(&on), Arc::clone(&calls));
+        let mut app = AbApp::gated(cmd_tx, frame_rx, OFF, switch);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+            .build(move |ctx| app.ui(ctx));
+        harness.run_steps(2);
+        harness.get_by_label("Noise suppression is off");
+        // Switched on from the tray/CLI (the poll repeats every 1.5 s).
+        on.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..3 {
+            if step_until(&mut harness, |h| {
+                h.query_by_label("Noise suppression is off").is_none()
+            }) {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared, "the mode poll clears the overlay");
+        harness.get_by_label("Connecting to your microphone…");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no request of our own");
+    }
+
+    #[test]
+    fn too_old_pipewire_closes_the_window_for_run_to_report() {
+        use std::sync::atomic::Ordering;
+        let (mut app, _cmd_rx) = test_app();
+        assert!(!app.needs_newer_pipewire.load(Ordering::Relaxed));
+        app.handle_frame(&Frame::NeedsNewerPipewire);
+        assert!(app.needs_newer_pipewire.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn off_overlay_passes_on_the_trays_reason_when_it_refuses() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        pin_english();
+        let (cmd_tx, _cmd_rx) = channel();
+        let (_frame_tx, frame_rx) = channel();
+        let switch = fake_switch(
+            Err(TurnOnError::Refused("the plugin is missing".into())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut app = AbApp::gated(cmd_tx, frame_rx, OFF, switch);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+            .build(move |ctx| app.ui(ctx));
+        harness.run_steps(2);
+        harness.get_by_label("Turn on noise suppression").click();
+        assert!(step_until(&mut harness, |h| h
+            .query_by_label_contains("Noise suppression has not started:")
+            .is_some()));
+        harness.get_by_label_contains("the plugin is missing");
+        assert!(harness.query_by_label_contains("didn't respond").is_none());
+        harness.get_by_label("Turn on noise suppression");
+    }
+
+    #[test]
+    fn off_overlay_keeps_the_button_when_the_request_goes_unanswered() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        pin_english();
+        let (cmd_tx, _cmd_rx) = channel();
+        let (_frame_tx, frame_rx) = channel();
+        let switch = fake_switch(
+            Err(TurnOnError::NoReply),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut app = AbApp::gated(cmd_tx, frame_rx, OFF, switch);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+            .build(move |ctx| app.ui(ctx));
+        harness.run_steps(2);
+        harness.get_by_label("Turn on noise suppression").click();
+        assert!(step_until(&mut harness, |h| h
+            .query_by_label("HushMic didn't respond. Try again in a moment.")
+            .is_some()));
+        // Still off, and the button is back for another try.
+        harness.get_by_label("Noise suppression is off");
+        harness.get_by_label("Turn on noise suppression");
+    }
+
+    #[test]
+    fn no_pipewire_overlay_retries_and_hands_over_once_reachable() {
+        pin_english();
+        let (cmd_tx, cmd_rx) = channel();
+        let (frame_tx, frame_rx) = channel();
+        let mut app = AbApp::gated(
+            cmd_tx,
+            frame_rx,
+            NO_PIPEWIRE,
+            SuppressionSwitch::control_socket(),
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+            .build(move |ctx| app.ui(ctx));
+        harness.run_steps(2);
+        harness.get_by_label("Can't reach PipeWire");
+        // The pactl line needs PipeWire too: not offered here.
+        assert!(harness.query_by_label_contains("pactl").is_none());
+        while cmd_rx.try_recv().is_ok() {}
+        harness.get_by_label("Retry detection").click();
+        harness.run_steps(2);
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::RetryDevice));
+        // PipeWire answers: the chain may still be starting.
+        frame_tx.send(Frame::PipewireReachable).unwrap();
+        harness.run_steps(2);
+        assert!(harness.query_by_label("Can't reach PipeWire").is_none());
+        harness.get_by_label("Connecting to your microphone…");
+    }
+
+    // The launch windows get screenshot-OCR-checked by an app catalog:
+    // nothing on them may read like a crash report. Covers the overlay
+    // labels (accesskit) and the painted status pill / timeline behind
+    // the dim.
+    #[test]
+    fn launch_overlays_read_calmly() {
+        const FLAGGED: [&str; 11] = [
+            "fatal",
+            "error",
+            "failed",
+            "failure",
+            "could not",
+            "cannot",
+            "unable to",
+            "not found",
+            "no such file",
+            "not installed",
+            "permission denied",
+        ];
+        let calm = |text: &str| {
+            let t = text.to_lowercase();
+            FLAGGED.iter().all(|w| !t.contains(w))
+        };
+        pin_english();
+        for gate in [OFF, NO_PIPEWIRE] {
+            let (cmd_tx, _cmd_rx) = channel();
+            let (_frame_tx, frame_rx) = channel();
+            let mut app = AbApp::gated(
+                cmd_tx,
+                frame_rx,
+                gate,
+                SuppressionSwitch {
+                    turn_on: Arc::new(|| Ok(())),
+                    is_on: Arc::new(|| None),
+                },
+            );
+            let state = WindowState::gated(gate);
+            let status = match state.status() {
+                Status::NoInput => tr!("ab-status-no-input"),
+                other => panic!("unexpected status {other:?}"),
+            };
+            assert!(calm(&status), "{status}");
+            assert!(calm(&state.timeline().label));
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))
+                .build(move |ctx| app.ui(ctx));
+            harness.run_steps(2);
+            let loud: Vec<String> = harness
+                .query_all_by(|n| n.label().is_some_and(|l| !calm(&l)))
+                .map(|n| format!("{n:?}"))
+                .collect();
+            assert!(loud.is_empty(), "{gate:?}: {loud:?}");
+            // Not vacuous: the overlay's own labels are in the tree.
+            assert!(harness.query_all_by(|n| n.label().is_some()).count() > 3);
+        }
+        // Transient texts the snapshot above cannot catch.
+        for text in [
+            tr!("ab-off-no-reply"),
+            tr!("ab-off-turning-on"),
+            tr!("ab-off-refused", reason = ""),
+        ] {
+            assert!(calm(&text), "{text}");
         }
     }
 
