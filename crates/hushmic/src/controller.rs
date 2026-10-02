@@ -435,6 +435,31 @@ context.modules = [
 /// The light model's id: the plugin's fallback tier under CPU pressure.
 pub const LIGHT_MODEL: &str = "dpdfnet2_48khz_hr";
 
+/// The config a chain start runs with: the saved one, or during a mic
+/// recovery fallback the same with the mic cleared, so the chain follows
+/// the system default. The fallback was decided on debounced evidence
+/// that the saved mic is gone; a later start whose device read fails (a
+/// failed read keeps the saved mic: unknown is not gone) or is stale must
+/// not pin the chain to it again, which would read as "on the preferred
+/// mic" and stop the return. Pure.
+pub fn restart_config(cfg: &Config, mic_fallback: bool) -> Config {
+    if mic_fallback {
+        Config {
+            mic: None,
+            ..cfg.clone()
+        }
+    } else {
+        cfg.clone()
+    }
+}
+
+/// Whether a settings change restarts the chain: when its values change,
+/// or when an explicit mic pick ended a recovery fallback (the saved mic
+/// is the same, but the chain still followed the default). Pure.
+pub fn settings_restart(values_changed: bool, fallback_ended: bool) -> bool {
+    values_changed || fallback_ended
+}
+
 /// What the chain's `HUSHMIC_INFERENCE` should be set to for the
 /// configured engine choice (issue #18): only `onnx` needs saying, since
 /// the plugin's default is auto. A value already in our own environment is
@@ -522,6 +547,10 @@ pub struct Controller {
     /// The child's stderr tee; joined in `disable()` so a draining old tee
     /// can never overwrite the engine tier of a freshly spawned chain.
     tee: Option<std::thread::JoinHandle<()>>,
+    /// Mic recovery fell back from the saved mic (it vanished): every
+    /// restart follows the system default until the return or a new pick
+    /// ([`restart_config`]).
+    mic_fallback: bool,
 }
 
 impl Controller {
@@ -539,7 +568,22 @@ impl Controller {
             tee: None,
             active_profile: None,
             logged_profile: None,
+            mic_fallback: false,
         }
+    }
+
+    /// Enter (mic recovery's fallback) or leave (its return) the state in
+    /// which every restart follows the system default instead of the saved
+    /// mic.
+    pub fn set_mic_fallback(&mut self, on: bool) {
+        self.mic_fallback = on;
+    }
+
+    /// The user picked a mic (the tray, or `config set mic`, even to the
+    /// same value) or turned HushMic on: a recovery fallback ends. True when one was latched, so
+    /// the pick has to restart the chain even if nothing else changed.
+    pub fn end_mic_fallback(&mut self) -> bool {
+        std::mem::take(&mut self.mic_fallback)
     }
 
     pub fn mode(&self) -> RunMode {
@@ -670,6 +714,11 @@ impl Controller {
     /// event loop's `Cmd`/`Tick` handlers and the `--enable-once` path) runs on
     /// the main thread, so the death-signal fires on process exit as intended.
     pub fn enable(&mut self, cfg: &Config) -> std::io::Result<()> {
+        // Whatever asked for this start (watchdog respawn, profile restart,
+        // a settings change), a recovery fallback stays one. Only the
+        // return, a mic pick or a deliberate turn-on ends it: never a device
+        // list, which can be stale right when the mic vanishes.
+        let cfg = &restart_config(cfg, self.mic_fallback);
         // ALWAYS tear down first — unconditionally, not just when `is_running()`.
         // `disable()` is idempotent (it `.take()`s the child and clears
         // `set_default_active`/`prior_default`), and it is the ONLY thing that
@@ -693,8 +742,16 @@ impl Controller {
         // mic, or the default source when the chain follows it. disable()
         // above handed the default back to the pre-takeover device; only a
         // failed restore leaves that device in `prior_default`.
+        let resolve_started = Instant::now();
         let target =
             pipewire::resolve_chain_target(cfg.mic.as_deref(), self.prior_default.as_deref());
+        if let (Some(m), None) = (cfg.mic.as_deref(), target.sources.as_ref()) {
+            eprintln!(
+                "[hushmic] the device list could not be read ({} ms); keeping the saved \
+                 microphone '{m}'",
+                resolve_started.elapsed().as_millis()
+            );
+        }
         let effective_mic = target.mic;
         let profile = cfg.profile_for(target.profile_device.as_deref());
         let profile_name = profile.device.as_deref().and_then(|d| {

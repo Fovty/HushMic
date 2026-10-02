@@ -437,9 +437,11 @@ fn apply_config(
     mictest_cancel: &Option<Arc<AtomicBool>>,
     ab_window: &mut Option<AbWindow>,
     gate: &mut FailureGate,
+    fallback_ended: bool,
 ) -> Result<(), String> {
     let d = hushmic::config_cli::diff(cfg, &new);
-    if d.chain && cfg.enabled {
+    let restart = hushmic::controller::settings_restart(d.chain, fallback_ended);
+    if restart && cfg.enabled {
         // Same invalidation as the tray commands: a running mic test would
         // record a chain mid-restart, and the A/B window compares the old
         // mic against the new output.
@@ -459,7 +461,7 @@ fn apply_config(
             errors.push(format!("the autostart entry could not be written: {e}"));
         }
     }
-    let chain_result = if d.chain && new.enabled {
+    let chain_result = if restart && new.enabled {
         apply(controller, &new)
     } else {
         Ok(())
@@ -1273,7 +1275,14 @@ fn main() {
                         let device = settings_device(&cfg, &controller, &mut target_cache);
                         let mut new = cfg.clone();
                         cc::apply(&mut new, k, v, device.as_deref());
-                        let chain_changed = cc::diff(&cfg, &new).chain;
+                        // A mic pick (even of the same mic) ends a recovery
+                        // fallback, like the tray's: it restarts the chain.
+                        let fallback_ended = (k == cc::Key::Mic || new.mic != cfg.mic)
+                            && controller.end_mic_fallback();
+                        let chain_changed = hushmic::controller::settings_restart(
+                            cc::diff(&cfg, &new).chain,
+                            fallback_ended,
+                        );
                         if k == cc::Key::SetDefault {
                             // Deliberate: may take the default again even
                             // after the user switched it away.
@@ -1291,6 +1300,7 @@ fn main() {
                             &mictest_cancel,
                             &mut ab_window,
                             &mut gate,
+                            fallback_ended,
                         );
                         let mut line = format!(
                             "{} = {}{}",
@@ -1467,8 +1477,12 @@ fn main() {
                         let old_sel = cfg.enabled.then(|| controller.mode());
                         if sel.is_some() && !cfg.enabled {
                             // Turned on deliberately: "Set as default
-                            // microphone" applies again.
+                            // microphone" applies again, and a recovery
+                            // fallback from before ends (the saved mic may
+                            // have been replugged meanwhile; if not, recovery
+                            // falls back again).
                             controller.reclaim_default();
+                            controller.end_mic_fallback();
                         }
                         match sel {
                             None => {
@@ -1506,7 +1520,9 @@ fn main() {
                     }
                     TrayCmd::SelectMic(m) => {
                         // The restart applies the pick's profile; the
-                        // refresh below shows it in the radios.
+                        // refresh below shows it in the radios. A pick
+                        // ends a recovery fallback (it restarts anyway).
+                        controller.end_mic_fallback();
                         cfg.apply_mic_selection(m);
                         if cfg.enabled {
                             applied = apply(&mut controller, &cfg);
@@ -2144,7 +2160,16 @@ fn main() {
                                 c.store(true, Ordering::Relaxed);
                             }
                         }
-                        match controller.enable(&cfg) {
+                        let started = Instant::now();
+                        controller.set_mic_fallback(switch == watchdog::Switch::Fallback);
+                        let result = controller.enable(&cfg);
+                        if started.elapsed() > Duration::from_secs(2) {
+                            eprintln!(
+                                "[hushmic] the chain restart took {} ms",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                        match result {
                             Ok(()) => {
                                 schedule_early_tick(&tx);
                                 notify::send_transient(

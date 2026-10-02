@@ -378,3 +378,55 @@ fn per_mic_profile_drives_the_rendered_conf() {
     );
     assert!(conf.contains("alsa_input.rode"), "{conf}");
 }
+
+#[test]
+fn every_restart_during_a_mic_fallback_follows_the_default() {
+    use hushmic::controller::restart_config;
+    use hushmic::pipewire::resolve_effective_mic;
+    let cfg = Config {
+        mic: Some("virt_mic".into()),
+        ..Config::default()
+    };
+    // a respawn (or profile or settings restart) during the fallback, with
+    // no device list: still the default, never the vanished mic
+    let during = restart_config(&cfg, true);
+    assert_eq!(during.mic, None);
+    assert_eq!(resolve_effective_mic(during.mic.as_deref(), None), None);
+    // the plain config would have pinned it again
+    assert_eq!(
+        resolve_effective_mic(cfg.mic.as_deref(), None).as_deref(),
+        Some("virt_mic")
+    );
+    // everything else as saved
+    assert_eq!(during.model, cfg.model);
+    assert_eq!(during.attn_limit, cfg.attn_limit);
+    assert_eq!(during.set_default, cfg.set_default);
+    // outside a fallback (after the return, or a new pick): as saved
+    assert_eq!(restart_config(&cfg, false).mic, cfg.mic);
+}
+
+#[test]
+fn picking_the_same_mic_again_ends_a_recovery_fallback() {
+    use hushmic::controller::{restart_config, settings_restart};
+    let cfg = Config {
+        mic: Some("mic_a".into()),
+        ..Config::default()
+    };
+    // `config set mic mic_a` while the fallback is latched: the value does
+    // not change, but the pick ends the fallback and restarts onto mic_a
+    assert!(settings_restart(false, true));
+    assert_eq!(restart_config(&cfg, false).mic.as_deref(), Some("mic_a"));
+    // nothing changed and no fallback: no restart
+    assert!(!settings_restart(false, false));
+    // a value change restarts as before
+    assert!(settings_restart(true, false));
+    // the controller's latch: set by the fallback, ended by a pick once
+    let mut c = hushmic::controller::Controller::new(test_paths());
+    assert!(!c.end_mic_fallback());
+    c.set_mic_fallback(true);
+    assert!(
+        c.end_mic_fallback(),
+        "a latched fallback ends with the pick"
+    );
+    assert!(!c.end_mic_fallback(), "and only once");
+}
