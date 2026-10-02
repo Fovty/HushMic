@@ -27,3 +27,6 @@
 # and the hicolor ladder are the committed artifacts.
 /packaging/tray/tray*.png
 /packaging/flatpak/ci-tree-manifest.yml
+
+# Python bytecode (the ci/ scripts import each other in tests)
+__pycache__/
