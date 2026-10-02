@@ -26,7 +26,7 @@ release tag:
 
 ```toml
 [dependencies]
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.1" }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.2" }
 ```
 
 ## What you need at runtime
@@ -58,7 +58,7 @@ feature and configure [`ort`](https://crates.io/crates/ort) yourself; cargo
 merges the features:
 
 ```toml
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.1", default-features = false }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.2", default-features = false }
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 ```
 
@@ -71,7 +71,7 @@ with 8-bit matrix math in roughly half the CPU time of ONNX Runtime, with
 no measurable difference in quality.
 
 ```toml
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.1", features = ["native"] }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.2", features = ["native"] }
 ```
 
 ```rust

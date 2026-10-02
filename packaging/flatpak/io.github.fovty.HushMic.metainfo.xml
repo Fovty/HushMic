@@ -49,6 +49,17 @@
   </screenshots>
 
   <releases>
+    <release version="0.10.2" date="2026-10-02">
+      <description>
+        <p>
+          Under heavy CPU load the noise filter now drops out for much
+          shorter moments and comes back within a fraction of a second,
+          instead of passing unfiltered audio for several seconds. When a
+          microphone disconnects and returns, HushMic reliably switches back
+          to it.
+        </p>
+      </description>
+    </release>
     <release version="0.10.1" date="2026-09-29">
       <description>
         <p>
