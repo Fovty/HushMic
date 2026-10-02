@@ -19,7 +19,7 @@ fn latency_node_rendered_only_when_supported() {
     assert!(on.contains("name   = hushmic_latency"), "{on}");
     assert!(on.contains("label  = delay"), "{on}");
     assert!(
-        on.contains("\"latency\" = 0.08"),
+        on.contains("\"latency\" = 0.1"),
         "latency must render as seconds: {on}"
     );
     assert!(
@@ -39,12 +39,12 @@ fn latency_node_rendered_only_when_supported() {
 
 #[test]
 fn latency_constant_and_rendered_seconds_agree() {
-    // 3840 samples @ 48 kHz = 0.08 s; the render derives one from the
-    // other so they cannot drift apart. The 3840 = engine 2400 (pinned
+    // 4800 samples @ 48 kHz = 0.1 s; the render derives one from the
+    // other so they cannot drift apart. The 4800 = engine 2400 (pinned
     // against the MEASURED DSP by the hushmic-denoiser latency tests) +
-    // 1440 async output lead (PLUGIN_LATENCY_SAMPLES in dpdfnet-ladspa,
+    // 2400 async output lead (PLUGIN_LATENCY_SAMPLES in dpdfnet-ladspa,
     // pinned end-to-end by its asset-gated latency test).
-    assert_eq!(LATENCY_SAMPLES, 3840);
+    assert_eq!(LATENCY_SAMPLES, 4800);
     let secs = LATENCY_SAMPLES as f64 / 48_000.0;
     let on = render_conf(
         &Config::default(),

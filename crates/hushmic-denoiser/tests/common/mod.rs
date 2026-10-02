@@ -30,7 +30,9 @@ pub fn model_path(name: &str) -> Option<PathBuf> {
 /// Commit the repo's bundled runtime (AlreadyInitialized is fine — another
 /// test in this binary may have won). None = assets absent, caller skips.
 pub fn init_dev_runtime() -> Option<()> {
-    let rt = repo_root().join("assets/lib/libonnxruntime.so");
+    let rt = std::env::var_os("ORT_DYLIB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("assets/lib/libonnxruntime.so"));
     if !rt.exists() {
         if assert_assets() {
             panic!(

@@ -275,7 +275,7 @@ fn ramp_alignment_is_exact_at_every_quantum() {
 
 #[test]
 fn a_long_stall_substitutes_silence_then_realigns_exactly() {
-    // One hop takes 120 ms — four times the 30 ms total cushion. Real
+    // One hop takes 120 ms — more than twice the 50 ms total cushion. Real
     // pacing: a 480-sample callback every 10 ms.
     let mut d = Driver::new(StallingEngine {
         hop: 0,
@@ -295,7 +295,7 @@ fn a_long_stall_substitutes_silence_then_realigns_exactly() {
     }
     assert_alignment(&d.out, OUTPUT_LEAD, 0);
     let zeros = d.out[OUTPUT_LEAD..].iter().filter(|&&v| v == 0.0).count();
-    assert!(zeros > 0, "a 120 ms stall must overrun the 30 ms cushion");
+    assert!(zeros > 0, "a 120 ms stall must overrun the 50 ms cushion");
     assert!(
         d.out[d.out.len() - 4 * 480..].iter().all(|&v| v != 0.0),
         "after recovery the stream is pure audio again"

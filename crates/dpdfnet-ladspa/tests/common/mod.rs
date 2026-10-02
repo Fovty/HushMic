@@ -26,7 +26,9 @@ pub fn model_path(name: &str) -> Option<PathBuf> {
 }
 
 pub fn runtime_path() -> Option<PathBuf> {
-    let p = repo_root().join("assets/lib/libonnxruntime.so");
+    let p = std::env::var_os("ORT_DYLIB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("assets/lib/libonnxruntime.so"));
     if !p.exists() && assert_assets() {
         panic!(
             "{} missing but HUSHMIC_ASSERT_ASSETS=1 — assets must be provisioned",

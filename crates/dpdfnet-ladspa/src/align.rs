@@ -23,11 +23,10 @@ pub const DESIGN_QUANTUM: usize = 480;
 
 use hushmic_denoiser::HOP;
 
-/// Worker stall headroom (20 ms): scheduling jitter plus transient
+/// Worker stall headroom (40 ms): scheduling jitter plus transient
 /// compute inflation the cushion absorbs before a zero is substituted.
-/// Sized from the issue-#10 field data (a 4x-inflated 28 ms dpdfnet8 hop
-/// consumes 18 ms of cushion).
-pub const STALL_HEADROOM: usize = 960;
+/// Sustained overload still substitutes silence.
+pub const STALL_HEADROOM: usize = 1920;
 
 /// The plugin-side output margin: output for the input pushed in a cycle
 /// is popped in that same callback, but the worker produces it only
@@ -149,8 +148,8 @@ mod tests {
     fn constants_pin_the_declared_latency() {
         // hushmic's controller::LATENCY_SAMPLES pins the same number for
         // the conf delay node and the doctor; a drift here must fail.
-        assert_eq!(OUTPUT_LEAD, 1440);
-        assert_eq!(PLUGIN_LATENCY_SAMPLES, 3840);
+        assert_eq!(OUTPUT_LEAD, 2400);
+        assert_eq!(PLUGIN_LATENCY_SAMPLES, 4800);
         assert_eq!(hushmic_denoiser::LATENCY_SAMPLES, 2400);
     }
 
@@ -227,7 +226,7 @@ mod tests {
     #[test]
     fn startup_emits_exactly_the_lead_then_real_samples() {
         let mut s = Sim::new();
-        for _ in 0..6 {
+        for _ in 0..=OUTPUT_LEAD / DESIGN_QUANTUM {
             s.cycle(DESIGN_QUANTUM);
         }
         assert!(s.emitted[..OUTPUT_LEAD].iter().all(|&v| v == 0.0));
@@ -236,9 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn forty_ms_worker_delay_preserves_every_sample() {
+        let mut s = Sim::new();
+        for _ in 0..20 {
+            s.push(DESIGN_QUANTUM);
+            // Model a worker whose output trails input by four 10 ms hops.
+            let ready = s.produced.len().saturating_sub(4 * DESIGN_QUANTUM);
+            s.pop(DESIGN_QUANTUM, ready.saturating_sub(s.consumed));
+        }
+        assert!(s.emitted[OUTPUT_LEAD..].iter().all(|&v| v != 0.0));
+        s.assert_alignment(OUTPUT_LEAD, 0);
+    }
+
+    #[test]
     fn a_stall_substitutes_zeros_then_realigns_exactly() {
         let mut s = Sim::new();
-        for _ in 0..4 {
+        for _ in 0..=OUTPUT_LEAD / DESIGN_QUANTUM {
             s.cycle(480);
         }
         // Worker stalls hard: only 180 samples sit in the ring — the
@@ -263,7 +275,7 @@ mod tests {
         for _ in 0..4 {
             s.cycle(480);
         }
-        for _ in 0..6 {
+        for _ in 0..=OUTPUT_LEAD / DESIGN_QUANTUM {
             s.cycle(1024); // metadata override beyond the design quantum
         }
         for _ in 0..4 {

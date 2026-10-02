@@ -1,0 +1,3 @@
+# Add pause protection alongside existing denoising
+
+Use a fixed voice reference established through deliberate enrollment and enrolled-speaker presence detection to gate the final suppression mixture while retaining the existing denoiser. A reference-conditioned extractor would expand the model and runtime changes to separating simultaneous speakers, beyond the agreed goal of stopping background speech during pauses. Favor preserving the enrolled speaker's words: detector failure returns to ordinary denoising with protection visibly unavailable, and a candidate must demonstrate the agreed behavior within 200 ms total processing latency before investment in full enrollment UI or production integration.

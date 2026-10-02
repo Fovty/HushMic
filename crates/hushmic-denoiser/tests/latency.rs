@@ -4,7 +4,7 @@
 //! DSP change shifts the real latency, they fail and force LATENCY_SAMPLES to
 //! be re-derived. (The framing half alone is pinned by the STFT unit tests;
 //! the plugin's async output lead on top is pinned by dpdfnet-ladspa's own
-//! latency test and the hushmic conf-test constant, 3840 = 2400 + 1440.)
+//! latency test and the hushmic conf-test constant, 4800 = 2400 + 2400.)
 
 mod common;
 
