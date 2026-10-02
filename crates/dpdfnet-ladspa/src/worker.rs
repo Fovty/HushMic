@@ -622,6 +622,9 @@ fn worker_loop(
 }
 
 #[cfg(test)]
+mod replay;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

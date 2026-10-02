@@ -214,6 +214,9 @@ impl Policy for Recorded {
         self.hop += 1;
         e
     }
+    fn note_pause(&mut self, hops: f32) {
+        self.inner.note_pause(hops);
+    }
     fn reset(&mut self) {
         self.inner.reset();
     }
@@ -374,6 +377,8 @@ fn scenario(name: &str, clip: &[f32]) {
     // so the duck must suppress a measurable burst.
     let flap_earliest = QUALITY_BACK_BY + 100;
     let flap_end_at = |f: u32| f + BURSTS * (BURST_LEN + BURST_GAP) - BURST_GAP;
+    // The stall is a panic behind a late backlog: raw at once (no fade),
+    // one drain hop that reads lag 0, five warm-up hops, one rejoin fade.
     let raw_phase = 1 + 5 + 1;
     // One full clip covers every input position after quality recovers.
     let search_end = flap_earliest as usize + clip_hops;

@@ -785,6 +785,9 @@ fn caught_up_large_quantum_never_reports_panic_lag() {
             self.lags.lock().unwrap().push(lag);
             self.ladder.observe(live, shadow, lag)
         }
+        fn note_pause(&mut self, hops: f32) {
+            self.ladder.note_pause(hops);
+        }
         fn reset(&mut self) {
             self.ladder.reset();
         }

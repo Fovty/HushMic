@@ -23,8 +23,26 @@ pub const LAG_ABORT: u32 = 2;
 /// Lag that is an emergency at once, without the hold and the cost
 /// condition: a worker that was kept off the CPU for 40 ms is already
 /// substituting zeros, and at any model cost the backlog drains too slowly
-/// for the hold to matter. Raw drains it in one hop.
+/// for the hold to matter. Raw drains it a hop per hop, at no cost.
 pub const LAG_PANIC: u32 = 4;
+/// The backlog a hop leaves behind, `lag + wall - 1` in hops (the hops that
+/// arrived while it ran, minus itself), beyond which that hop itself missed
+/// its slot (the deadline is strict: a hop that leaves exactly this much
+/// was on time): the aligner zero-filled it and discards the output. What follows
+/// is heard after zeros either way, so a fade into raw hides nothing; and a
+/// trial abort that leaves this much was audible.
+pub const LATE_BACKLOG: f32 = 2.0;
+/// `LAG_HOLD` (three) consecutive hops at this live cost whose last one
+/// leaves more than a `LATE_BACKLOG` are an overload, not a stall: an
+/// emergency at once, without waiting for the lag reading to reach
+/// `LAG_PANIC`. Under CPU contention a starved hop takes two to three
+/// budgets, so the reading lags the real backlog by a whole hop and the
+/// panic used to fire about 50 ms into the zeros. A blip of one or two long
+/// hops (a page fault, a short burst of contention) drains on its own
+/// within the cushion: two hops were not enough evidence, and an emergency
+/// there cost 80 ms of ducked voice and the quality dwell for at most a
+/// hop or two of zeros.
+pub const STARVED_COST: f32 = 1.5;
 /// A trial also aborts after this many consecutive hops at `lag >= LAG_WARN`
 /// (a trial is optional, zeros are not).
 pub const TRIAL_LAG_HOLD: u32 = 3;
@@ -79,15 +97,17 @@ pub const TRIAL: u32 = 30;
 pub const PROMOTE_LOAD: f32 = 0.70;
 /// Crossfade hops for a preventive demotion.
 pub const XFADE_DEMOTE: u32 = 3;
-/// Crossfade hops into raw under emergency.
+/// Crossfade hops into raw under emergency, while the output is still on
+/// time. A panic or any emergency behind a `LATE_BACKLOG` has no fade: the
+/// output is already zeros, and every fade hop would still run the failed
+/// model at its inflated cost.
 pub const XFADE_EMERGENCY: u32 = 2;
-/// Crossfade hops into raw after a panic: the output is already zeros
-/// behind a lag of `LAG_PANIC`, and every crossfade hop still runs the
-/// failed model at its inflated cost, so one hop (a ramp over 480
-/// samples) is all the smoothing that is worth its 10 ms.
-pub const XFADE_PANIC: u32 = 1;
 /// Crossfade hops for a promotion.
 pub const XFADE_PROMOTE: u32 = 5;
+/// Hops an emergency's rejoin waits for raw to drain the backlog before
+/// it gives up: raw drains a hop per hop, so this is half a second of
+/// backlog, and the duck must not hold a lag that is not draining.
+pub const DRAIN_MAX: u32 = 50;
 /// Rejoin fade after the model has filled its delay line. A linear ramp
 /// over one hop keeps complementary gains and reaches the model at its end.
 pub const XFADE_REJOIN: u32 = 1;
@@ -141,7 +161,8 @@ pub enum ShadowKind {
     /// A tier expected to fit rejoins after an emergency: it warms up
     /// without a median verdict, but the budget guards still apply. This
     /// is the light tier after quality failed, or a tier a cheap panic
-    /// took down. Raw exposure is `WARMUP` hops plus the rejoin fade.
+    /// took down. It starts after the drain (`Phase::Drain`); raw exposure
+    /// is the drain, `WARMUP` hops and the rejoin fade.
     Rejoin,
 }
 
@@ -182,6 +203,11 @@ pub enum Event {
         tier: Tier,
         cost: f32,
     },
+    /// An emergency's drain gave up (the backlog did not drain): `tier`
+    /// was not attempted and waits out its dwell.
+    DrainAbandoned {
+        tier: Tier,
+    },
 }
 
 pub trait Policy: Send + 'static {
@@ -194,6 +220,11 @@ pub trait Policy: Send + 'static {
     /// hops queued beyond the one just processed.
     fn observe(&mut self, live_cost: f32, shadow_cost: Option<f32>, lag_hops: u32)
         -> Option<Event>;
+    /// Of the next `observe`'s live cost, this many hops were a run-guard
+    /// sleep the worker took before it read the lag: the lag reading
+    /// already holds the hops that arrived during it. Required, so a
+    /// wrapper cannot silently drop it.
+    fn note_pause(&mut self, hops: f32);
     /// The DSP state was reset: drop any phase in flight, the lower tier of
     /// the pair becomes live. Backoff survives; a changed tier starts its age anew.
     fn reset(&mut self);
@@ -219,6 +250,9 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     ) -> Option<Event> {
         (**self).observe(live_cost, shadow_cost, lag_hops)
     }
+    fn note_pause(&mut self, hops: f32) {
+        (**self).note_pause(hops)
+    }
     fn reset(&mut self) {
         (**self).reset()
     }
@@ -240,6 +274,7 @@ impl Policy for Pinned {
     fn observe(&mut self, _: f32, _: Option<f32>, _: u32) -> Option<Event> {
         None
     }
+    fn note_pause(&mut self, _: f32) {}
     fn reset(&mut self) {}
     fn live(&self) -> Tier {
         self.0
@@ -272,6 +307,15 @@ enum Phase {
         of: u32,
         seed: f32,
         change: Change,
+    },
+    /// An emergency landed on raw and a tier above rejoins: raw runs alone
+    /// (ducked) until a hop reads lag 0, then `target`'s Rejoin shadow
+    /// starts. Raw drains a hop of backlog per hop at no cost; next to the
+    /// cold candidate it would not, and the rejoin's first hop would read
+    /// `LAG_ABORT` and end it.
+    Drain {
+        target: usize,
+        hop: u32,
     },
 }
 
@@ -315,6 +359,8 @@ pub struct Ladder {
     /// The emergency in flight was a panic at a low recent cost: the tier
     /// itself was fine, something else held the CPU.
     cheap_panic: bool,
+    /// The guard sleep inside the next observe's live cost (`note_pause`).
+    pause: f32,
 }
 
 impl Ladder {
@@ -349,6 +395,7 @@ impl Ladder {
             recent: [0.0; LAG_HOLD as usize],
             grace: START_GRACE,
             cheap_panic: false,
+            pause: 0.0,
         }
     }
 
@@ -395,6 +442,9 @@ impl Ladder {
     /// moment (the backlog model, the lag, a candidate over a whole budget)
     /// was a silent probe that cost nothing audible: the same dwell again,
     /// so a load that comes and goes does not stack minutes of passthrough.
+    /// An abort whose hop left a `LATE_BACKLOG` was not silent (the cold
+    /// hop overran the cushion, zeros follow): it doubles like a verdict,
+    /// or a sustained load would cut the stream at every dwell.
     /// Audible flapping (a tier rejoining and failing within
     /// `RECENT_PROMOTION`) backs off through the oscillation guard.
     fn trial_failed(&mut self, target: usize, cost: f32, verdict: bool) -> Option<Event> {
@@ -414,26 +464,32 @@ impl Ladder {
         })
     }
 
-    fn start_emergency(&mut self, lag: u32, cheap: bool) -> Option<Event> {
+    /// `late`: the hop just observed left a `LATE_BACKLOG`, so the stream is
+    /// already in zeros and a fade would only add hops of the failed tier
+    /// at its inflated cost to the gap. Raw goes live at once instead (its
+    /// duck starts at the target, `AdaptiveEngine`) and drains the backlog
+    /// on the next hops.
+    fn start_emergency(&mut self, lag: u32, cheap: bool, late: bool) -> Option<Event> {
         let failed = self.live;
         self.cheap_panic = cheap;
+        let event = Some(Event::Demoted {
+            to: Tier::Raw,
+            cost: self.load,
+            lag,
+        });
+        if late {
+            self.finish_crossfade(self.bottom(), 0.0, Change::Emergency(failed));
+            return event;
+        }
         self.phase = Phase::Crossfade {
             from: self.live,
             to: self.bottom(),
             hop: 0,
-            of: if lag >= LAG_PANIC {
-                XFADE_PANIC
-            } else {
-                XFADE_EMERGENCY
-            },
+            of: XFADE_EMERGENCY,
             seed: 0.0,
             change: Change::Emergency(failed),
         };
-        Some(Event::Demoted {
-            to: Tier::Raw,
-            cost: self.load,
-            lag,
-        })
+        event
     }
 
     // Use the age at fade completion so the intent and landing agree even
@@ -469,11 +525,14 @@ impl Ladder {
             _ if to > 0 => self.dwell[to - 1],
             _ => u32::MAX,
         };
-        if self.next_trial_at == 0 {
-            self.start_shadow(to - 1, ShadowKind::Rejoin);
+        self.phase = if self.next_trial_at == 0 {
+            Phase::Drain {
+                target: to - 1,
+                hop: 0,
+            }
         } else {
-            self.phase = Phase::Steady;
-        }
+            Phase::Steady
+        };
     }
 
     fn start_shadow(&mut self, target: usize, kind: ShadowKind) {
@@ -516,6 +575,7 @@ impl Policy for Ladder {
                 kind: ShadowKind::Rejoin,
                 ..
             }
+            | Phase::Drain { .. }
             | Phase::Crossfade {
                 change: Change::Rejoin,
                 ..
@@ -526,7 +586,7 @@ impl Policy for Ladder {
 
     fn step(&self) -> Step {
         match self.phase {
-            Phase::Steady => Step::Steady {
+            Phase::Steady | Phase::Drain { .. } => Step::Steady {
                 live: self.tiers[self.live],
             },
             Phase::Shadow { target, kind, .. } => Step::Shadow {
@@ -568,6 +628,27 @@ impl Policy for Ladder {
         self.recent.rotate_left(1);
         self.recent[LAG_HOLD as usize - 1] = c;
         let recent_mean = self.recent.iter().sum::<f32>() / LAG_HOLD as f32;
+        // The hop's whole wall time, unclamped: a cold shadow hop can take
+        // several budgets, and all of it is backlog.
+        let wall = |x: f32| {
+            if x.is_finite() {
+                x.clamp(0.0, 8.0)
+            } else {
+                8.0
+            }
+        };
+        // A guard sleep before the hop is in the live cost (the load and the
+        // pair model need it) and already in the lag reading: count it once.
+        let pause = std::mem::take(&mut self.pause);
+        let backlog =
+            lag as f32 + (wall(live_cost) - pause).max(0.0) + shadow_cost.map(wall).unwrap_or(0.0)
+                - 1.0;
+        let late = backlog > LATE_BACKLOG;
+        // `recent` holds the live costs with any guard sleep in them, so a
+        // hop that carried a sleep can count as starved. A realtime worker
+        // sleeps at most once per RUN_GUARD_AFTER, so it is one of the
+        // three at most, and the other two must be starved on their own.
+        let starved = late && self.recent.iter().all(|&x| x >= STARVED_COST);
         if lag >= LAG_WARN && lag >= self.prev_lag {
             self.lag_hold = self.lag_hold.saturating_add(1);
         } else {
@@ -578,7 +659,7 @@ impl Policy for Ladder {
         let in_grace = self.grace > 0 && lag < GRACE_LAG;
         // Panic starts on the hop after grace expires. A held costly lag
         // can still end grace early through GRACE_LAG.
-        let panic = self.grace == 0 && lag >= LAG_PANIC;
+        let panic = self.grace == 0 && (lag >= LAG_PANIC || starved);
         self.grace = self.grace.saturating_sub(1);
         let held = self.lag_hold >= LAG_HOLD && recent_mean >= EMERGENCY_COST;
         let emergency = !at_bottom && !in_grace && (held || panic);
@@ -616,12 +697,16 @@ impl Policy for Ladder {
                     let s = if s.is_finite() { s.max(0.0) } else { 2.0 };
                     last = s;
                     let over = c + s - 1.0;
-                    self.pair_over.rotate_left(1);
-                    self.pair_over[LAG_HOLD as usize - 1] = over;
                     self.excess = (self.excess + over).max(0.0);
                     // The next hop is projected like this one, except after
-                    // a cold hop, which the next warm one costs about half.
-                    let next = if judged { over } else { c + s / 2.0 - 1.0 };
+                    // a cold hop, which the next warm one costs about half,
+                    // and without a guard sleep: the worker sleeps at most
+                    // once per RUN_GUARD_AFTER, never on two hops in a row.
+                    let warm = (c - pause).max(0.0);
+                    let over = warm + s - 1.0;
+                    self.pair_over.rotate_left(1);
+                    self.pair_over[LAG_HOLD as usize - 1] = over;
+                    let next = if judged { over } else { warm + s / 2.0 - 1.0 };
                     projected = self.excess + next.max(0.0);
                     if judged {
                         if n < costs.len() {
@@ -643,17 +728,20 @@ impl Policy for Ladder {
                     || (kind == ShadowKind::Trial && self.lag_hold >= TRIAL_LAG_HOLD)
                     || (kind != ShadowKind::Demote && self.trial_over >= TRIAL_OVER_HOLD);
                 if abort {
+                    let heard = late && kind == ShadowKind::Trial;
                     // The pair is too expensive: a trial fails, a demotion
                     // warm-up escalates. Either way raw is next when the lag
                     // is already critical.
                     let ev = match kind {
                         // Judged on the warm hops; a trial that never got
                         // that far reports the cold hop that ended it.
+                        // A rejoin's lag is the emergency's backlog, not
+                        // the candidate's doing: only a trial is blamed.
                         ShadowKind::Trial | ShadowKind::Rejoin if n == 0 => {
-                            self.trial_failed(target, last, false)
+                            self.trial_failed(target, last, heard)
                         }
                         ShadowKind::Trial | ShadowKind::Rejoin => {
-                            self.trial_failed(target, Self::median(&costs[..n]), false)
+                            self.trial_failed(target, Self::median(&costs[..n]), heard)
                         }
                         ShadowKind::Demote => {
                             self.phase = Phase::Steady;
@@ -661,7 +749,7 @@ impl Policy for Ladder {
                         }
                     };
                     if kind == ShadowKind::Demote || emergency {
-                        return self.start_emergency(lag, cheap);
+                        return self.start_emergency(lag, cheap, late);
                     }
                     return ev;
                 }
@@ -732,9 +820,29 @@ impl Policy for Ladder {
                     }
                 }
             }
+            Phase::Drain { target, hop } => {
+                if lag < LAG_WARN {
+                    self.start_shadow(target, ShadowKind::Rejoin);
+                    None
+                } else if self.lag_hold >= LAG_HOLD || hop + 1 >= DRAIN_MAX {
+                    // Raw alone is not draining it: the CPU is gone, not
+                    // just short. Wait out the dwell at full gain; the
+                    // tier was never run, so no trial is reported.
+                    self.trial_failed(target, 0.0, false);
+                    Some(Event::DrainAbandoned {
+                        tier: self.tiers[target],
+                    })
+                } else {
+                    self.phase = Phase::Drain {
+                        target,
+                        hop: hop + 1,
+                    };
+                    None
+                }
+            }
             Phase::Steady => {
                 if emergency {
-                    return self.start_emergency(lag, cheap);
+                    return self.start_emergency(lag, cheap, late);
                 }
                 if !at_bottom {
                     let next = self.live + 1;
@@ -781,9 +889,14 @@ impl Policy for Ladder {
         }
     }
 
+    fn note_pause(&mut self, hops: f32) {
+        self.pause = if hops.is_finite() { hops.max(0.0) } else { 0.0 };
+    }
+
     fn describe(&self) -> String {
         let phase = match self.phase {
             Phase::Steady => "steady".to_string(),
+            Phase::Drain { hop, .. } => format!("drain hop {hop}"),
             Phase::Shadow { kind, hop, .. } => format!("shadow {kind:?} hop {hop}"),
             Phase::Crossfade { hop, of, .. } => format!("crossfade {hop}/{of}"),
         };
@@ -805,7 +918,7 @@ impl Policy for Ladder {
         match self.phase {
             Phase::Shadow { target, .. } => self.live = self.live.max(target),
             Phase::Crossfade { from, to, .. } => self.live = from.max(to),
-            Phase::Steady => {}
+            Phase::Steady | Phase::Drain { .. } => {}
         }
         if self.live != before && self.live > 0 {
             // Landed lower: the tier above gets its usual trial timer (the
@@ -815,6 +928,17 @@ impl Policy for Ladder {
             self.since_trial = 0;
             self.since_change = 0;
             self.entered_by_promotion = false;
+        }
+        if self.live == self.bottom() && self.live > 0 {
+            // The host resets every instance as its stream pauses (no
+            // consumer), and the ladder's clock is its hops: a call that
+            // ended in raw would start the next one with the rest of the
+            // dwell, however long the break. Probe the tier above on the
+            // first hops instead. Only the timer is cut: the dwell stays,
+            // so a probe into a load that is still there backs off as
+            // usual (kept when silent, doubled when it left a late
+            // backlog).
+            self.next_trial_at = 0;
         }
         self.phase = Phase::Steady;
         self.prev_lag = 0;
@@ -835,14 +959,17 @@ mod tests {
 
     #[test]
     fn duck_intent_covers_emergency_rejoin_and_its_fade() {
-        for (lag, hops) in [(LAG_PANIC, XFADE_PANIC), (LAG_WARN, XFADE_EMERGENCY)] {
+        for (lag, late, hops) in [(LAG_PANIC, true, 0), (LAG_WARN, false, XFADE_EMERGENCY)] {
             let mut l = warm(&QLR);
             assert!(!l.duck_raw());
-            l.start_emergency(lag, false);
+            l.start_emergency(lag, false, late);
             for _ in 0..hops {
                 assert!(l.duck_raw());
                 drive(&mut l, 1, 1.2, 0.0, 0);
             }
+            assert!(matches!(l.phase, Phase::Drain { target: 1, .. }));
+            assert!(l.duck_raw());
+            drive(&mut l, 1, 0.0, 0.0, 0);
             for _ in 0..WARMUP {
                 assert!(matches!(
                     l.step(),
@@ -896,7 +1023,7 @@ mod tests {
         assert!(!l.duck_raw());
         // Even a malformed ladder with no model cannot request a duck.
         let mut l = warm(&[Tier::Raw, Tier::Raw]);
-        l.start_emergency(LAG_PANIC, true);
+        l.start_emergency(LAG_PANIC, true, false);
         assert!(!l.duck_raw());
     }
 
@@ -910,13 +1037,15 @@ mod tests {
                 for promoted in [false, true] {
                     let mut l = warm(tiers);
                     l.entered_by_promotion = promoted;
-                    l.start_emergency(LAG_PANIC, cheap);
+                    l.start_emergency(LAG_PANIC, cheap, false);
                     let immediate = cheap && !promoted;
                     assert_eq!(l.duck_raw(), immediate);
-                    drive(&mut l, XFADE_PANIC, 0.5, 0.0, 0);
+                    drive(&mut l, XFADE_EMERGENCY, 0.5, 0.0, 0);
                     assert_eq!(l.duck_raw(), immediate);
                     if immediate {
-                        drive(&mut l, 1, 0.0, 0.2, LAG_ABORT);
+                        // Raw does not drain a lag that holds: the drain
+                        // gives up and raw returns to full gain.
+                        drive(&mut l, LAG_HOLD, 0.0, 0.0, LAG_ABORT);
                     }
                     assert!(steady(&l, Tier::Raw));
                     for _ in 0..10 {
@@ -927,7 +1056,7 @@ mod tests {
             }
         }
         let mut l = warm(&QLR);
-        l.start_emergency(LAG_PANIC, false);
+        l.start_emergency(LAG_PANIC, false, false);
         assert!(l.duck_raw());
         l.reset();
         assert!(steady(&l, Tier::Raw));
@@ -940,8 +1069,8 @@ mod tests {
             let mut l = warm(&[Tier::Light, Tier::Raw]);
             l.entered_by_promotion = true;
             l.since_change = age;
-            l.start_emergency(LAG_PANIC, true);
-            let expected = age + XFADE_PANIC >= RECENT_PROMOTION;
+            l.start_emergency(LAG_PANIC, true, false);
+            let expected = age + XFADE_EMERGENCY >= RECENT_PROMOTION;
             let mut p: Box<dyn Policy> = Box::new(l);
             assert_eq!(p.duck_raw(), expected);
             p.observe(0.2, Some(0.0), 0);
@@ -1006,6 +1135,10 @@ mod tests {
         // The crossfade into raw completes regardless of lag.
         drive(l, XFADE_EMERGENCY, cost, 0.0, 1);
         assert_eq!(l.live(), Tier::Raw);
+        if matches!(l.phase, Phase::Drain { .. }) {
+            // Raw alone drains the backlog in a hop; the rejoin follows.
+            assert!(l.observe(0.0, None, 0).is_none());
+        }
     }
 
     fn shadow_at(live: usize, kind: ShadowKind) -> Ladder {
@@ -1023,9 +1156,13 @@ mod tests {
 
     #[test]
     fn panic_raw_phase_is_seven_hops() {
+        // No fade (the output is already zeros), one drain hop that reads
+        // lag 0, the rejoin warm-up, the rejoin fade.
         let mut l = warm(&QLR);
         l.observe(0.5, None, LAG_PANIC);
-        drive(&mut l, XFADE_PANIC, 0.5, 0.0, 0);
+        assert!(steady(&l, Tier::Raw));
+        assert!(l.duck_raw());
+        drive(&mut l, 1, 0.0, 0.0, 0);
         assert!(matches!(
             l.step(),
             Step::Shadow {
@@ -1045,7 +1182,7 @@ mod tests {
         ));
         drive(&mut l, 1, 0.0, 0.3, 0);
         assert!(steady(&l, Tier::Light));
-        assert_eq!(XFADE_PANIC + WARMUP + 1, 7);
+        assert_eq!(1 + WARMUP + XFADE_REJOIN, 7);
     }
 
     #[test]
@@ -1087,6 +1224,77 @@ mod tests {
         ));
         drive(&mut l, XFADE_PROMOTE, 0.3, 0.8, 0);
         assert!(steady(&l, Tier::Quality));
+    }
+
+    #[test]
+    fn a_reset_on_raw_probes_the_tier_above_at_once() {
+        // Raw after light failed, light's dwell doubled; the stream pauses
+        // (the host resets the instance) and resumes: light is probed on
+        // the first hop, and the dwell is still there for the next failure.
+        let mut l = warm(&QLR);
+        overload(&mut l, 1.2);
+        drive(&mut l, REJOIN_HOPS, 0.0, 0.3, 0);
+        overload(&mut l, 1.5);
+        assert_eq!(l.next_trial_at(), 2 * RAW_RETRY_BASE);
+        drive(&mut l, 10, 0.0, 0.0, 0);
+        l.reset();
+        assert!(steady(&l, Tier::Raw));
+        assert!(!l.duck_raw());
+        l.observe(0.0, None, 0);
+        assert_eq!(
+            l.step(),
+            Step::Shadow {
+                live: Tier::Raw,
+                shadow: Tier::Light,
+                kind: ShadowKind::Trial,
+            }
+        );
+        let ev = drive(&mut l, TRIAL_HOPS, 0.0, 1.5, 0);
+        assert!(matches!(ev[..], [(_, Event::TrialFailed { .. })]), "{ev:?}");
+        assert_eq!(l.next_trial_at(), 2 * RAW_RETRY_BASE);
+    }
+
+    #[test]
+    fn a_reset_probe_keeps_an_audible_backoff_and_extends_it() {
+        // Light's probes leave a late backlog (a cold hop of four budgets):
+        // each doubles the dwell. A reset still probes at once, but does
+        // not forgive the backoff: the next audible abort doubles from
+        // there, up to the cap, and a silent one keeps it.
+        let mut l = warm(&QLR);
+        overload(&mut l, 1.2);
+        drive(&mut l, REJOIN_HOPS, 0.0, 0.3, 0);
+        drive(&mut l, RECENT_PROMOTION, 0.3, 1.5, 0); // quality probes fail
+        overload(&mut l, 1.5);
+        assert_eq!(l.next_trial_at(), RAW_RETRY_BASE);
+        drive(&mut l, RAW_RETRY_BASE, 0.0, 0.0, 0);
+        assert!(matches!(
+            l.observe(0.0, Some(4.0), 0),
+            Some(Event::TrialFailed { .. })
+        ));
+        assert_eq!(l.next_trial_at(), 2 * RAW_RETRY_BASE);
+        for expected in [RAW_RETRY_MAX, RAW_RETRY_MAX] {
+            l.reset();
+            l.observe(0.0, None, 0);
+            assert!(matches!(
+                l.step(),
+                Step::Shadow {
+                    kind: ShadowKind::Trial,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                l.observe(0.0, Some(4.0), 0),
+                Some(Event::TrialFailed { .. })
+            ));
+            assert_eq!(l.next_trial_at(), expected);
+        }
+        l.reset();
+        l.observe(0.0, None, 0);
+        assert!(matches!(
+            l.observe(0.0, Some(0.3), LAG_ABORT),
+            Some(Event::TrialFailed { .. })
+        ));
+        assert_eq!(l.next_trial_at(), RAW_RETRY_MAX);
     }
 
     #[test]
@@ -1174,10 +1382,11 @@ mod tests {
         // A hopeless first second: cost 2.0, lag held. Nothing happens.
         assert!(drive(&mut l, START_GRACE, 2.0, 0.0, 3).is_empty());
         assert!(steady(&l, Tier::Quality));
-        // Right after the grace the same input is an emergency.
+        // Right after the grace the same input is an emergency at once
+        // (three starved hops behind a late backlog).
         let ev = drive(&mut l, LAG_HOLD, 2.0, 0.0, 3);
         assert!(
-            matches!(ev[..], [(_, Event::Demoted { to: Tier::Raw, .. })]),
+            matches!(ev[..], [(0, Event::Demoted { to: Tier::Raw, .. }), ..]),
             "{ev:?}"
         );
         // A reset re-arms the grace.
@@ -1192,24 +1401,23 @@ mod tests {
         // and the emergency fires as soon as it is held at GRACE_LAG (the
         // hold and the cost condition still apply inside the grace; the
         // panic rule does not).
+        // Raw does not drain a lag that holds either: the drain gives up
+        // and light waits out its dwell at full gain.
         assert!(drive(&mut l, 10, 2.0, 0.0, GRACE_LAG - 1).is_empty());
-        let ev = drive(&mut l, LAG_HOLD, 2.0, 0.0, GRACE_LAG);
+        let ev = drive(&mut l, 2 * LAG_HOLD, 2.0, 0.0, GRACE_LAG);
         assert!(
             matches!(
                 ev[..],
                 [
                     (_, Event::Demoted { to: Tier::Raw, .. }),
-                    (
-                        _,
-                        Event::TrialFailed {
-                            tier: Tier::Light,
-                            ..
-                        }
-                    )
+                    (_, Event::DrainAbandoned { tier: Tier::Light })
                 ]
             ),
             "{ev:?}"
         );
+        assert!(steady(&l, Tier::Raw));
+        assert!(!l.duck_raw());
+        assert_eq!(l.next_trial_at(), RAW_RETRY_BASE);
         // A single first-inference stall at a normal cost drains: no event.
         let mut l = Ladder::new(&QLR);
         for lag in [6, 5, 4, 3, 2, 1, 0] {
@@ -1230,8 +1438,8 @@ mod tests {
             matches!(ev, Some(Event::Demoted { to: Tier::Raw, .. })),
             "{ev:?}"
         );
-        drive(&mut l, XFADE_PANIC, 0.5, 0.0, 0);
         assert_eq!(l.next_trial_at(), 0);
+        drive(&mut l, 1, 0.0, 0.0, 0);
         assert!(matches!(
             l.step(),
             Step::Shadow {
@@ -1246,7 +1454,6 @@ mod tests {
         assert!(steady(&l, Tier::Quality));
         drive(&mut l, 100, 0.5, 0.0, 0);
         l.observe(0.5, None, LAG_PANIC);
-        drive(&mut l, XFADE_PANIC, 0.5, 0.0, 0);
         assert_eq!(l.next_trial_at(), 2 * RAW_RETRY_BASE);
         // An overload emergency (held, cost 1.2) is never cheap.
         let mut l = warm(&[Tier::Quality, Tier::Raw]);
@@ -1674,6 +1881,96 @@ mod tests {
     }
 
     #[test]
+    fn a_rejoin_waits_for_raw_to_drain_the_backlog() {
+        // A held overload's fade ends two hops behind. Next to the cold
+        // light hops that backlog would read LAG_ABORT and end the rejoin;
+        // raw alone drains it, ducked, and light rejoins from lag zero.
+        let mut l = warm(&QLR);
+        drive(&mut l, LAG_HOLD - 1, 1.3, 0.0, 1);
+        assert!(matches!(
+            l.observe(1.3, None, 1),
+            Some(Event::Demoted { lag: 1, .. })
+        ));
+        drive(&mut l, XFADE_EMERGENCY, 1.3, 0.0, LAG_ABORT);
+        assert!(steady(&l, Tier::Raw));
+        for lag in [LAG_ABORT, 1] {
+            assert!(l.duck_raw());
+            assert!(l.observe(0.0, None, lag).is_none());
+            assert!(steady(&l, Tier::Raw));
+        }
+        assert!(l.observe(0.0, None, 0).is_none());
+        assert!(l.duck_raw());
+        assert_eq!(
+            l.step(),
+            Step::Shadow {
+                live: Tier::Raw,
+                shadow: Tier::Light,
+                kind: ShadowKind::Rejoin,
+            }
+        );
+        // Two cold hops at twice the cost, then warm ones: light rejoins.
+        assert!(drive(&mut l, TRIAL_COLD, 0.0, 0.7, 0).is_empty());
+        let ev = drive(&mut l, WARMUP - TRIAL_COLD, 0.0, 0.35, 0);
+        assert!(
+            matches!(ev[..], [(_, Event::Promoted { to: Tier::Light })]),
+            "{ev:?}"
+        );
+        drive(&mut l, XFADE_REJOIN, 0.0, 0.35, 0);
+        assert!(steady(&l, Tier::Light));
+        assert!(!l.duck_raw());
+    }
+
+    #[test]
+    fn a_late_emergency_whose_backlog_does_not_drain_ends_audibly() {
+        // Raw goes live at once behind a late backlog (no fade) and drains.
+        // A lag that holds ends the drain after LAG_HOLD hops; one that
+        // keeps coming back ends it after DRAIN_MAX: the duck never holds a
+        // raw phase that is not draining.
+        for (lags, hops) in [([LAG_PANIC, LAG_PANIC], LAG_HOLD), ([2, 1], DRAIN_MAX)] {
+            let mut l = warm(&QLR);
+            l.start_emergency(LAG_PANIC, false, true);
+            assert!(steady(&l, Tier::Raw));
+            let mut ev = Vec::new();
+            for h in 0..hops {
+                assert!(l.duck_raw());
+                if let Some(e) = l.observe(0.0, None, lags[h as usize % 2]) {
+                    ev.push((h, e));
+                }
+            }
+            assert!(
+                matches!(ev[..], [(h, Event::DrainAbandoned { tier: Tier::Light })] if h == hops - 1),
+                "{ev:?}"
+            );
+            assert!(steady(&l, Tier::Raw));
+            assert!(!l.duck_raw());
+            assert_eq!(l.next_trial_at(), RAW_RETRY_BASE);
+        }
+    }
+
+    #[test]
+    fn a_rejoin_that_ends_behind_a_late_backlog_is_not_blamed() {
+        // The rejoin starts from lag 0, but its cold hop takes four budgets
+        // (the CPU went away again): the backlog is late, yet the rejoin is
+        // the emergency's return, not an optional probe. It keeps the
+        // retry dwell instead of doubling it like an audible trial.
+        let mut l = warm(&QLR);
+        l.start_emergency(LAG_PANIC, false, true);
+        drive(&mut l, 1, 0.0, 0.0, 0);
+        let ev = l.observe(0.0, Some(4.0), 0);
+        assert!(
+            matches!(
+                ev,
+                Some(Event::TrialFailed {
+                    tier: Tier::Light,
+                    ..
+                })
+            ),
+            "{ev:?}"
+        );
+        assert_eq!(l.next_trial_at(), RAW_RETRY_BASE);
+    }
+
+    #[test]
     fn emergency_from_light_waits_dwell() {
         let mut l = warm(&QLR);
         // Get to Light first via an emergency + trial.
@@ -1967,6 +2264,224 @@ mod tests {
     }
 
     #[test]
+    fn a_starved_tier_panics_before_the_lag_reading_does() {
+        // Three hops at about two and a half budgets: the third leaves a
+        // backlog of 3.4 although the reading at its start was only 2 (the
+        // panic would wait for 4). Raw goes live at once (no fade hop at the
+        // starved cost) and light warms once raw has drained.
+        let mut l = warm(&QLR);
+        assert_eq!(l.observe(2.3, None, 0), None);
+        assert_eq!(l.observe(2.5, None, 1), None);
+        let ev = l.observe(2.4, None, 2);
+        assert!(
+            matches!(
+                ev,
+                Some(Event::Demoted {
+                    to: Tier::Raw,
+                    lag: 2,
+                    ..
+                })
+            ),
+            "{ev:?}"
+        );
+        assert!(steady(&l, Tier::Raw));
+        assert!(matches!(l.phase, Phase::Drain { target: 1, .. }));
+        assert!(l.duck_raw());
+        // Raw drains the backlog; light warms once a hop reads lag 0.
+        drive(&mut l, 1, 0.0, 0.0, 2);
+        drive(&mut l, 1, 0.0, 0.0, 0);
+        assert!(matches!(
+            l.step(),
+            Step::Shadow {
+                live: Tier::Raw,
+                kind: ShadowKind::Rejoin,
+                ..
+            }
+        ));
+        assert!(l.duck_raw());
+    }
+
+    #[test]
+    fn a_two_hop_blip_is_not_starvation() {
+        // Two hops at two to two and a half budgets leave a late backlog
+        // (or exactly LATE_BACKLOG, which is still on time), then the CPU
+        // is back: the backlog drains within the cushion, no emergency.
+        for (a, b) in [(2.0, 2.0), (2.5, 2.5), (2.3, 2.0)] {
+            let mut l = warm(&QLR);
+            drive(&mut l, 100, 0.5, 0.0, 0);
+            assert_eq!(l.observe(a, None, 0), None);
+            assert_eq!(l.observe(b, None, 1), None);
+            assert_eq!(l.observe(0.5, None, 2), None);
+            assert_eq!(l.observe(0.5, None, 1), None);
+            assert_eq!(l.observe(0.5, None, 1), None);
+            assert_eq!(l.observe(0.5, None, 0), None);
+            assert!(steady(&l, Tier::Quality));
+        }
+    }
+
+    #[test]
+    fn a_guard_pause_is_counted_once_in_the_backlog() {
+        // A trial hop after a 15 ms guard sleep: live 0.3 plus the pause
+        // 1.5, and a lag reading of 2 that already holds the hops that
+        // arrived during the sleep. The real backlog is 2 + 0.3 + 0.6 - 1
+        // = 1.9, on time: the abort is a silent probe and keeps its dwell.
+        // Counting the pause twice (3.4) would have doubled it.
+        let mut l = shadow_at(1, ShadowKind::Trial);
+        l.note_pause(1.5);
+        let ev = l.observe(0.3 + 1.5, Some(0.6), LAG_ABORT);
+        assert!(matches!(ev, Some(Event::TrialFailed { .. })), "{ev:?}");
+        assert_eq!(l.next_trial_at(), DWELL_BASE);
+        // The pause note is for that one hop only.
+        let mut l = shadow_at(1, ShadowKind::Trial);
+        l.note_pause(1.5);
+        assert!(l.observe(0.3, Some(0.3), 0).is_none());
+        let ev = l.observe(0.3 + 1.5, Some(0.6), LAG_ABORT);
+        assert!(matches!(ev, Some(Event::TrialFailed { .. })), "{ev:?}");
+        assert_eq!(l.next_trial_at(), 2 * DWELL_BASE);
+    }
+
+    #[test]
+    fn a_guard_sleep_is_not_projected_onto_the_next_hop() {
+        // A rejoin's judged hop carries a 15 ms guard sleep: the pair
+        // really fell 0.99 hops behind, but the next hop has no sleep
+        // (the worker sleeps at most once per RUN_GUARD_AFTER), so the
+        // projection is 0.99, not 1.98, and light rejoins. Unnoted, the
+        // same costs would read as a pair that does not fit.
+        for (noted, survives) in [(true, true), (false, false)] {
+            let mut l = shadow_at(2, ShadowKind::Rejoin);
+            drive(&mut l, TRIAL_COLD, 0.0, 0.9, 0);
+            if noted {
+                l.note_pause(1.54);
+            }
+            let ev = l.observe(1.54, Some(0.45), 1);
+            assert_eq!(ev.is_none(), survives, "{ev:?}");
+            if survives {
+                let ev = drive(&mut l, WARMUP - TRIAL_COLD - 1, 0.0, 0.45, 0);
+                assert!(
+                    matches!(ev[..], [(_, Event::Promoted { to: Tier::Light })]),
+                    "{ev:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_long_hop_is_a_stall_not_starvation() {
+        // One 35 ms hop leaves a late backlog, but the next hop is fast and
+        // drains it: no emergency (the lag reading never reaches LAG_PANIC).
+        let mut l = warm(&QLR);
+        assert_eq!(l.observe(3.5, None, 0), None);
+        assert_eq!(l.observe(0.5, None, 2), None);
+        assert_eq!(l.observe(0.5, None, 1), None);
+        assert!(steady(&l, Tier::Quality));
+    }
+
+    #[test]
+    fn an_audible_trial_abort_backs_off_a_silent_one_does_not() {
+        // A cold candidate hop of four budgets next to light: the backlog it
+        // leaves (3.3) means zeros, so the dwell doubles like a verdict.
+        let mut l = shadow_at(1, ShadowKind::Trial);
+        let ev = l.observe(0.3, Some(4.0), 0);
+        assert!(matches!(ev, Some(Event::TrialFailed { .. })), "{ev:?}");
+        assert_eq!(l.next_trial_at(), 2 * DWELL_BASE);
+        // Cut short by a lag reading with the pair still on time (backlog
+        // 1.6): a silent probe, the same dwell again.
+        let mut l = shadow_at(1, ShadowKind::Trial);
+        let ev = l.observe(0.3, Some(0.3), LAG_ABORT);
+        assert!(matches!(ev, Some(Event::TrialFailed { .. })), "{ev:?}");
+        assert_eq!(l.next_trial_at(), DWELL_BASE);
+    }
+
+    /// A deterministic replay of a load on the worker's CPU (the CI stress
+    /// steps) or of a slower CPU. Hop `i` arrives at time `i` (in hops) and
+    /// is due at `i + 3` (the aligner's lead); a hop that finishes later is
+    /// zeros. A tier that did not run in the previous hop costs twice its
+    /// warm cost (cold caches). Under `contended` the worker gets a third
+    /// of its CPU (two busy loops) unless it was idle and the hop fits a
+    /// scheduler slice (0.3 budgets), which is what the CI traces show.
+    /// Returns the zero runs as (first hop, hops).
+    fn replay(
+        quality: &dyn Fn(u32) -> f32,
+        light: f32,
+        contended: &dyn Fn(u32) -> bool,
+        hops: u32,
+    ) -> Vec<(u32, u32)> {
+        let mut l = Ladder::new(&QLR).with_dwell_base(500);
+        let mut done = 0.0f32;
+        let mut ran = [false; 3];
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for i in 0..hops {
+            let t = i as f32;
+            let start = t.max(done);
+            let idle = start > done;
+            let lag = (start.floor() - t) as u32;
+            let (live, shadow) = match l.step() {
+                Step::Steady { live } => (live, None),
+                Step::Shadow { live, shadow, .. } => (live, Some(shadow)),
+                Step::Crossfade { from, to, .. } => (from, Some(to)),
+            };
+            let index = |t: Tier| QLR.iter().position(|&x| x == t).unwrap();
+            let cost = |t: Tier| {
+                let warm = [quality(i), light, 0.0][index(t)];
+                if ran[index(t)] {
+                    warm
+                } else {
+                    2.0 * warm
+                }
+            };
+            let (cl, cs) = (cost(live), shadow.map(cost).unwrap_or(0.0));
+            let stretch = if contended(i) && (!idle || cl + cs > 0.3) {
+                3.0
+            } else {
+                1.0
+            };
+            ran = [false; 3];
+            ran[index(live)] = true;
+            if let Some(s) = shadow {
+                ran[index(s)] = true;
+            }
+            done = start + (cl + cs) * stretch;
+            if done > t + 3.0 {
+                match runs.last_mut() {
+                    Some((a, n)) if *a + *n == i => *n += 1,
+                    _ => runs.push((i, 1)),
+                }
+            }
+            l.observe(cl * stretch, shadow.map(|_| cs * stretch), lag);
+        }
+        runs
+    }
+
+    #[test]
+    fn starvation_on_quality_leaves_three_hops_of_zeros() {
+        // The CI stress step: quality at 0.72, two busy loops for 20 s. The
+        // emergency used to fire at a lag reading of 3-4 and fade for a
+        // hop at the starved cost: 11 hops (110 ms) of zeros, measured
+        // 100-110 ms with the real models (evaluation 2026-10). Now the
+        // third starved hop is the emergency (two are a blip that may still
+        // drain), raw goes live without a fade and drains before the
+        // rejoin: the three starved hops are the gap.
+        let runs = replay(&|_| 0.72, 0.27, &|i| (600..2600).contains(&i), 3000);
+        let onset: u32 = runs.iter().filter(|r| r.0 < 620).map(|r| r.1).sum();
+        assert!(onset <= 3, "{runs:?}");
+    }
+
+    #[test]
+    fn a_sustained_overload_backs_off_its_audible_trials() {
+        // A realtime worker on a CPU that became twice as slow for two
+        // minutes (quality 2.0): every quality trial's cold hop overruns
+        // the cushion. They used to repeat at every dwell (24 cuts); now
+        // each one doubles the wait.
+        let runs = replay(
+            &|i| if (600..12_600).contains(&i) { 2.0 } else { 0.6 },
+            0.25,
+            &|_| false,
+            13_000,
+        );
+        assert!(runs.len() <= 5, "{runs:?}");
+    }
+
+    #[test]
     fn a_probe_cut_short_by_load_keeps_its_dwell() {
         // Raw live after light failed; light's probes land inside load
         // bursts (candidate 1.5) and are cut short: the wait stays 5 s each
@@ -2011,17 +2526,16 @@ mod tests {
     #[test]
     fn a_tier_that_holds_a_minute_earns_its_dwell_back() {
         let mut l = warm(&[Tier::Quality, Tier::Raw]).with_dwell_base(100);
-        // A cheap panic: quality rejoins at once.
+        // A cheap panic: quality rejoins as soon as raw has drained.
         drive(&mut l, 100, 0.5, 0.0, 0);
         l.observe(0.5, None, LAG_PANIC);
-        drive(&mut l, XFADE_PANIC + REJOIN_HOPS, 0.0, 0.3, 0);
+        drive(&mut l, 1 + REJOIN_HOPS, 0.0, 0.3, 0);
         assert!(steady(&l, Tier::Quality));
         // Knocked out within RECENT_PROMOTION twice: the guard doubles the
         // dwell each time (200, 400) and the rejoin waits for it.
         for expected in [200, 400] {
             drive(&mut l, 100, 0.5, 0.0, 0);
             l.observe(0.5, None, LAG_PANIC);
-            drive(&mut l, XFADE_PANIC, 0.5, 0.0, 0);
             assert_eq!(l.next_trial_at(), expected);
             drive(
                 &mut l,
@@ -2129,7 +2643,6 @@ mod tests {
             assert!(steady(&l, Tier::Light), "{}", l.describe());
             drive(&mut l, 100, 0.3, 0.0, 0);
             l.observe(0.3, None, LAG_PANIC);
-            drive(&mut l, XFADE_PANIC, 0.3, 0.0, 0);
             waits.push(l.next_trial_at());
         }
         assert_eq!(waits, vec![1000, 2000, 2000, 2000, 2000]);

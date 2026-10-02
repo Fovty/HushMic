@@ -72,6 +72,10 @@ pub struct AdaptiveEngine<E: HopEngine, P: Policy> {
     raw_out: [f32; HOP],
     raw_ramp: GainRamp,
     raw_duck_gain: f32,
+    /// The last hop's output had no raw in it, so the duck may start at
+    /// its target: an emergency that skips its fade (`LATE_BACKLOG`) must
+    /// not open with a hop of raw ramping down from full gain.
+    raw_silent: bool,
     muted: bool,
     policy: P,
     clock: Clock,
@@ -118,6 +122,7 @@ impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
             // snaps instead of fading (matches `Denoiser`).
             raw_ramp: GainRamp::new(),
             raw_duck_gain: 1.0,
+            raw_silent: true,
             muted: false,
             policy,
             clock,
@@ -183,11 +188,16 @@ impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
                 tier.word(),
                 cost * 10.0
             ),
+            Event::DrainAbandoned { tier } => format!(
+                "engine: {} ({} not attempted, the backlog did not drain)",
+                live.word(),
+                tier.word()
+            ),
         };
         (self.sink)(&line);
         self.announced_tier = Some(match event {
             Event::Demoted { to, .. } | Event::Promoted { to } => to,
-            Event::TrialFailed { .. } => live,
+            Event::TrialFailed { .. } | Event::DrainAbandoned { .. } => live,
         });
     }
 
@@ -231,7 +241,11 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         } else {
             1.0
         };
-        let start = self.raw_duck_gain;
+        let start = if self.raw_silent {
+            target
+        } else {
+            self.raw_duck_gain
+        };
         for (i, sample) in raw.iter_mut().enumerate() {
             let a = (i + 1) as f32 / HOP as f32;
             *sample *= start * (1.0 - a) + target * a;
@@ -241,6 +255,10 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         self.hops += 1;
 
         let step = self.policy.step();
+        self.raw_silent = match step {
+            Step::Steady { live } | Step::Shadow { live, .. } => live != Tier::Raw,
+            Step::Crossfade { .. } => false,
+        };
         let (result, live_cost, shadow_cost) = match step {
             Step::Steady { live } => {
                 let (r, c) = self.run_into(live, input, output);
@@ -272,8 +290,11 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         };
         let steady = matches!(step, Step::Steady { .. });
         // A guard pause since the last hop is time the live path did not
-        // produce: it counts as live cost, once.
-        let live_cost = live_cost + std::mem::take(&mut self.pause_hops);
+        // produce: it counts as live cost, once. The policy is told which
+        // part it was, because the lag reading taken after it holds it too.
+        let pause = std::mem::take(&mut self.pause_hops);
+        self.policy.note_pause(pause);
+        let live_cost = live_cost + pause;
         let event = self.policy.observe(live_cost, shadow_cost, self.lag);
         if let Some(e) = event {
             self.log_event(e);
@@ -304,6 +325,7 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         self.raw_out = [0.0; HOP];
         self.raw_ramp.reset_to(self.muted);
         self.raw_duck_gain = 1.0;
+        self.raw_silent = true;
         let before = self.policy.live();
         self.policy.reset();
         let after = self.policy.live();
@@ -438,6 +460,7 @@ mod tests {
         steps: Vec<Step>,
         i: usize,
         seen: Seen,
+        paused: Arc<Mutex<Vec<f32>>>,
     }
     impl Policy for Scripted {
         fn step(&self) -> Step {
@@ -447,6 +470,9 @@ mod tests {
             self.seen.lock().unwrap().push((c, s, lag));
             self.i += 1;
             None
+        }
+        fn note_pause(&mut self, hops: f32) {
+            self.paused.lock().unwrap().push(hops);
         }
         fn reset(&mut self) {}
         fn live(&self) -> Tier {
@@ -489,18 +515,16 @@ mod tests {
     #[test]
     fn emergency_raw_ducks_holds_and_fades_into_model_without_a_hole() {
         let f = Fakes::new();
+        // The panic left a late backlog: raw is live at once, ducked from
+        // its first sample (the hop before it missed its slot, so what
+        // precedes this raw is the aligner's zeros, not the model).
         let mut e = emergency_engine(&f);
         let duck = 10.0f32.powf(RAW_DUCK_DB / 20.0);
         let mut out = dc(0.0);
-        e.process_hop(&dc(1.0), &mut out).unwrap();
-        continuous(1.0, &out, 2.0 / HOP as f32);
-        assert!(out.windows(2).all(|w| w[1] <= w[0]));
-        assert_eq!(out[HOP - 1], duck);
-        let mut previous_raw = 1.0;
-        continuous(previous_raw, &e.raw_out, 1.0 / HOP as f32);
-        assert!(e.raw_out.windows(2).all(|w| w[1] <= w[0]));
-        previous_raw = e.raw_out[HOP - 1];
-        for _ in 0..crate::ladder::WARMUP {
+        let mut previous_raw = duck;
+        // One drain hop (the lag reads 0: raw drained the backlog), then
+        // the rejoin's warm-up, all ducked.
+        for _ in 0..1 + crate::ladder::WARMUP {
             e.process_hop(&dc(1.0), &mut out).unwrap();
             assert!(out.iter().all(|&v| (v - duck).abs() < 1e-7 && v > 0.0));
             continuous(previous_raw, &e.raw_out, 1e-7);
@@ -519,6 +543,42 @@ mod tests {
         assert!(!e.policy().duck_raw());
         e.process_hop(&dc(1.0), &mut out).unwrap();
         assert_eq!(out, dc(0.25));
+    }
+
+    #[test]
+    fn an_emergency_on_time_fades_from_the_model_into_ducked_raw() {
+        // A held overload (lag 1, cost 1.0) leaves no late backlog: the
+        // output is still heard, so the model fades out over
+        // XFADE_EMERGENCY hops into raw that is ducked from the start.
+        let f = Fakes::new();
+        let mut e = f.engine(
+            Some(f.gain(1.0, 1.0)),
+            Some(f.gain(0.25, 0.2)),
+            crate::ladder::Ladder::new(&[Tier::Quality, Tier::Light, Tier::Raw]),
+        );
+        let mut out = dc(0.0);
+        e.set_lag_hops(0);
+        for _ in 0..crate::ladder::START_GRACE {
+            e.process_hop(&dc(1.0), &mut out).unwrap();
+        }
+        e.set_lag_hops(1);
+        for _ in 0..crate::ladder::LAG_HOLD {
+            e.process_hop(&dc(1.0), &mut out).unwrap();
+        }
+        assert!(matches!(
+            e.policy().step(),
+            Step::Crossfade { to: Tier::Raw, .. }
+        ));
+        let duck = 10.0f32.powf(RAW_DUCK_DB / 20.0);
+        let mut previous = 1.0;
+        for _ in 0..crate::ladder::XFADE_EMERGENCY {
+            e.process_hop(&dc(1.0), &mut out).unwrap();
+            continuous(previous, &out, 1.0 / HOP as f32);
+            assert!(out.windows(2).all(|w| w[1] <= w[0]));
+            assert!(e.raw_out.iter().all(|&v| (v - duck).abs() < 1e-7));
+            previous = out[HOP - 1];
+        }
+        assert!((previous - duck).abs() < 1e-7);
     }
 
     #[test]
@@ -565,9 +625,7 @@ mod tests {
         e.quality.as_mut().unwrap().gain = 0.0;
         e.light.as_mut().unwrap().gain = 0.0;
         let mut out = dc(1.0);
-        for _ in
-            0..crate::ladder::XFADE_PANIC + crate::ladder::WARMUP + crate::ladder::XFADE_REJOIN + 1
-        {
+        for _ in 0..crate::ladder::WARMUP + crate::ladder::XFADE_REJOIN + 1 {
             e.process_hop(&dc(1.0), &mut out).unwrap();
             assert_eq!(out, dc(0.0));
         }
@@ -595,12 +653,14 @@ mod tests {
     fn a_guard_pause_counts_as_live_cost_once() {
         let f = Fakes::new();
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let paused = Arc::new(Mutex::new(Vec::new()));
         let p = Scripted {
             steps: vec![Step::Steady {
                 live: Tier::Quality,
             }],
             i: 0,
             seen: Arc::clone(&seen),
+            paused: Arc::clone(&paused),
         };
         let mut e = f.engine(Some(f.gain(1.0, 0.5)), None, p);
         let mut out = [0.0; HOP];
@@ -610,6 +670,11 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!((seen[0].0 - 1.5).abs() < 1e-3, "{:?}", seen[0]);
         assert!((seen[1].0 - 0.5).abs() < 1e-3, "{:?}", seen[1]);
+        // The policy is told which part of that cost was the pause (the
+        // lag reading taken after it already holds it).
+        let paused = paused.lock().unwrap();
+        assert!((paused[0] - 1.0).abs() < 1e-3, "{paused:?}");
+        assert_eq!(paused[1], 0.0);
     }
 
     #[test]
@@ -666,6 +731,7 @@ mod tests {
             steps,
             i: 0,
             seen: Arc::clone(&seen),
+            paused: Default::default(),
         };
         let mut e = f.engine(Some(f.gain(1.0, 0.5)), Some(f.gain(3.0, 0.2)), p);
         let mut out = [0.0; HOP];
@@ -717,6 +783,7 @@ mod tests {
             steps,
             i: 0,
             seen: Arc::new(Mutex::new(Vec::new())),
+            paused: Default::default(),
         };
         let mut e = f.engine(Some(f.gain(1.0, 0.1)), Some(f.gain(1.0, 0.1)), p);
         let mut out = [0.0; HOP];
@@ -743,6 +810,7 @@ mod tests {
                 steps,
                 i: 0,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                paused: Default::default(),
             };
             let mut e = f.engine(None, Some(f.gain(gain, 0.1)), p);
             let mut out = [0.0; HOP];
@@ -780,6 +848,7 @@ mod tests {
             steps,
             i: 0,
             seen: Arc::new(Mutex::new(Vec::new())),
+            paused: Default::default(),
         };
         let mut e = f.engine(Some(f.gain(1.0, 0.1)), None, p);
         let mut out = [0.0; HOP];
@@ -867,6 +936,7 @@ mod tests {
         fn observe(&mut self, _: f32, _: Option<f32>, _: u32) -> Option<Event> {
             None
         }
+        fn note_pause(&mut self, _: f32) {}
         fn reset(&mut self) {
             self.live = Tier::Light;
         }
@@ -966,6 +1036,9 @@ mod tests {
             tier: Tier::Quality,
             cost: 0.81,
         });
+        e.log_event(Event::DrainAbandoned {
+            tier: Tier::Quality,
+        });
         let l = lines.lock().unwrap();
         assert_eq!(l[0], "engine: passthrough (cpu overloaded, lag 3 hops)");
         assert_eq!(l[1], "engine: light (cpu tight, 9.2 ms per 10 ms hop)");
@@ -973,6 +1046,10 @@ mod tests {
         assert_eq!(
             l[3],
             "engine: light (trial of quality failed, 8.1 ms per 10 ms hop)"
+        );
+        assert_eq!(
+            l[4],
+            "engine: light (quality not attempted, the backlog did not drain)"
         );
     }
 }
