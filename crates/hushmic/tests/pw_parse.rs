@@ -642,3 +642,34 @@ fn repin_backs_off_against_a_live_adversary() {
     assert!(repin_allowed(3, 60));
     assert!(repin_allowed(50, 3600));
 }
+
+#[test]
+fn chain_node_state_comes_from_the_node_info() {
+    use hushmic::pipewire::{node_state, state_is_idle};
+    // Shape captured from pw-dump on PipeWire 1.6.9 with nothing recording
+    // from HushMic: the capture stream idles, the source is suspended.
+    let dump = r#"[
+      { "id": 46, "type": "PipeWire:Interface:Node",
+        "info": { "state": "idle", "props": { "node.name": "hushmic_input" } } },
+      { "id": 47, "type": "PipeWire:Interface:Node",
+        "info": { "state": "suspended",
+          "props": { "media.class": "Audio/Source", "node.name": "hushmic_source" } } },
+      { "id": 48, "type": "PipeWire:Interface:Port",
+        "info": { "props": { "node.name": "hushmic_source" } } }
+    ]"#;
+    assert_eq!(
+        node_state(dump, "hushmic_source").as_deref(),
+        Some("suspended")
+    );
+    assert_eq!(node_state(dump, "hushmic_input").as_deref(), Some("idle"));
+    // No such node, a node without a state, garbage: unknown.
+    assert_eq!(node_state(dump, "absent"), None);
+    assert_eq!(node_state(PWDUMP, "hushmic_source"), None);
+    assert_eq!(node_state("not json", "hushmic_source"), None);
+
+    assert!(state_is_idle("idle"));
+    assert!(state_is_idle("suspended"));
+    assert!(!state_is_idle("running"));
+    assert!(!state_is_idle("creating"));
+    assert!(!state_is_idle("error"));
+}

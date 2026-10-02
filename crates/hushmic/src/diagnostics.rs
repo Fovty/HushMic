@@ -73,6 +73,10 @@ pub struct Report {
     /// node (issue #10); 0 = node present but unpinned (pre-pin chain).
     /// None = chain not visible in the dump.
     pub chain_quantum_pin: Option<u32>,
+    /// PipeWire's scheduling state for `hushmic_source` (`running`,
+    /// `idle`, `suspended`, ...); None = no node or no dump. Idle is normal:
+    /// with no active consumer PipeWire does not run the chain at all.
+    pub chain_node_state: Option<String>,
     /// System-wide `clock.force-quantum` from the settings metadata (the
     /// manual override); None = not forced.
     pub forced_quantum: Option<u32>,
@@ -182,6 +186,9 @@ pub fn collect() -> Report {
         chain_quantum_pin: dump
             .as_deref()
             .and_then(crate::pipewire::chain_pins_quantum),
+        chain_node_state: dump
+            .as_deref()
+            .and_then(|d| crate::pipewire::node_state(d, "hushmic_source")),
         forced_quantum: crate::pipewire::settings_force_quantum(),
     }
 }
@@ -443,6 +450,16 @@ pub fn render(r: &Report) -> (String, usize) {
             false,
             "hushmic_source present: unavailable".into(),
         ),
+    }
+    // A fact, never a problem: idle is PipeWire not scheduling the chain,
+    // normally because no stream reads from it (the capture side is passive).
+    if let (Some(true), Some(st)) = (r.hushmic_present, r.chain_node_state.as_deref()) {
+        let s = if crate::pipewire::state_is_idle(st) {
+            format!("  state: {st} (PipeWire is not running the chain right now)")
+        } else {
+            format!("  state: {st}")
+        };
+        line(&mut out, false, s);
     }
     line(
         &mut out,
@@ -872,6 +889,7 @@ mod tests {
             capture_feeders: Some(vec!["alsa_input.usb-mic".into()]),
             prior_default: Some("alsa_input.usb-mic".into()),
             chain_quantum_pin: Some(crate::controller::PINNED_QUANTUM),
+            chain_node_state: Some("running".into()),
             forced_quantum: None,
             inference_setting: "auto".into(),
             inference: Some(vec![]),
@@ -1012,6 +1030,31 @@ mod tests {
             text.contains("capture fed by: alsa_input.usb-mic"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_idle_chain_is_a_plain_fact_worded_as_normal() {
+        let mut r = healthy();
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("  state: running\n"), "{text}");
+        for st in ["idle", "suspended"] {
+            r.chain_node_state = Some(st.into());
+            let (text, problems) = render(&r);
+            assert_eq!(problems, 0, "idle is never a problem: {text}");
+            assert!(
+                text.contains(&format!(
+                    "  state: {st} (PipeWire is not running the chain right now)"
+                )),
+                "{text}"
+            );
+        }
+        // No node, or no state: no state line.
+        r.hushmic_present = Some(false);
+        assert!(!render(&r).0.contains("  state: "));
+        r.hushmic_present = Some(true);
+        r.chain_node_state = None;
+        assert!(!render(&r).0.contains("  state: "));
     }
 
     #[test]

@@ -987,23 +987,85 @@ mod tests {
         }
     }
 
+    /// Set in the child process that runs the stalled-bus scenario.
+    const STALLED_BUS_CHILD: &str = "HUSHMIC_RT_STALLED_BUS_CHILD";
+
+    /// libdbus reads `DBUS_SYSTEM_BUS_ADDRESS` once per process, on its
+    /// first bus connection. In-process, any test that reached the system
+    /// bus first (`outcome_shape_on_this_machine`) made the redirect below
+    /// a no-op: the listener never saw a client and the test hung on
+    /// accept while holding `ENV`, stalling every other env test with it.
+    /// So the scenario runs in a fresh child process (this test binary,
+    /// filtered to the ignored inner test), with a bounded wait.
     #[test]
     fn deadline_covers_a_stalled_bus_registration() {
+        if DBus::load().is_none() {
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rt::tests::stalled_bus_registration_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(STALLED_BUS_CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let output = match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(output) => output.unwrap(),
+            Err(_) => {
+                // SAFETY: plain syscall on our own child's pid.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("the stalled-bus child did not finish within 30 s");
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child: {:?}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in a child process; see deadline_covers_a_stalled_bus_registration"]
+    fn stalled_bus_registration_child() {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixListener};
-        let _g = ENV.lock().unwrap();
-        if DBus::load().is_none() {
+        if std::env::var_os(STALLED_BUS_CHILD).is_none() {
             return;
         }
         let name = format!("hushmic_deadline_test_{}", std::process::id());
         let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let (release, released) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (_connection, _) = listener.accept().unwrap();
+            // Bounded: a client that never connects fails the test instead
+            // of hanging it.
+            let until = Instant::now() + Duration::from_secs(5);
+            let connection = loop {
+                match listener.accept() {
+                    Ok((c, _)) => break Some(c),
+                    Err(_) if Instant::now() < until => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break None,
+                }
+            };
             let _ = released.recv_timeout(Duration::from_secs(3));
+            connection.is_some()
         });
-        let previous = std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS");
+        // A fresh process: libdbus has not read the address yet.
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", format!("unix:abstract={name}"));
         let pending = Arc::new(AtomicBool::new(true));
         let started = Instant::now();
@@ -1022,16 +1084,12 @@ mod tests {
         let elapsed = started.elapsed();
         let was_pending = pending.load(Ordering::Acquire);
         let _ = release.send(());
-        server.join().unwrap();
+        let connected = server.join().unwrap();
         let done = Instant::now() + Duration::from_secs(2);
         while pending.load(Ordering::Acquire) && Instant::now() < done {
             std::thread::sleep(Duration::from_millis(1));
         }
-        if let Some(value) = previous {
-            std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", value);
-        } else {
-            std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
-        }
+        assert!(connected, "libdbus never connected to the redirected bus");
         assert_eq!(outcome, RtOutcome::Unavailable("timeout".into()));
         assert!(
             elapsed < Duration::from_secs(1),

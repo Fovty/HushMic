@@ -163,6 +163,12 @@ pub struct Status {
     pub defaults_attn_limit: f32,
     pub chain_running: bool,
     pub node_present: Option<bool>,
+    /// PipeWire's scheduling state for `hushmic_source` (`running`,
+    /// `idle`, `suspended`, ...); None = unknown or the chain is down. Idle
+    /// means PipeWire is not running the chain, so it costs no CPU (see
+    /// `pipewire::state_is_idle`); it says nothing about which apps hold a
+    /// stream open (a corked one does not count).
+    pub node_state: Option<String>,
     /// A StatusNotifierItem is registered (`sni`) or the daemon runs
     /// without an icon (`none`: --headless, tray = false, or no watcher).
     pub tray_sni: bool,
@@ -237,10 +243,13 @@ pub fn render_status_human(s: &Status) -> String {
     let chain = if !s.chain_running {
         "not running"
     } else {
-        match s.node_present {
-            Some(true) => "running",
-            Some(false) => "running, node missing",
-            None => "running (node state unknown)",
+        match (s.node_present, s.node_state.as_deref()) {
+            (Some(true), Some(st)) if crate::pipewire::state_is_idle(st) => {
+                "running, idle (not processing audio right now)"
+            }
+            (Some(true), _) => "running",
+            (Some(false), _) => "running, node missing",
+            (None, _) => "running (node state unknown)",
         }
     };
     let engine = match (s.chain_running, s.engine) {
@@ -311,6 +320,10 @@ pub fn render_status_json(s: &Status) -> String {
         "chain": {
             "running": s.chain_running,
             "node_present": s.node_present,
+            "node_state": s.node_state.as_ref().filter(|_| s.chain_running),
+            "idle": s.node_state.as_deref()
+                .filter(|_| s.chain_running)
+                .map(crate::pipewire::state_is_idle),
         },
     })
     .to_string()
@@ -717,6 +730,7 @@ mod tests {
             defaults_attn_limit: 24.0,
             chain_running: true,
             node_present: Some(true),
+            node_state: Some("running".into()),
             tray_sni: true,
             engine: Some(EngineTier::Quality),
             configured_light: false,
@@ -873,6 +887,38 @@ mod tests {
         assert_eq!(v["enabled"], false);
         assert!(v["mic"]["configured"].is_null());
         assert!(v["chain"]["node_present"].is_null());
+        // A stale state from before the chain went down is not reported.
+        assert!(v["chain"]["node_state"].is_null());
+        assert!(v["chain"]["idle"].is_null());
+    }
+
+    #[test]
+    fn status_says_when_nothing_records_from_hushmic() {
+        // Running and recorded from: plain "running", idle false.
+        let s = demo_status();
+        assert!(render_status_human(&s).contains("chain: running\n"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
+        assert_eq!(v["chain"]["node_state"], "running");
+        assert_eq!(v["chain"]["idle"], false);
+        // Idle and suspended both read as idle, worded as normal.
+        for st in ["idle", "suspended"] {
+            let mut i = demo_status();
+            i.node_state = Some(st.into());
+            let h = render_status_human(&i);
+            assert!(
+                h.contains("chain: running, idle (not processing audio right now)\n"),
+                "{h}"
+            );
+            let v: serde_json::Value = serde_json::from_str(&render_status_json(&i)).unwrap();
+            assert_eq!(v["chain"]["node_state"], st);
+            assert_eq!(v["chain"]["idle"], true);
+        }
+        // Unknown state: the line stays as before, idle is null.
+        let mut u = demo_status();
+        u.node_state = None;
+        assert!(render_status_human(&u).contains("chain: running\n"));
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&u)).unwrap();
+        assert!(v["chain"]["idle"].is_null());
     }
 
     #[test]

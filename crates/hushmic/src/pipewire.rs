@@ -90,6 +90,36 @@ pub fn chain_pins_quantum(stdout: &str) -> Option<u32> {
     None
 }
 
+/// The scheduling state PipeWire reports for the node `name` (`info.state`:
+/// `running`, `idle`, `suspended`, `creating`, `error`). `None` = no such
+/// node, no state, or an unparseable dump. Pure function — no I/O.
+pub fn node_state(stdout: &str, name: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    v.as_array()?
+        .iter()
+        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Node"))
+        .find(|o| {
+            o.get("info")
+                .and_then(|i| i.get("props"))
+                .and_then(|p| p.get("node.name"))
+                .and_then(|n| n.as_str())
+                == Some(name)
+        })
+        .and_then(|o| o.get("info")?.get("state")?.as_str())
+        .map(str::to_string)
+}
+
+/// Whether a `hushmic_source` [`node_state`] means PipeWire is not running
+/// the chain (no CPU): `idle`, then `suspended` after the session
+/// manager's suspend timeout. The capture stream is `node.passive`, so this
+/// is the normal state while no active stream reads from HushMic (a corked
+/// stream does not count; a muted-but-open one does). It is a scheduling
+/// fact, not a list of apps: on PipeWire < 0.3.68 another client of the
+/// mic keeps the chain `running` with nobody reading from it.
+pub fn state_is_idle(state: &str) -> bool {
+    matches!(state, "idle" | "suspended")
+}
+
 /// Resolve a node NAME to its numeric PipeWire global id from a `pw-dump`
 /// snapshot. Pure — no I/O. `None` if the JSON is unparseable or no
 /// `Audio` node carries that `node.name`.
@@ -477,7 +507,44 @@ pub fn pw_dump() -> Option<String> {
     if !o.status.success() {
         return None;
     }
-    let raw = String::from_utf8_lossy(&o.stdout).into_owned();
+    valid_dump(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// [`pw_dump`] with a deadline, for callers on the main loop that must
+/// not stall on a wedged daemon: past `budget` the child is killed and the
+/// probe reads as failed (`None`, i.e. unknown).
+pub fn pw_dump_within(budget: Duration) -> Option<String> {
+    let mut child = Command::new("pw-dump")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // read(2) has no timeout: the reader gets its own thread, and killing
+    // the child on a timeout ends it with EOF.
+    std::thread::spawn(move || {
+        let mut raw = Vec::new();
+        let ok = stdout.read_to_end(&mut raw).is_ok();
+        let _ = tx.send(ok.then_some(raw));
+    });
+    let raw = match rx.recv_timeout(budget) {
+        Ok(raw) => raw,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let status = child.wait().ok()?;
+    if !status.success() {
+        return None;
+    }
+    valid_dump(String::from_utf8_lossy(&raw?).into_owned())
+}
+
+/// The JSON check (and old-pw-dump repair) shared by the dump probes.
+fn valid_dump(raw: String) -> Option<String> {
     // Fast path: valid JSON passes through untouched (IgnoredAny validates
     // without building a tree).
     if serde_json::from_str::<serde::de::IgnoredAny>(&raw).is_ok() {

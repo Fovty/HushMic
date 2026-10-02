@@ -48,6 +48,11 @@ fn fail_summary() -> String {
 /// right after a spawn would flash Error / respawn a healthy child.
 const STARTUP_GRACE_SECS: u64 = 3;
 
+/// The budget for `hushmic status` to re-read an idle chain's state on the
+/// main loop. pw-dump answers in tens of ms; past this the reading is
+/// unknown and the status line says plain `running`.
+const STATUS_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
 /// One extra Tick shortly after a chain spawn. The 5 s watchdog cadence is
 /// the wrong clock for healing a capture stream that another audio tool
 /// re-routed at creation (issue #5: EasyEffects) — without this the A/B
@@ -561,11 +566,13 @@ fn refresh_tray(
     controller: &mut Controller,
     known_mics: &mut Vec<pipewire::Source>,
     last_node_present: &mut Option<bool>,
+    last_node_state: &mut Option<String>,
     engine: &mut EngineCache,
     testing: bool,
     target_cache: &mut TargetCache,
 ) {
-    let nodes = pipewire::sources_snapshot();
+    let dump = pipewire::pw_dump();
+    let nodes = dump.as_deref().map(pipewire::parse_pwdump_nodes);
     let node_present = nodes
         .as_ref()
         .map(|v| v.iter().any(|s| s.name == "hushmic_source"));
@@ -573,6 +580,9 @@ fn refresh_tray(
         *known_mics = pipewire::filter_real(&v);
     }
     *last_node_present = node_present;
+    *last_node_state = dump
+        .as_deref()
+        .and_then(|d| pipewire::node_state(d, "hushmic_source"));
     let status = compute_status(cfg, controller, node_present);
     let new_mics = known_mics.clone();
     let snapshot = cfg.clone();
@@ -1107,6 +1117,9 @@ fn main() {
     // Last hushmic_source probe verdict, refreshed by Tick and the Cmd
     // epilogue — `status` reports it instead of re-probing on the hot path.
     let mut last_node_present: Option<bool> = None;
+    // PipeWire's scheduling state for hushmic_source from the same
+    // snapshots (`hushmic status`: idle / running).
+    let mut last_node_state: Option<String> = None;
     let mut tray_engine = EngineCache::default();
     // Metadata stream routing (the re-pin write) exists only on modern
     // PipeWire; probed once — on legacy hosts the theft mechanism does not
@@ -1123,7 +1136,8 @@ fn main() {
     let mut default_release = watchdog::DefaultRelease::default();
     // The device a start would take its settings from, as last seen with
     // no chain running, and the `mic` it was resolved for — spares the
-    // main loop a pw-dump per status/config request (see settings_device).
+    // main loop a pw-dump per status/config request (see settings_device;
+    // `status` only re-reads the node state, bounded, while it reads idle).
     let mut target_cache: TargetCache = None;
     // Shortcuts portal state: None until the worker's first report;
     // Some(false) makes Tick nudge a reconnect, throttled by the backoff.
@@ -1167,6 +1181,22 @@ fn main() {
                             .active_model()
                             .and_then(|m| control::live_model(engine, m, configured_light))
                             .and_then(|m| hushmic::diagnostics::inference_for(&m));
+                        // The tick's snapshot is up to 5 s old. A running
+                        // chain stays running for the call, so that reading
+                        // is used as is; an idle or unknown one is re-read,
+                        // because idle flips the moment a call starts and a
+                        // status taken right after joining must not say
+                        // idle. Bounded: a wedged daemon must not stall the
+                        // loop (a failed probe reads as unknown).
+                        let node_state = if !controller.is_running() {
+                            None
+                        } else {
+                            match last_node_state.as_deref() {
+                                Some(st) if !pipewire::state_is_idle(st) => last_node_state.clone(),
+                                _ => pipewire::pw_dump_within(STATUS_PROBE_BUDGET)
+                                    .and_then(|d| pipewire::node_state(&d, "hushmic_source")),
+                            }
+                        };
                         let s = control::Status {
                             version: env!("CARGO_PKG_VERSION").to_string(),
                             mode: cfg.enabled.then(|| controller.mode()),
@@ -1185,6 +1215,7 @@ fn main() {
                             defaults_attn_limit: cfg.attn_limit,
                             chain_running: controller.is_running(),
                             node_present: last_node_present,
+                            node_state,
                             tray_sni: handle.is_sni(),
                             engine,
                             configured_light,
@@ -1291,6 +1322,7 @@ fn main() {
                             &mut controller,
                             &mut known_mics,
                             &mut last_node_present,
+                            &mut last_node_state,
                             &mut tray_engine,
                             testing,
                             &mut target_cache,
@@ -1632,6 +1664,7 @@ fn main() {
                     &mut controller,
                     &mut known_mics,
                     &mut last_node_present,
+                    &mut last_node_state,
                     &mut tray_engine,
                     testing,
                     &mut target_cache,
@@ -1771,6 +1804,7 @@ fn main() {
                                     &mut controller,
                                     &mut known_mics,
                                     &mut last_node_present,
+                                    &mut last_node_state,
                                     &mut tray_engine,
                                     testing,
                                     &mut target_cache,
@@ -1867,6 +1901,9 @@ fn main() {
                     .as_ref()
                     .map(|v| v.iter().any(|s| s.name == "hushmic_source"));
                 last_node_present = node_present;
+                last_node_state = dump
+                    .as_deref()
+                    .and_then(|d| pipewire::node_state(d, "hushmic_source"));
                 if let Some(v) = nodes.as_ref() {
                     let real = pipewire::filter_real(v);
                     if real != known_mics {

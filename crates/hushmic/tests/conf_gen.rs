@@ -56,6 +56,62 @@ fn latency_constant_and_rendered_seconds_agree() {
     assert!(on.contains(&format!("\"latency\" = {secs}")), "{on}");
 }
 
+/// The free idle (docs/superpowers/idle-mode-design.md): with nothing
+/// recording from HushMic, PipeWire must not schedule the chain at all.
+/// That rests on the capture stream being passive (its link to the mic
+/// does not make the chain runnable) and on nothing forcing the chain to
+/// run without consumers. Measured on PipeWire 0.3.65, 1.0.5 and 1.6.9:
+/// 0 % CPU idle; a chain without `node.passive` would run whenever the
+/// mic does. Every rendering variant must keep both.
+#[test]
+fn every_conf_lets_pipewire_idle_the_chain() {
+    let mics = [None, Some("alsa_input.realmic".to_string())];
+    let modes = [RunMode::Suppress, RunMode::Bypass, RunMode::Mute];
+    for mic in &mics {
+        for legacy in [false, true] {
+            for report_latency in [false, true] {
+                for mode in modes {
+                    let cfg = Config {
+                        mic: mic.clone(),
+                        ..Config::default()
+                    };
+                    let c = render_conf(&cfg, &test_paths(), legacy, mode, report_latency);
+                    let capture = c
+                        .split("capture.props = {")
+                        .nth(1)
+                        .and_then(|rest| rest.split("playback.props").next())
+                        .expect("capture.props block");
+                    assert!(
+                        capture.contains("node.passive   = true"),
+                        "capture stream must stay passive: {c}"
+                    );
+                    let playback = c.split("playback.props = {").nth(1).expect("playback");
+                    // A passive source would not run for its consumers.
+                    assert!(
+                        !playback.contains("node.passive"),
+                        "the source itself must not be passive: {c}"
+                    );
+                    // Each of these forces the chain to run, or joins it to
+                    // a scheduling group that a mic consumer keeps running.
+                    for forbidden in [
+                        "node.always-process",
+                        "node.want-driver",
+                        "node.suspend-on-idle",
+                        "node.pause-on-idle",
+                        "node.link-group",
+                        "node.group",
+                    ] {
+                        assert!(
+                            !c.contains(forbidden),
+                            "{forbidden} changes when PipeWire schedules the chain: {c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn conf_renders_the_run_mode() {
     let cfg = Config::default();
