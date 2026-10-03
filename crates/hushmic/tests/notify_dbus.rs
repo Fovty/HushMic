@@ -81,7 +81,15 @@ fn notify_round_trip_on_a_private_bus() {
     }
 
     let mut daemon = Command::new("dbus-daemon")
-        .args(["--session", "--nofork", "--print-address=1"])
+        .args([
+            "--config-file",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/private-bus.conf"
+            ),
+            "--nofork",
+            "--print-address=1",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -93,9 +101,8 @@ fn notify_round_trip_on_a_private_bus() {
         line.trim().to_string()
     };
     let _guard = BusGuard(daemon);
-    // Binary present but session bus unstartable (e.g. no session.conf
-    // installed) is an environment problem, not a code defect: skip, like
-    // the missing-binary case.
+    // Binary present but session bus unstartable is an environment
+    // problem, not a code defect: skip, like the missing-binary case.
     if !addr.starts_with("unix:") {
         eprintln!(
             "SKIP notify_round_trip_on_a_private_bus: dbus-daemon reported no usable \
