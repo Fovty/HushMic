@@ -568,7 +568,7 @@ fn worker_loop(
             continue;
         }
         let pause = if realtime || forced {
-            guard.pause(rttime_limit())
+            guard.pause(if realtime { rttime_limit() } else { None })
         } else {
             None
         };
