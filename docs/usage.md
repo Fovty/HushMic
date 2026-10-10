@@ -57,6 +57,7 @@ The noise suppression lives in a LADSPA plugin, `libdpdfnet_ladspa.so`, and Easy
 - HushMic has to be installed, but it does not have to run. EasyEffects only uses the plugin and the model files.
 - Install a package: the `.deb`, the AUR packages, the Fedora package, or the install script with its default `/usr` prefix. These put the plugin in `/usr/lib/ladspa/`, where EasyEffects looks for it. The AppImage keeps the plugin inside the image, and the Flatpak version of EasyEffects cannot see plugins installed on the system.
 - EasyEffects has its own settings: its *Attenuation Limit* slider sets the suppression strength. HushMic's model, strength and microphone choices do not apply there.
+- When the CPU gets tight, the plugin switches to the light model on its own and back later, as it does in HushMic. Past that the audio passes unfiltered until the load drops.
 - Running HushMic's virtual mic and EasyEffects' Deep Noise Remover on the same microphone filters the audio twice and adds the latency twice. Use one or the other for your microphone.
 
 ## Test my mic

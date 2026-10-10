@@ -31,9 +31,16 @@ const DEFAULT_MODEL: &str = env!("HUSHMIC_DEFAULT_MODEL");
 const DEFAULT_DYLIB: &str = env!("HUSHMIC_DEFAULT_DYLIB");
 
 fn model_path() -> PathBuf {
-    std::env::var("HUSHMIC_MODEL_PATH")
+    model_path_from(std::env::var_os("HUSHMIC_MODEL_PATH").as_deref())
+}
+
+/// `HUSHMIC_MODEL_PATH` overrides the compiled-in default; unset or empty
+/// means the default, as for `ORT_DYLIB_PATH`.
+fn model_path_from(named: Option<&std::ffi::OsStr>) -> PathBuf {
+    named
+        .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_MODEL))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL))
 }
 
 /// LADSPA control value -> mode: round to nearest, clamp to 0..=2.
@@ -64,6 +71,43 @@ fn plan_tiers(main: &std::path::Path, light_loaded: bool) -> (Vec<Tier>, Tier) {
     } else {
         (vec![Tier::Quality, Tier::Raw], Tier::Quality)
     }
+}
+
+/// File stem of the light model, the fallback tier under CPU pressure.
+const LIGHT_MODEL: &str = "dpdfnet2_48khz_hr";
+
+/// Where the light model comes from, before any file is touched.
+#[derive(Debug, PartialEq)]
+enum LightModel {
+    /// The main model already is the light one: no fallback model.
+    None,
+    /// Named by `HUSHMIC_FALLBACK_MODEL_PATH` (the HushMic app sets it).
+    Named(PathBuf),
+    /// No host named one: the light model's file next to the main model,
+    /// with the main model's extension. Hosts that set no variables
+    /// (EasyEffects) get the light tier this way.
+    Sibling(PathBuf),
+}
+
+/// `named` is `HUSHMIC_FALLBACK_MODEL_PATH`; unset or empty means "find
+/// it", as for `ORT_DYLIB_PATH`. A named path always wins, so a host can
+/// still point the plugin at another file.
+fn light_model(named: Option<&std::ffi::OsStr>, main: &std::path::Path) -> LightModel {
+    if plan_tiers(main, false).1 == Tier::Light {
+        return LightModel::None;
+    }
+    if let Some(p) = named.filter(|p| !p.is_empty()) {
+        return LightModel::Named(PathBuf::from(p));
+    }
+    let file = match main.extension() {
+        Some(ext) => {
+            let mut f = std::ffi::OsString::from(format!("{LIGHT_MODEL}."));
+            f.push(ext);
+            f
+        }
+        None => LIGHT_MODEL.into(),
+    };
+    LightModel::Sibling(main.with_file_name(file))
 }
 
 /// `HUSHMIC_DSP_TIER=quality|light|passthrough` pins the policy; a word
@@ -177,6 +221,26 @@ fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
     Box::new(ladder)
 }
 
+/// The runtime this plugin committed, when it was this plugin (the first
+/// instance in the process; later ones find it already committed).
+static OUR_RUNTIME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// What to say when an instance finds a runtime already committed: nothing
+/// when it is the one this plugin loaded for the same path, otherwise which
+/// runtime is in use instead of the requested one.
+fn runtime_note(ours: Option<&str>, requested: &str) -> Option<String> {
+    match ours {
+        Some(p) if p == requested => None,
+        Some(p) => Some(format!(
+            "ONNX Runtime from {p} is already in use in this process; {requested} was not loaded"
+        )),
+        None => Some(format!(
+            "another component of this process set up ONNX Runtime first; it is used \
+             instead of {requested}"
+        )),
+    }
+}
+
 /// Bring up the pinned bundled runtime and load the model(s). On any failure
 /// of the main model the plugin runs engine-less (working-but-silent node).
 /// The runtime commit is gated on OUR resolved path — a failed init must
@@ -184,8 +248,10 @@ fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
 /// bundled one, so no `Denoiser` constructor (whose implicit resolution would
 /// try exactly that) is ever reached on the error path.
 ///
-/// `HUSHMIC_FALLBACK_MODEL_PATH` names the light model; when it loads, the
-/// adaptive engine can fall back to it under CPU pressure (issue #14). Both
+/// The light model (see `light_model`) is the adaptive engine's fallback
+/// under CPU pressure (issue #14); without it overload goes straight to
+/// unfiltered audio. Loading it costs memory and init time in every
+/// instance, not CPU: it only runs while the ladder trials or uses it. Both
 /// loads happen here, on the instantiate thread, before the worker exists,
 /// and both go through `load_denoiser`, so both tiers run on the selected
 /// engine. The runtime is committed even when both models end up native:
@@ -200,10 +266,14 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
             eprintln!("[dpdfnet-ladspa] {e}");
             return None;
         }
-        Ok(RuntimeInit::AlreadyInitialized) => eprintln!(
-            "[dpdfnet-ladspa] note: an ONNX Runtime environment was already committed in \
-             this process; the bundled runtime at {dylib} may not be the one in use"
-        ),
+        Ok(RuntimeInit::AlreadyInitialized) => {
+            if let Some(note) = runtime_note(OUR_RUNTIME.get().map(String::as_str), &dylib) {
+                eprintln!("[dpdfnet-ladspa] note: {note}");
+            }
+        }
+        Ok(RuntimeInit::Committed) => {
+            let _ = OUR_RUNTIME.set(dylib.clone());
+        }
         // RuntimeInit is non_exhaustive: any future variant still means "a
         // runtime is committed", so proceeding is the right default.
         Ok(_) => {}
@@ -216,17 +286,45 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
             return None;
         }
     };
-    // A main model that is already the light one has no fallback to load;
-    // the comparison is by canonical path so a symlinked or differently
-    // spelled duplicate is not loaded twice as the "light" tier.
-    let (_, main_tier) = plan_tiers(&main_path, false);
+    // The comparison is by canonical path so a symlinked or differently
+    // spelled duplicate of the main model is not loaded twice as the
+    // "light" tier.
     let same_file = |p: &PathBuf| {
         let canon = |q: &std::path::Path| q.canonicalize().unwrap_or_else(|_| q.to_path_buf());
         canon(p) == canon(&main_path)
     };
-    let light = std::env::var_os("HUSHMIC_FALLBACK_MODEL_PATH")
-        .map(PathBuf::from)
-        .filter(|p| main_tier != Tier::Light && !same_file(p))
+    let light_path = match light_model(
+        std::env::var_os("HUSHMIC_FALLBACK_MODEL_PATH").as_deref(),
+        &main_path,
+    ) {
+        LightModel::None => None,
+        LightModel::Named(p) => Some(p),
+        LightModel::Sibling(p) if same_file(&p) => {
+            eprintln!(
+                "[dpdfnet-ladspa] {} is the main model itself; no light model to \
+                 fall back to",
+                p.display()
+            );
+            None
+        }
+        LightModel::Sibling(p) if p.exists() => {
+            eprintln!(
+                "[dpdfnet-ladspa] light model: {} (next to the main model)",
+                p.display()
+            );
+            Some(p)
+        }
+        LightModel::Sibling(p) => {
+            eprintln!(
+                "[dpdfnet-ladspa] no light model at {}; under CPU overload the \
+                 audio passes unfiltered",
+                p.display()
+            );
+            None
+        }
+    };
+    let light = light_path
+        .filter(|p| !same_file(p))
         .and_then(|p| match load_denoiser(&p) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -485,6 +583,72 @@ mod tests {
         assert_eq!(
             plan_tiers(l, true),
             (vec![Tier::Light, Tier::Raw], Tier::Light)
+        );
+    }
+
+    #[test]
+    fn runtime_note_only_when_the_runtime_is_not_ours() {
+        // Every instance after the first (EasyEffects: the right channel).
+        assert_eq!(runtime_note(Some("/usr/lib/x.so"), "/usr/lib/x.so"), None);
+        let other = runtime_note(Some("/a/x.so"), "/b/x.so").unwrap();
+        assert!(
+            other.contains("/a/x.so") && other.contains("/b/x.so"),
+            "{other}"
+        );
+        let foreign = runtime_note(None, "/b/x.so").unwrap();
+        assert!(foreign.contains("another component"), "{foreign}");
+        assert!(!other.contains("bundled") && !foreign.contains("bundled"));
+    }
+
+    #[test]
+    fn empty_model_path_means_the_default() {
+        use std::ffi::OsStr;
+        assert_eq!(model_path_from(None), PathBuf::from(DEFAULT_MODEL));
+        assert_eq!(
+            model_path_from(Some(OsStr::new(""))),
+            PathBuf::from(DEFAULT_MODEL)
+        );
+        assert_eq!(
+            model_path_from(Some(OsStr::new("/m/x.onnx"))),
+            PathBuf::from("/m/x.onnx")
+        );
+    }
+
+    #[test]
+    fn light_model_is_found_next_to_the_main_one_unless_named() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+        let q = Path::new("/usr/share/hushmic/models/dpdfnet8_48khz_hr.onnx");
+        let sibling =
+            LightModel::Sibling("/usr/share/hushmic/models/dpdfnet2_48khz_hr.onnx".into());
+        // Unset and empty both mean "find it" (EasyEffects sets nothing).
+        assert_eq!(light_model(None, q), sibling);
+        assert_eq!(light_model(Some(OsStr::new("")), q), sibling);
+        // A named path wins, existing or not.
+        assert_eq!(
+            light_model(Some(OsStr::new("/elsewhere/l.onnx")), q),
+            LightModel::Named("/elsewhere/l.onnx".into())
+        );
+        // A light main model has no fallback, named or not.
+        let l = Path::new("/m/dpdfnet2_48khz_hr.onnx");
+        assert_eq!(light_model(None, l), LightModel::None);
+        assert_eq!(
+            light_model(Some(OsStr::new("/m/dpdfnet2_48khz_hr.onnx")), l),
+            LightModel::None
+        );
+        // The sibling keeps the main model's extension, or has none.
+        assert_eq!(
+            light_model(None, Path::new("/m/custom.model")),
+            LightModel::Sibling("/m/dpdfnet2_48khz_hr.model".into())
+        );
+        assert_eq!(
+            light_model(None, Path::new("/m/custom")),
+            LightModel::Sibling("/m/dpdfnet2_48khz_hr".into())
+        );
+        // A relative main model gets a relative sibling in the same place.
+        assert_eq!(
+            light_model(None, Path::new("dpdfnet8_48khz_hr.onnx")),
+            LightModel::Sibling("dpdfnet2_48khz_hr.onnx".into())
         );
     }
 

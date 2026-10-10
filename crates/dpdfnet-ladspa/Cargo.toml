@@ -23,3 +23,9 @@ libc = "0.2"
 
 [dev-dependencies]
 claxon = "0.4" # FLAC decode for the committed public parity fixture
+
+# Self-exec harness: the model paths and the ONNX Runtime commit are
+# process-global, so each host case runs in its own subprocess.
+[[test]]
+name = "host_light_model"
+harness = false

@@ -53,6 +53,10 @@ resolved in this order:
 3. The bare soname `libonnxruntime.so`: a copy next to your executable wins,
    then the normal dynamic linker search, which finds a distro package.
 
+ONNX Runtime 1.18 or newer works (the crate uses API version 18). Once a
+model runs on ONNX Runtime, the crate keeps its environment until the process
+exits instead of releasing it at exit, which crashed runtimes before 1.23.
+
 Prefer static linking or ort's downloaded binaries? Disable the default
 feature and configure [`ort`](https://crates.io/crates/ort) yourself; cargo
 merges the features:

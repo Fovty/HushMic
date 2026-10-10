@@ -37,16 +37,40 @@ fn parse_csv_f32(s: &str) -> Vec<f32> {
 /// API bootstrap would otherwise retry the dylib load itself and PANIC on
 /// failure) — `crate::runtime::ensure_runtime` guarantees that.
 fn session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
-    Session::builder()
-        .map_err(|e| e.to_string())?
+    let builder = Session::builder().map_err(|e| e.to_string())?;
+    keep_environment();
+    builder
         .with_execution_providers([ort::ep::CPU::default().build()])
         .map_err(|e| e.to_string())?
         .with_intra_threads(1)
         .map_err(|e| e.to_string())?
         .with_inter_threads(1)
         .map_err(|e| e.to_string())?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
+        // All (99) rather than Level3: ort maps Level3 to ORT_ENABLE_LAYOUT (3),
+        // which runtimes before 1.23 reject. All is the layout level there; 1.23
+        // and later add one pass for fp16 initializers, which these fp32 graphs
+        // do not have, so the optimized graph is the same everywhere.
+        .with_optimization_level(GraphOptimizationLevel::All)
         .map_err(|e| e.to_string())
+}
+
+/// Hold a reference to ort's process-wide environment until the process
+/// ends, so ort never releases it at exit. ort releases it from a
+/// `.fini_array` entry, and glibc runs those after the C++ static
+/// destructors of the dlopened runtime. ONNX Runtime before 1.23 owns the
+/// environment through a static `unique_ptr` (`OrtEnv::p_instance_`) whose
+/// destructor has deleted it by then, so the release deletes it a second
+/// time and the process aborts at exit ("double free or corruption").
+/// 1.23 made that owner a plain pointer. Skipping the release at exit costs
+/// nothing; statics are never dropped.
+fn keep_environment() {
+    static KEPT: std::sync::OnceLock<std::sync::Arc<ort::environment::Environment>> =
+        std::sync::OnceLock::new();
+    if KEPT.get().is_none() {
+        if let Ok(env) = ort::environment::current() {
+            let _ = KEPT.set(env);
+        }
+    }
 }
 
 impl Model {
