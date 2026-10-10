@@ -140,12 +140,14 @@ Three clips are not a formal benchmark, but the source audio is public. Method, 
 
 **No tray icon on GNOME?** Install the *AppIndicator and KStatusNotifierItem Support* extension. HushMic keeps running without it.
 
+**Can I use it in EasyEffects?** Yes. EasyEffects can load HushMic's plugin as the DPDFNet model of its Deep Noise Remover, on your microphone and also on what you hear. Install HushMic from a package, then pick the model in EasyEffects. Details: [docs/usage.md](docs/usage.md#using-the-plugin-in-easyeffects).
+
 More: [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Alternatives
 
 - [NoiseTorch-ng](https://github.com/noisetorch/NoiseTorch): RNNoise-based virtual mic, needs `setcap`.
-- [EasyEffects](https://github.com/wwmm/easyeffects): full PipeWire effects suite with an RNNoise denoiser.
+- [EasyEffects](https://github.com/wwmm/easyeffects): full PipeWire effects suite with an RNNoise denoiser. Its Deep Noise Remover can also run DPDFNet through HushMic's plugin.
 - [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice): RNNoise LADSPA/VST plugin, wired by hand.
 - [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet): the model family HushMic builds on, with its own LADSPA plugin.
 

@@ -50,6 +50,15 @@ Model and strength are remembered per microphone. Pick a microphone under **Micr
 
 With **Set as default microphone** on, HushMic is the default input and uses the microphone that was the default before. If you switch the system default to another microphone yourself, that switch stays: HushMic follows the new microphone with its settings and does not take the default back until you turn it on again (mode, the checkbox, or the next start).
 
+## Using the plugin in EasyEffects
+
+The noise suppression lives in a LADSPA plugin, `libdpdfnet_ladspa.so`, and EasyEffects can load it directly. In EasyEffects, add **Deep Noise Remover** to the input or output effects and set its **Model** to *DPDFNet*. On the output side it cleans up what you hear, for example background noise from other people in a call. This needs an EasyEffects version with the DPDFNet model, added in October 2026.
+
+- HushMic has to be installed, but it does not have to run. EasyEffects only uses the plugin and the model files.
+- Install a package: the `.deb`, the AUR packages, the Fedora package, or the install script with its default `/usr` prefix. These put the plugin in `/usr/lib/ladspa/`, where EasyEffects looks for it. The AppImage keeps the plugin inside the image, and the Flatpak version of EasyEffects cannot see plugins installed on the system.
+- EasyEffects has its own settings: its *Attenuation Limit* slider sets the suppression strength. HushMic's model, strength and microphone choices do not apply there.
+- Running HushMic's virtual mic and EasyEffects' Deep Noise Remover on the same microphone filters the audio twice and adds the latency twice. Use one or the other for your microphone.
+
 ## Test my mic
 
 **Test my mic** in the menu opens a window with the raw microphone and the cleaned output side by side: scrolling spectrograms and level meters. It can also record a 10-second sample and play it back as *Play raw* and *Play filtered*, with measured before/after numbers. Without a display or GL, an audio-only record-and-playback test runs instead.
