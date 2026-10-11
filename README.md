@@ -164,7 +164,7 @@ This produces `target/release/hushmic` and `target/release/libdpdfnet_ladspa.so`
 
 ## Contributing
 
-Translations happen on [Weblate](https://hosted.weblate.org/projects/hushmic/), see [TRANSLATING.md](TRANSLATING.md). Plans are in the [roadmap](ROADMAP.md). If HushMic is useful to you, a coffee on [Ko-fi](https://ko-fi.com/fovty) helps keep it maintained.
+Translations happen on [Weblate](https://hosted.weblate.org/projects/hushmic/), see [TRANSLATING.md](TRANSLATING.md). If HushMic is useful to you, a coffee on [Ko-fi](https://ko-fi.com/fovty) helps keep it maintained.
 
 ## License
 
