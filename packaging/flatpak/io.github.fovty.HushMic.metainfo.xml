@@ -49,6 +49,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.10.3" date="2026-10-10">
+      <description>
+        <p>
+          The noise filter now runs with older ONNX Runtime versions, such
+          as the one Fedora ships. Used as a plugin in other apps like
+          EasyEffects, it falls back to the light model under heavy CPU load
+          instead of passing unfiltered audio.
+        </p>
+      </description>
+    </release>
     <release version="0.10.2" date="2026-10-02">
       <description>
         <p>
