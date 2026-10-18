@@ -49,6 +49,15 @@
   </screenshots>
 
   <releases>
+    <release version="0.10.4" date="2026-10-18">
+      <description>
+        <p>
+          Started with the systemd unit, HushMic no longer breaks the
+          desktop portal for the rest of the session: it now waits for the
+          desktop before it sets up its global shortcuts.
+        </p>
+      </description>
+    </release>
     <release version="0.10.3" date="2026-10-10">
       <description>
         <p>
