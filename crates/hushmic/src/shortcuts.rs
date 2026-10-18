@@ -4,6 +4,7 @@
 //! tested), and the portal client plumbing.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -357,14 +358,217 @@ fn plasma_version(wait: Duration) -> Option<(u32, u32)> {
 
 /// The backend for this session, from the environment and (on Plasma 6)
 /// plasmashell's version, waiting up to `wait` for plasmashell to start.
+/// A variable missing from our own environment is taken from the user
+/// manager's: the systemd unit starts before the desktop exports them, and
+/// an SSH shell never has them.
 pub fn detect_backend(wait: Duration) -> Backend {
     let flatpak = crate::sandbox::is_flatpak();
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
-    let session = std::env::var("KDE_SESSION_VERSION").ok();
+    let mut desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+    let mut session = std::env::var("KDE_SESSION_VERSION").ok();
+    if !flatpak && (desktop.is_none() || session.is_none()) {
+        if let Some(env) = manager_environment() {
+            desktop = desktop.or_else(|| env_value(&env, "XDG_CURRENT_DESKTOP").map(str::to_owned));
+            session = session.or_else(|| env_value(&env, "KDE_SESSION_VERSION").map(str::to_owned));
+        }
+    }
     let plasma = (!flatpak && is_kde(desktop.as_deref()) && session.as_deref() != Some("5"))
         .then(|| plasma_version(wait))
         .flatten();
     choose_backend(flatpak, desktop.as_deref(), session.as_deref(), plasma)
+}
+
+const SYSTEMD_NAME: &str = "org.freedesktop.systemd1";
+const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
+const SYSTEMD_MANAGER: &str = "org.freedesktop.systemd1.Manager";
+
+/// The value of `key` in a `KEY=VALUE` list; empty counts as unset.
+fn env_value<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
+    env.iter()
+        .filter_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        .find(|v| !v.is_empty())
+}
+
+/// Whether `env` names a display that is there: its Wayland socket or X
+/// server socket exists. A unit that lingers past logout can still see
+/// the ended session's variables (GNOME 50 removes them, not every desktop
+/// does). A remote X display (`host:0`) is taken on trust.
+fn has_display(env: &[String], exists: impl Fn(&Path) -> bool) -> bool {
+    let wayland = env_value(env, "WAYLAND_DISPLAY").is_some_and(|w| {
+        let w = Path::new(w);
+        if w.is_absolute() {
+            return exists(w);
+        }
+        env_value(env, "XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+            .is_some_and(|dir| exists(&dir.join(w)))
+    });
+    wayland
+        || env_value(env, "DISPLAY").is_some_and(|d| match x11_socket(d) {
+            Some(socket) => exists(&socket),
+            None => true,
+        })
+}
+
+/// The local socket of an X display (`:0`, `:1.0`, `unix:0`); `None` for a
+/// remote or unparsable one.
+fn x11_socket(display: &str) -> Option<PathBuf> {
+    let (host, rest) = display.rsplit_once(':')?;
+    if !host.is_empty() && host != "unix" {
+        return None;
+    }
+    let n: u32 = rest.split('.').next()?.parse().ok()?;
+    Some(PathBuf::from(format!("/tmp/.X11-unix/X{n}")))
+}
+
+/// Whether the portal may be woken now (issue #26). Its backends are
+/// GTK/Qt programs that D-Bus activation starts with the user manager's
+/// environment: started before the desktop has put its display and name
+/// there, they exit with "cannot open display" or the portal settles for
+/// GTK fallbacks (no screen sharing, screenshots or shortcuts), and it
+/// stays that way for every app until it is restarted. The systemd unit
+/// starts at default.target, a second or two ahead of the desktop.
+///
+/// `own_display`: we were started with a display; `under_systemd`: the
+/// user manager started us, so our environment is a copy of its
+/// environment from before the session and says nothing; `manager_env`: the
+/// user manager's environment, `None` without a reachable systemd (a
+/// sandbox, another init), where the old behavior stays: go ahead.
+fn session_ready(
+    own_display: bool,
+    under_systemd: bool,
+    manager_env: Option<&[String]>,
+    exists: impl Fn(&Path) -> bool,
+) -> bool {
+    if own_display && !under_systemd {
+        return true;
+    }
+    manager_env.is_none_or(|env| has_display(env, exists))
+}
+
+/// What the user manager said about its environment.
+enum ManagerEnv {
+    Env(Vec<String>),
+    /// No systemd on the bus (or no bus): nothing to wait for.
+    Absent,
+    /// No answer in time — at login the manager is at its busiest; ask
+    /// again rather than take silence for a display.
+    Slow,
+}
+
+/// The user manager's environment (its `Environment` property), or `None`
+/// without a reachable systemd. Blocking: for callers outside a runtime.
+fn manager_environment() -> Option<Vec<String>> {
+    let conn = zbus::blocking::connection::Builder::session()
+        .ok()?
+        .method_timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    zbus::blocking::proxy::Builder::<zbus::blocking::Proxy>::new(&conn)
+        .destination(SYSTEMD_NAME)
+        .and_then(|b| b.path(SYSTEMD_PATH))
+        .and_then(|b| b.interface(SYSTEMD_MANAGER))
+        .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
+        .and_then(|b| b.build())
+        .ok()?
+        .get_property("Environment")
+        .ok()
+}
+
+/// [`manager_environment`] for the worker's runtime (zbus's blocking API
+/// starts its own runtime, which panics inside another).
+async fn manager_environment_async(conn: &zbus::Connection) -> ManagerEnv {
+    let proxy = match zbus::proxy::Builder::<zbus::Proxy>::new(conn)
+        .destination(SYSTEMD_NAME)
+        .and_then(|b| b.path(SYSTEMD_PATH))
+        .and_then(|b| b.interface(SYSTEMD_MANAGER))
+        .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
+    {
+        Ok(b) => match b.build().await {
+            Ok(p) => p,
+            Err(_) => return ManagerEnv::Absent,
+        },
+        Err(_) => return ManagerEnv::Absent,
+    };
+    match tokio::time::timeout(Duration::from_secs(2), proxy.get_property("Environment")).await {
+        Err(_) => ManagerEnv::Slow,
+        Ok(Ok(env)) => ManagerEnv::Env(env),
+        // ServiceUnknown in a sandbox or without systemd
+        Ok(Err(_)) => ManagerEnv::Absent,
+    }
+}
+
+/// Hold the worker until [`session_ready`], polling every 2 s. While it
+/// waits, shortcuts count as unavailable (`announce` sends that once; a
+/// retry has already sent it) and Retry nudges are dropped. Returns false
+/// when the main loop shut down meanwhile.
+async fn wait_for_session(
+    events: &std::sync::mpsc::Sender<PortalEvent>,
+    cmds: &mut tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    mut announce: bool,
+) -> bool {
+    let own_display = ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    if own_display && !under_systemd {
+        return true;
+    }
+    let conn = zbus::Connection::session().await.ok();
+    let mut waited = false;
+    // Polls that saw the display but no XDG_CURRENT_DESKTOP. The portal
+    // picks its backends by that name (without it, GNOME's portal came up
+    // with GTK fallbacks only), and so does detect_backend; desktops export
+    // it with or before the display, so a few polls is plenty.
+    let mut nameless = 0;
+    loop {
+        let env = match &conn {
+            Some(c) => manager_environment_async(c).await,
+            None => ManagerEnv::Absent,
+        };
+        let ready = match env {
+            ManagerEnv::Env(env) => {
+                session_ready(own_display, under_systemd, Some(&env), Path::exists)
+                    && (env_value(&env, "XDG_CURRENT_DESKTOP").is_some() || {
+                        nameless += 1;
+                        nameless > 3
+                    })
+            }
+            ManagerEnv::Absent => true,
+            ManagerEnv::Slow => false,
+        };
+        if ready {
+            if waited {
+                eprintln!("[hushmic] global shortcuts: the graphical session is up");
+            }
+            return true;
+        }
+        if !waited {
+            eprintln!("[hushmic] global shortcuts: waiting for the graphical session");
+            waited = true;
+        }
+        if announce {
+            announce = false;
+            if events.send(PortalEvent::Unavailable).is_err() {
+                return false;
+            }
+        }
+        let tick = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(tick);
+        loop {
+            tokio::select! {
+                _ = &mut tick => break,
+                c = cmds.recv() => match c {
+                    None => return false,
+                    Some(Cmd::Shutdown(ack)) => {
+                        let _ = ack.send(());
+                        return false;
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+    }
 }
 
 /// Start the worker thread: probe the portal, create a session, and stream
@@ -378,17 +582,25 @@ pub fn spawn(
 ) -> tokio::sync::mpsc::UnboundedSender<Cmd> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
+        let mut cmd_rx = cmd_rx;
         // Current-thread runtime: zbus is pinned tokio-mode workspace-wide,
         // and only async zbus can bound signal waits (see portal.rs).
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            Ok(rt) => match detect_backend(Duration::from_secs(20)) {
-                Backend::Portal => rt.block_on(worker(events, rebind_on_start, cmd_rx)),
-                Backend::KGlobalAccel => rt.block_on(kglobalaccel::worker(events, cmd_rx)),
-                Backend::Unsupported => rt.block_on(unsupported(events, cmd_rx)),
-            },
+            Ok(rt) => {
+                // Before the backend, too: the desktop's variables arrive
+                // with the display, and kglobalaccel needs the display.
+                if !rt.block_on(wait_for_session(&events, &mut cmd_rx, true)) {
+                    return;
+                }
+                match detect_backend(Duration::from_secs(20)) {
+                    Backend::Portal => rt.block_on(worker(events, rebind_on_start, cmd_rx)),
+                    Backend::KGlobalAccel => rt.block_on(kglobalaccel::worker(events, cmd_rx)),
+                    Backend::Unsupported => rt.block_on(unsupported(events, cmd_rx)),
+                }
+            }
             Err(e) => {
                 eprintln!("[hushmic] global-shortcuts worker could not start: {e}");
                 let _ = events.send(PortalEvent::Unavailable);
@@ -441,6 +653,12 @@ async fn worker(
                 return;
             }
             Some(_) => {}
+        }
+        // The portal also goes when the session ends (logout under a
+        // lingering unit): reconnecting then would wake it without a
+        // display again.
+        if !wait_for_session(&events, &mut cmds, false).await {
+            return;
         }
     }
 }
@@ -945,6 +1163,90 @@ mod tests {
             choose_backend(false, Some("ubuntu:kde"), Some("5"), None),
             KGlobalAccel
         );
+    }
+
+    #[test]
+    fn the_portal_waits_for_the_display() {
+        let env = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let up = |p: &Path| {
+            p == Path::new("/run/user/1000/wayland-0") || p == Path::new("/tmp/.X11-unix/X0")
+        };
+        let down = |_: &Path| false;
+        let early = env(&["HOME=/home/u", "XDG_RUNTIME_DIR=/run/user/1000"]);
+        let wayland = env(&[
+            "XDG_RUNTIME_DIR=/run/user/1000",
+            "WAYLAND_DISPLAY=wayland-0",
+        ]);
+        let x11 = env(&["DISPLAY=:0"]);
+        let unset = env(&["DISPLAY=", "WAYLAND_DISPLAY="]);
+        let ready =
+            |own, sd, e: Option<&Vec<String>>| session_ready(own, sd, e.map(|v| &v[..]), up);
+        // the unit at login (#26): not before the desktop exported it
+        assert!(!ready(false, true, Some(&early)));
+        assert!(ready(false, true, Some(&wayland)));
+        assert!(ready(false, true, Some(&x11)));
+        assert!(!ready(false, true, Some(&unset)));
+        // our copy of the manager's environment says nothing about now
+        assert!(!ready(true, true, Some(&early)));
+        // launched by the desktop: its display is there
+        assert!(ready(true, false, Some(&early)));
+        // SSH shell: the manager decides
+        assert!(!ready(false, false, Some(&early)));
+        assert!(ready(false, false, Some(&wayland)));
+        // no systemd to ask (sandbox, other init): as before, go ahead
+        assert!(ready(false, true, None));
+        assert!(ready(false, false, None));
+        // after logout under a lingering unit: the variables stay, the
+        // sockets are gone
+        assert!(!session_ready(false, true, Some(&wayland), down));
+        assert!(!session_ready(false, true, Some(&x11), down));
+    }
+
+    #[test]
+    fn displays_resolve_to_their_sockets() {
+        let env = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let probe = |p: &Path| {
+            seen.borrow_mut().push(p.to_path_buf());
+            true
+        };
+        assert!(has_display(&env(&["WAYLAND_DISPLAY=/tmp/wl"]), probe));
+        assert!(has_display(
+            &env(&["XDG_RUNTIME_DIR=/run/user/7", "WAYLAND_DISPLAY=wayland-1"]),
+            probe
+        ));
+        assert!(has_display(&env(&["DISPLAY=:1.0"]), probe));
+        assert!(has_display(&env(&["DISPLAY=unix:2"]), probe));
+        assert_eq!(
+            *seen.borrow(),
+            [
+                "/tmp/wl",
+                "/run/user/7/wayland-1",
+                "/tmp/.X11-unix/X1",
+                "/tmp/.X11-unix/X2"
+            ]
+            .map(PathBuf::from)
+        );
+        // remote X: nothing local to look at
+        assert!(has_display(&env(&["DISPLAY=box:0"]), |_: &Path| false));
+        assert_eq!(x11_socket("box:0"), None);
+        assert_eq!(x11_socket(":x"), None);
+    }
+
+    #[test]
+    fn env_value_reads_set_variables_only() {
+        let env: Vec<String> = [
+            "XDG_CURRENT_DESKTOP=KDE",
+            "KDE_SESSION_VERSION=",
+            "DISPLAYX=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(env_value(&env, "XDG_CURRENT_DESKTOP"), Some("KDE"));
+        assert_eq!(env_value(&env, "KDE_SESSION_VERSION"), None);
+        assert_eq!(env_value(&env, "DISPLAY"), None);
+        assert!(!has_display(&env, |_: &Path| true));
     }
 
     #[test]

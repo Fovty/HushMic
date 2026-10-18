@@ -64,13 +64,14 @@ The generated unit records the executable path. If you move the AppImage or the 
 
 ### Flatpak
 
-The Flatpak cannot write host units. Create `~/.config/systemd/user/hushmic.service` on the host yourself. Stopping goes through `hushmic quit` because the unit's main process is the sandbox launcher, not HushMic:
+The Flatpak cannot write host units. Create `~/.config/systemd/user/hushmic.service` on the host yourself. Stopping goes through `hushmic quit` because the unit's main process is the sandbox launcher, not HushMic. This unit starts with the graphical session, not at `default.target`: from inside the sandbox HushMic cannot tell when the desktop is up, and asking the desktop portal for shortcuts before that breaks the portal for the whole session:
 
 ```ini
 [Unit]
 Description=HushMic noise-suppression virtual microphone
-After=pipewire.service wireplumber.service
+After=graphical-session.target pipewire.service wireplumber.service
 Wants=pipewire.service
+PartOf=graphical-session.target
 
 [Service]
 ExecStart=flatpak run io.github.fovty.HushMic --headless
@@ -80,7 +81,7 @@ RestartSec=3
 TimeoutStopSec=10
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 ```
 
-Then `systemctl --user daemon-reload` and `systemctl --user enable --now hushmic.service`. Turn the Flatpak's own autostart off first (`flatpak run io.github.fovty.HushMic config set autostart false`). This needs a Flatpak built from a release with headless support.
+Then `systemctl --user daemon-reload` and `systemctl --user enable --now hushmic.service`. Turn the Flatpak's own autostart off first (`flatpak run io.github.fovty.HushMic config set autostart false`). This needs a Flatpak built from a release with headless support. Desktops that do not start `graphical-session.target` (Cinnamon, Xfce, MATE, LXQt) never start this unit; use the autostart entry there.
