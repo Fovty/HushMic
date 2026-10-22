@@ -49,6 +49,15 @@
   </screenshots>
 
   <releases>
+    <release version="0.11.0" date="2026-10-23">
+      <description>
+        <p>
+          The native engine now runs DPDFNet's final W7A8 runtime, which
+          uses AVX-VNNI where the CPU has it: up to 44 % less CPU than
+          before on recent Intel CPUs, with unchanged quality.
+        </p>
+      </description>
+    </release>
     <release version="0.10.4" date="2026-10-18">
       <description>
         <p>
