@@ -136,7 +136,7 @@ Three clips are not a formal benchmark, but the source audio is public. Method, 
 
 **Does my audio go anywhere?** No. Everything runs on the CPU and nothing is uploaded.
 
-**How much latency and CPU?** 80 ms of processing (10 ms framing, 40 ms model context, 30 ms scheduling margin) plus PipeWire's own buffering. On PipeWire 1.6 and later the latency is reported to the graph, so apps like OBS can compensate. On CPUs with AVX2 (most Intel Core and AMD Ryzen CPUs since 2015) the models run on a native engine that needs roughly half the CPU of ONNX Runtime. CPUs without it, including many older Pentium, Celeron and Atom chips, use ONNX Runtime: there the quality model takes about a third of a fast desktop core and more than a whole core on slow chips, where HushMic runs the cheaper light model on its own.
+**How much latency and CPU?** 80 ms of processing plus PipeWire's own buffering; on PipeWire 1.6 and later apps like OBS can compensate for it. On CPUs with AVX2 and FMA (most Intel Core and AMD Ryzen CPUs since 2015) a native engine runs the models in under half the CPU ONNX Runtime needs, and in about a quarter to a third on CPUs with AVX-VNNI. Other CPUs, including many older Pentium, Celeron and Atom chips, use ONNX Runtime, and on slow ones HushMic runs the light model on its own. Details: [docs/troubleshooting.md](docs/troubleshooting.md#latency-and-cpu).
 
 **No tray icon on GNOME?** Install the *AppIndicator and KStatusNotifierItem Support* extension. HushMic keeps running without it.
 

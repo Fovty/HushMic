@@ -673,7 +673,7 @@ pub fn parse_engine_line(line: &[u8]) -> Option<EngineTier> {
 
 /// What the plugin runs one model on (issue #18), from its contract line
 /// `[dpdfnet-ladspa] inference: <engine>[ (<reason>)] for <model>`, e.g.
-/// `native int8` or `onnx (native weights not installed (...))`.
+/// `native w7a8 avx2` or `onnx (native weights not installed (...))`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inference {
     pub model: String,
@@ -900,11 +900,11 @@ mod tests {
     fn inference_lines_parse_with_and_without_a_reason() {
         assert_eq!(
             parse_inference_line(
-                b"[dpdfnet-ladspa] inference: native int8 for dpdfnet8_48khz_hr\n"
+                b"[dpdfnet-ladspa] inference: native w7a8 avx2 for dpdfnet8_48khz_hr\n"
             ),
             Some(Inference {
                 model: "dpdfnet8_48khz_hr".into(),
-                engine: "native int8".into(),
+                engine: "native w7a8 avx2".into(),
                 reason: None,
             })
         );
@@ -921,16 +921,16 @@ mod tests {
         );
         // A reason may itself say "for".
         let i = parse_inference_line(
-            b"[dpdfnet-ladspa] inference: onnx (CPU lacks AVX2/FMA for native int8) for m\n",
+            b"[dpdfnet-ladspa] inference: onnx (CPU lacks AVX2/FMA for the native engine) for m\n",
         )
         .unwrap();
         assert_eq!(
             i.reason.as_deref(),
-            Some("CPU lacks AVX2/FMA for native int8")
+            Some("CPU lacks AVX2/FMA for the native engine")
         );
         assert_eq!(
             i.to_string(),
-            "onnx (CPU lacks AVX2/FMA for native int8) for m"
+            "onnx (CPU lacks AVX2/FMA for the native engine) for m"
         );
         // A model id with spaces, or with "for" in it.
         let i = parse_inference_line(
@@ -942,17 +942,18 @@ mod tests {
             i.reason.as_deref(),
             Some("no native build of this model file")
         );
-        let i = parse_inference_line(b"[dpdfnet-ladspa] inference: native int8 for a b\n").unwrap();
+        let i = parse_inference_line(b"[dpdfnet-ladspa] inference: native w7a8 avx2 for a b\n")
+            .unwrap();
         assert_eq!(
             (i.engine.as_str(), i.model.as_str()),
-            ("native int8", "a b")
+            ("native w7a8 avx2", "a b")
         );
         for torn in [
-            &b"[dpdfnet-ladspa] inference: native int8"[..],
-            b"[dpdfnet-ladspa] inference: native int8 for \n",
+            &b"[dpdfnet-ladspa] inference: native w7a8 avx2"[..],
+            b"[dpdfnet-ladspa] inference: native w7a8 avx2 for \n",
             b"[dpdfnet-ladspa] inference: onnx (no close for m\n",
             b"[dpdfnet-ladspa] engine: quality (cost 0.42)\n",
-            b"inference: native int8 for m\n",
+            b"inference: native w7a8 avx2 for m\n",
         ] {
             assert_eq!(
                 parse_inference_line(torn),
@@ -963,14 +964,14 @@ mod tests {
         }
         // The two contracts never read each other's lines.
         assert_eq!(
-            parse_engine_line(b"[dpdfnet-ladspa] inference: native int8 for m\n"),
+            parse_engine_line(b"[dpdfnet-ladspa] inference: native w7a8 avx2 for m\n"),
             None
         );
     }
 
     #[test]
     fn the_log_keeps_each_models_last_inference_line() {
-        let log = "[dpdfnet-ladspa] inference: native int8 for q\n\
+        let log = "[dpdfnet-ladspa] inference: native w7a8 avx2 for q\n\
                    [dpdfnet-ladspa] inference: onnx (requested) for l\n\
                    [dpdfnet-ladspa] engine: quality (cost 0.30)\n\
                    [dpdfnet-ladspa] inference: onnx (requested) for q\n";
@@ -987,25 +988,25 @@ mod tests {
         r.inference = Some(vec![
             Inference {
                 model: "dpdfnet8_48khz_hr".into(),
-                engine: "native int8".into(),
+                engine: "native w7a8 avx2".into(),
                 reason: None,
             },
             Inference {
                 model: "dpdfnet2_48khz_hr".into(),
                 engine: "onnx".into(),
-                reason: Some("CPU lacks AVX2/FMA for native int8".into()),
+                reason: Some("CPU lacks AVX2/FMA for the native engine".into()),
             },
         ]);
         let (text, problems) = render(&r);
         assert_eq!(problems, 0, "{text}");
         assert!(text.contains("  inference: auto\n"), "{text}");
         assert!(
-            text.contains("inference: native int8 for dpdfnet8_48khz_hr\n"),
+            text.contains("inference: native w7a8 avx2 for dpdfnet8_48khz_hr\n"),
             "{text}"
         );
         assert!(
             text.contains(
-                "inference: onnx (CPU lacks AVX2/FMA for native int8) for dpdfnet2_48khz_hr\n"
+                "inference: onnx (CPU lacks AVX2/FMA for the native engine) for dpdfnet2_48khz_hr\n"
             ),
             "{text}"
         );
@@ -1518,11 +1519,11 @@ mod tests {
             engine: engine.into(),
             reason: None,
         };
-        store_inference(live, line("native int8"));
-        assert_eq!(inference_for("q"), Some(line("native int8")));
+        store_inference(live, line("native w7a8 avx2"));
+        assert_eq!(inference_for("q"), Some(line("native w7a8 avx2")));
         assert_eq!(inference_for("l"), None);
         store_inference(new_gen, line("onnx"));
-        assert_eq!(inference_for("q"), Some(line("native int8")));
+        assert_eq!(inference_for("q"), Some(line("native w7a8 avx2")));
         let next = new_engine_generation();
         assert_eq!(inference_for("q"), None, "a new chain starts unreported");
         store_inference(live, line("onnx"));

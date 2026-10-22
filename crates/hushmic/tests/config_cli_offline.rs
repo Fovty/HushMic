@@ -73,7 +73,7 @@ fn config_set_and_get_work_on_the_file_without_a_daemon() {
     assert_eq!(code, 0);
     assert!(out.starts_with("tray = false"), "{out}");
     // inference: auto | onnx; the native engines are not settings.
-    let (code, _, err) = run(&home, &["config", "set", "inference", "native-int8"]);
+    let (code, _, err) = run(&home, &["config", "set", "inference", "native"]);
     assert_eq!(code, 1);
     assert!(err.contains("auto or onnx"), "{err}");
     let (code, out, err) = run(&home, &["config", "set", "inference", "onnx"]);

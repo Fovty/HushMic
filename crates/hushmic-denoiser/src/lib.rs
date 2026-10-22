@@ -23,8 +23,9 @@
 //!   your own `ort` linking strategy instead.
 //!
 //! The optional `native` feature adds the DPDFNet authors' C runtime as a
-//! second engine (INT8 on x86-64 CPUs with AVX2 and FMA, about half the CPU
-//! per hop); see `Denoiser::from_file_with`. ONNX stays the fallback.
+//! second engine (8-bit matrix math on x86-64 CPUs with AVX2 and FMA, about
+//! half the CPU per hop); see `Denoiser::from_file_with`. ONNX stays the
+//! fallback.
 
 mod attn;
 mod denoiser;

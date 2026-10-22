@@ -1,0 +1,13 @@
+/* Shared kernels call the corresponding VNNI assembly specialization. */
+#undef dpdf_qdot64_fixed_avx2
+#define dpdf_qdot64_fixed_avx2 dpdf_qdot64_fixed_vnni
+#undef dpdf_qdot4pair64_avx2
+#define dpdf_qdot4pair64_avx2 dpdf_qdot4pair64_vnni
+#undef dpdf_qdot4pair96_avx2
+#define dpdf_qdot4pair96_avx2 dpdf_qdot4pair96_vnni
+#undef dpdf_qaffine64_fused_avx2
+#define dpdf_qaffine64_fused_avx2 dpdf_qaffine64_fused_vnni
+#undef dpdf_qaffine256_fused_avx2
+#define dpdf_qaffine256_fused_avx2 dpdf_qaffine256_fused_vnni
+#undef dpdf_qaffine4pair64_fused_avx2
+#define dpdf_qaffine4pair64_fused_avx2 dpdf_qaffine4pair64_fused_vnni

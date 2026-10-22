@@ -88,9 +88,22 @@ hushmic devices [--json]       microphones you can pass as `mic`
 hushmic service install|uninstall   see headless.md
 ```
 
-`status`, `mode`, `toggle` and `quit` talk to the running instance over a socket. Exit codes: 0 ok, 1 invalid usage or a failed command, 2 HushMic is not running. The `engine:` line in `status` (`quality model`, `light model`, `passthrough`; the JSON field `engine`) says which engine the chain is running right now: under CPU pressure HushMic falls back to the light model or to unfiltered audio and climbs back later, see [troubleshooting.md](troubleshooting.md#latency-and-cpu). The `chain:` line reads `running, idle (not processing audio right now)` while PipeWire has paused the filter chain because nothing is reading from it; in `status --json`, `chain.node_state` is PipeWire's state for HushMic's virtual microphone (`running`, `idle`, `suspended`) and `chain.idle` is `true` for `idle` and `suspended`, both `null` while unknown or with the chain off.
+`status`, `mode`, `toggle` and `quit` talk to the running instance over a socket. Exit codes: 0 ok, 1 invalid usage or a failed command, 2 HushMic is not running. `toggle mute` twice returns you to the state you came from, so one key can serve as a mute button.
 
-`config set` applies the change immediately while HushMic runs and writes it to the file otherwise, with the same validation either way. `model` and `attn_limit` follow the menu's rule: `config get` shows the settings in effect and `config set` changes them where the menu would (the microphone's own settings, or the defaults). Without a running instance they refer to the microphone HushMic would start with. `status` names whose settings they are, for example `strength: 100 dB (RODE NT-USB profile)` or `(defaults)`; in `status --json`, `model` and `attn_limit` are the values in effect, `profile` is the node name of the microphone they belong to (`null` for the defaults), `defaults` holds the default `model` and `attn_limit`, and `inference` says what the running model runs on (`engine` is `native int8` or `onnx`, `reason` says why ONNX runs, `null` while nothing is reported). `config` and `config get` read the running instance's settings when there is one, else the file. `toggle mute` twice returns you to the state you came from, so one key can serve as a mute button.
+What `status` shows:
+
+- `engine:` is what the chain runs right now: `quality model`, `light model` or `passthrough`, followed by the inference engine, for example `quality model (native w7a8 avx2)`. Under CPU pressure HushMic falls back to the light model or to unfiltered audio and climbs back later, see [troubleshooting.md](troubleshooting.md#latency-and-cpu).
+- `chain:` reads `running, idle (not processing audio right now)` while PipeWire has paused the filter chain because nothing is reading from it.
+- `model:` and `strength:` show the settings in effect and whose they are, for example `strength: 100 dB (RODE NT-USB profile)` or `(defaults)`.
+
+In `status --json`:
+
+- `engine` is `quality`, `light` or `passthrough`.
+- `inference` says what the running model runs on: `engine` is `native w7a8 avx2`, `native w7a8 avx-vnni` or `onnx`, and `reason` says why ONNX runs. It is `null` while nothing is reported.
+- `model` and `attn_limit` are the values in effect, `profile` is the node name of the microphone they belong to (`null` for the defaults), and `defaults` holds the default `model` and `attn_limit`.
+- `chain.node_state` is PipeWire's state for HushMic's virtual microphone (`running`, `idle`, `suspended`), and `chain.idle` is `true` for `idle` and `suspended`. Both are `null` while unknown or with the chain off.
+
+`config set` applies the change immediately while HushMic runs and writes it to the file otherwise, with the same validation either way. `config` and `config get` read the running instance's settings when there is one, else the file. `model` and `attn_limit` follow the menu's rule: `config get` shows the settings in effect and `config set` changes them where the menu would (the microphone's own settings, or the defaults). Without a running instance they refer to the microphone HushMic would start with.
 
 ## Configuration
 
@@ -110,7 +123,7 @@ The file is `~/.config/hushmic/config.toml` (`hushmic config path` prints the ex
 
 Booleans also accept `on`/`off`, `yes`/`no` and `1`/`0`. `tray = false` hides the icon; a plain `hushmic` launch still opens the window, so use `--headless` when you want neither.
 
-`tray_icon = auto` picks the monochrome icons on KDE and GNOME and the colored ones everywhere else, because those two desktops recolor a monochrome panel icon to match their theme. `color` and `symbolic` pin the choice if you prefer the other set. HushMic only names the icon it wants; the desktop draws it, so the monochrome one follows your panel from light to dark on its own. The change applies while HushMic runs, with no restart. `symbolic` on a desktop that does not recolor panel icons (LXQt, for example) can come out near-black on a dark panel, which is why `auto` leaves those on the colored set. If the monochrome files are not installed (an older package, a plain `cargo build`), the desktop falls back to the colored icon.
+`tray_icon = auto` picks the monochrome icons on KDE and GNOME, which recolor them to match the panel, and the colored ones everywhere else. `color` and `symbolic` pin the choice. `symbolic` on a desktop that does not recolor panel icons (LXQt, for example) can come out near-black on a dark panel. If the monochrome files are not installed (an older package, a plain `cargo build`), the desktop shows the colored icon.
 
 `inference = auto` runs the models on the native engine where the CPU supports it (x86-64 with AVX2 and FMA) and its weight files are installed, and on ONNX Runtime otherwise. `onnx` always uses ONNX Runtime. A change restarts the filter chain, which takes a moment. `hushmic status` shows the engine in use.
 

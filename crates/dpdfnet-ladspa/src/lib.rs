@@ -138,14 +138,24 @@ pub fn inference_from(value: Option<&str>) -> Result<hushmic_denoiser::Inference
     use hushmic_denoiser::Inference;
     match value.unwrap_or("") {
         "" => Ok(Inference::Auto),
-        w => Inference::parse(w).ok_or_else(|| {
-            format!("HUSHMIC_INFERENCE={w} is not auto, onnx, native-int8 or native-fp32")
-        }),
+        w => Inference::parse(w)
+            .ok_or_else(|| format!("HUSHMIC_INFERENCE={w} is not auto, onnx or native")),
     }
 }
 
-/// The inference contract line for one model: `inference: native int8 for
-/// <model>` or `inference: onnx (<reason>) for <model>`. The app parses it
+/// What a loaded denoiser runs on, as the contract line names it: `onnx`,
+/// or `native w7a8` plus the kernel set the runtime picked (`avx-vnni` or
+/// `avx2`). No parentheses: those hold the reason ONNX runs.
+#[cfg(feature = "native")]
+pub fn engine_label(d: &Denoiser) -> String {
+    match d.native_kernels() {
+        Some(kernels) => format!("{} {kernels}", d.engine()),
+        None => d.engine().to_string(),
+    }
+}
+
+/// The inference contract line for one model: `inference: native w7a8 avx2
+/// for <model>` or `inference: onnx (<reason>) for <model>`. The app parses it
 /// for `status` and `--doctor`; it must never start with `engine: `, which
 /// is the tier contract.
 pub fn inference_line(model: &str, engine: &str, reason: Option<&str>) -> String {
@@ -160,7 +170,7 @@ fn model_name(path: &std::path::Path) -> &str {
 }
 
 /// Load one model on the engine `HUSHMIC_INFERENCE` asks for (default
-/// auto: native INT8 where the CPU and the installed weights allow it).
+/// auto: native where the CPU and the installed weights allow it).
 /// Every native failure falls back to ONNX; one contract line per model
 /// says what runs and, for ONNX, why.
 #[cfg(feature = "native")]
@@ -187,11 +197,7 @@ pub fn load_denoiser_with(
         (None, None, Inference::Onnx) => Some("requested"),
         (None, None, _) => None,
     };
-    log::contract_line(&inference_line(
-        model_name(path),
-        &d.engine().to_string(),
-        reason,
-    ));
+    log::contract_line(&inference_line(model_name(path), &engine_label(&d), reason));
     Ok(d)
 }
 
@@ -666,8 +672,8 @@ mod tests {
     #[test]
     fn inference_lines_never_look_like_the_tier_contract() {
         assert_eq!(
-            inference_line("dpdfnet8_48khz_hr", "native int8", None),
-            "inference: native int8 for dpdfnet8_48khz_hr"
+            inference_line("dpdfnet8_48khz_hr", "native w7a8 avx-vnni", None),
+            "inference: native w7a8 avx-vnni for dpdfnet8_48khz_hr"
         );
         assert_eq!(
             inference_line("dpdfnet2_48khz_hr", "onnx", Some("requested")),
@@ -678,13 +684,22 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
+    #[allow(deprecated)]
     fn inference_env_words() {
         use hushmic_denoiser::Inference;
         assert_eq!(inference_from(None), Ok(Inference::Auto));
         assert_eq!(inference_from(Some("")), Ok(Inference::Auto));
         assert_eq!(inference_from(Some("onnx")), Ok(Inference::Onnx));
+        assert_eq!(inference_from(Some("native")), Ok(Inference::NativeInt8));
+        // Earlier words keep starting the chain: native-int8 and
+        // native-w7a8 are the native engine, native-fp32 runs ONNX and says
+        // why.
         assert_eq!(
             inference_from(Some("native-int8")),
+            Ok(Inference::NativeInt8)
+        );
+        assert_eq!(
+            inference_from(Some("native-w7a8")),
             Ok(Inference::NativeInt8)
         );
         assert_eq!(

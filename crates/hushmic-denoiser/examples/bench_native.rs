@@ -1,7 +1,7 @@
 //! Dev probe (feature `native`): load time and full Denoiser hop cost
-//! (STFT + model + iSTFT) per engine — ONNX, native fp32 and native int8 —
-//! for both models. Rounds rotate the engine order so drift (thermal,
-//! neighbours) spreads evenly. One `load ...` and one `bench ...` line per
+//! (STFT + model + iSTFT) per engine — ONNX and native — for both models.
+//! Rounds rotate the engine order so drift (thermal, neighbours) spreads
+//! evenly. One `load ...` and one `bench ...` line per
 //! model and engine, for scripts.
 //!
 //! Env: HUSHMIC_MODEL_DIR (default: the repo's assets/models, which holds
@@ -47,11 +47,7 @@ fn main() {
         Err(_) => (0..HOP).map(|i| ((i as f32) * 0.37).sin() * 0.1).collect(),
     };
 
-    let engines = [
-        Inference::Onnx,
-        Inference::NativeFp32,
-        Inference::NativeInt8,
-    ];
+    let engines = [Inference::Onnx, Inference::NativeInt8];
     for model in models.split(',') {
         let path = model_dir.join(format!("{model}.onnx"));
         let mut dens: Vec<(Inference, Denoiser)> = engines

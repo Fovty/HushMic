@@ -577,7 +577,7 @@ mod tests {
         }
         // The native engines are debugging overrides (HUSHMIC_INFERENCE),
         // not settings.
-        let e = parse_value(Key::Inference, "native-int8", &md).unwrap_err();
+        let e = parse_value(Key::Inference, "native", &md).unwrap_err();
         assert!(e.contains("auto or onnx"), "{e}");
         assert!(parse_value(Key::Enabled, "true", &md).is_err());
     }

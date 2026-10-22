@@ -1,0 +1,11 @@
+{
+  global:
+    dpdfnet_get_model_info;
+    dpdfnet_cpu_supported;
+    dpdfnet_create;
+    dpdfnet_init_state;
+    dpdfnet_process;
+    dpdfnet_owned_bytes;
+    dpdfnet_destroy;
+  local: *;
+};

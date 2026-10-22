@@ -3,7 +3,8 @@
 # ubuntu:22.04). Artifacts inherit the BUILD host's glibc requirement: built on
 # a newer base, every artifact — tarball, .deb, even the "self-contained"
 # AppImage — refuses to run on Ubuntu 22.04 / Debian 12 / RHEL 9. Both
-# workflows run this after building.
+# workflows run this after building. It also checks that the plugin loads
+# and carries the native engine's AVX-VNNI kernels.
 set -euo pipefail
 
 FLOOR="${1:-2.35}"
@@ -28,4 +29,14 @@ done
 # The same builds must load: imports only from glibc/libgcc, LADSPA-only
 # exports (the native engine's C linked in, not left undefined).
 bash "$REPO_ROOT/scripts/check-plugin-symbols.sh" "$REPO_ROOT/target/release/libdpdfnet_ladspa.so" || fail=1
+# Release plugins carry the native engine's AVX-VNNI kernels. build.rs
+# leaves them out (with a warning) when the compiler or assembler cannot
+# build them; a release must not ship AVX2-only by accident.
+vnni="$(objdump -d --no-show-raw-insn "$REPO_ROOT/target/release/libdpdfnet_ladspa.so" | grep -c vpdpbusd || true)"
+if [ "$vnni" -gt 0 ]; then
+  echo "libdpdfnet_ladspa.so: AVX-VNNI kernels present ($vnni vpdpbusd)"
+else
+  echo "error: libdpdfnet_ladspa.so has no AVX-VNNI kernels (no vpdpbusd); the toolchain could not build them" >&2
+  fail=1
+fi
 exit "$fail"

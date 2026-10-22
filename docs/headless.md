@@ -39,6 +39,8 @@ systemctl --user status hushmic.service
 
 The status should say active. If it exited at once, a tray instance was still running.
 
+The unit starts before the desktop is up. The virtual mic works right away; global shortcuts wait until you are logged in to the desktop.
+
 To start at boot before you log in:
 
 ```bash

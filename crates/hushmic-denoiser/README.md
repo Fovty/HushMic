@@ -68,11 +68,16 @@ ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 
 ## Native engine (optional)
 
-The `native` feature adds a second engine: the DPDFNet authors' C
-runtime, included in this crate (`native/`) and compiled by `build.rs`, so
-it needs a C compiler. On x86-64 CPUs with AVX2 and FMA it runs the models
-with 8-bit matrix math in roughly half the CPU time of ONNX Runtime, with
-no measurable difference in quality.
+The `native` feature adds a second engine: the DPDFNet authors' optimized
+C runtime, included in this crate (`native/`) and compiled by `build.rs`.
+It is x86-64 Linux only and needs a C compiler that also assembles `.S`
+files; upstream tests GCC only, and a clang build prints a warning. The
+AVX-VNNI kernels are built only when the toolchain supports them (GCC 11
+and binutils 2.36 or newer), otherwise the AVX2 kernels run everywhere.
+On CPUs with AVX2 and FMA it runs the models with W7A8 matrix math (7-bit
+weights, 8-bit activations; AVX-VNNI where the CPU has it) in under half
+the CPU time of ONNX Runtime, and about a quarter to a third with AVX-VNNI. Its output agrees with ONNX's to about 35
+to 39 dB (waveform SNR).
 
 ```toml
 hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.4", features = ["native"] }
@@ -82,19 +87,21 @@ hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.10.4", 
 use hushmic_denoiser::{Denoiser, Inference};
 
 let denoiser = Denoiser::from_file_with("dpdfnet8_48khz_hr.onnx", Inference::Auto)?;
-println!("running on {}", denoiser.engine()); // "native int8" or "onnx"
+println!("running on {}", denoiser.engine()); // "native w7a8" or "onnx"
+println!("kernels: {:?}", denoiser.native_kernels()); // Some("avx2"), Some("avx-vnni") or None
 ```
 
-The engine needs the model's packed weights, `<model>.weights.f32`, in the
-same directory as the `.onnx` file. They come from the DPDFNet repository
-at the commit the C sources are taken from, and every HushMic release
-since 0.10.0 attaches the same files (`<model>.weights.f32`, listed in its
-`sha256sums.txt`); `scripts/setup-assets.sh` in the HushMic repository
-downloads and verifies them. The model file itself
-is still needed: it identifies the model, and ONNX Runtime is the fallback
-whenever the native engine cannot run (no AVX2, missing or damaged
-weights, an unrecognized model file). `Denoiser::fallback_reason` says
-why. `Inference::NativeFp32` is also available for comparisons.
+The engine needs the model's packed weights, `<model>.weights.f32`, next
+to the `.onnx` file. Every HushMic release since 0.10.0 attaches them
+(listed in `sha256sums.txt`), and `scripts/setup-assets.sh` in the HushMic
+repository downloads and verifies them. The `.onnx` file is still needed:
+it identifies the model, and ONNX Runtime takes over whenever the native
+engine cannot run (no AVX2/FMA, missing or damaged weights, an
+unrecognized model file); `Denoiser::fallback_reason` says why. The thread
+that processes audio needs at least 1 MiB of stack (a spawned Rust thread
+has 2 MiB). `Inference::NativeInt8` asks for the native engine explicitly
+(the name is from the earlier INT8 runtime); `Inference::NativeFp32` is
+deprecated and runs ONNX.
 
 ## Example
 

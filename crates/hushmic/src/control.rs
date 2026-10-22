@@ -201,7 +201,7 @@ pub fn live_model(
 }
 
 /// The human wording of the engine line, e.g. `quality model (native
-/// int8)` or `light model (fallback, onnx)`.
+/// w7a8)` or `light model (fallback, onnx)`.
 fn engine_words(
     tier: EngineTier,
     configured_light: bool,
@@ -749,15 +749,15 @@ mod tests {
     #[test]
     fn status_names_the_inference_engine_of_the_live_tier() {
         let mut s = demo_status();
-        s.inference = Some(inference("native int8", None));
+        s.inference = Some(inference("native w7a8 avx2", None));
         assert!(
-            render_status_human(&s).contains("engine: quality model (native int8)\n"),
+            render_status_human(&s).contains("engine: quality model (native w7a8 avx2)\n"),
             "{}",
             render_status_human(&s)
         );
         let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();
         assert_eq!(v["engine"], "quality");
-        assert_eq!(v["inference"]["engine"], "native int8");
+        assert_eq!(v["inference"]["engine"], "native w7a8 avx2");
         assert_eq!(v["inference"]["model"], "dpdfnet8_48khz_hr");
         assert!(v["inference"]["reason"].is_null());
         s.engine = Some(EngineTier::Light);
@@ -769,8 +769,8 @@ mod tests {
         assert!(render_status_human(&s).contains("engine: passthrough (fallback)\n"));
         // Before the first tier line: the engine alone, like --json.
         s.engine = None;
-        s.inference = Some(inference("native int8", None));
-        assert!(render_status_human(&s).contains("engine: native int8\n"));
+        s.inference = Some(inference("native w7a8 avx2", None));
+        assert!(render_status_human(&s).contains("engine: native w7a8 avx2\n"));
         s.chain_running = false;
         assert!(!render_status_human(&s).contains("engine:"));
         let v: serde_json::Value = serde_json::from_str(&render_status_json(&s)).unwrap();

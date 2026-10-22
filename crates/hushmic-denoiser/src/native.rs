@@ -1,20 +1,24 @@
-//! Native inference engine (feature `native`): the DPDFNet authors' C
-//! runtime, vendored under native/ and compiled by build.rs. It has the
-//! same one-hop contract as the ONNX graph — `spec` `[481,2]` interleaved
-//! plus `state_in` in, `spec_e` plus `state_out` out — so everything around
-//! the model is untouched.
+//! Native inference engine (feature `native`): the DPDFNet authors'
+//! optimized C runtime (W7A8: 7-bit weights, 8-bit activations), vendored
+//! under native/ and compiled by build.rs. It has the same one-hop contract
+//! as the ONNX graph — `spec` `[481,2]` interleaved plus `state_in` in,
+//! `spec_e` plus `state_out` out — so everything around the model is
+//! untouched.
 //!
-//! Only the versioned C API is bound: `<model>_get_api(1)` returns an
-//! immutable function table. The generated C is specific to one exported
-//! ONNX graph, so a model file is recognized by its SHA-256 (the export the
-//! C was generated from, recorded in the vendored manifest), and the packed
-//! weights next to it must hash to the value the table carries. Every
-//! mismatch is an `Err` with a reason, which the caller turns into an ONNX
-//! fallback.
+//! The public C API of `dpdfnet.h` (ABI 1) is bound, plus one private
+//! symbol per model, `dpdfnet{8,2}_private_has_avx_vnni`: the predicate
+//! the runtime uses at creation to pick its AVX-VNNI kernels, so the engine
+//! can report which kernel set runs. It is hidden in the static archive,
+//! not exported from the plugin. The runtime is
+//! specific to the exported ONNX graphs it was made from, so a model file is
+//! recognized by its SHA-256 (recorded in the vendored manifests), and the
+//! packed weights next to it must hash to the value the runtime reports.
+//! Every mismatch is an `Err` with a reason, which the caller turns into an
+//! ONNX fallback.
 
 use crate::stft::SPEC_LEN;
 use sha2::{Digest, Sha256};
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, CStr};
 use std::io::Read;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -24,37 +28,44 @@ use std::ptr::NonNull;
 /// [`Denoiser::from_file_with`]: crate::Denoiser::from_file_with
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Inference {
-    /// Native INT8 where the CPU supports it (x86-64 with AVX2 and FMA)
-    /// and the model's weights are installed and intact, otherwise ONNX.
+    /// The native engine where the CPU supports it (x86-64 with AVX2 and
+    /// FMA) and the model's weights are installed and intact, otherwise
+    /// ONNX.
     #[default]
     Auto,
     /// ONNX Runtime only.
     Onnx,
-    /// Native with INT8 matrices (AVX2 and FMA required), else ONNX.
+    /// The native engine (W7A8; the name is kept from the earlier INT8
+    /// runtime), else ONNX.
     NativeInt8,
-    /// Native in full FP32. Mainly for comparisons: without AVX2 it runs
-    /// the portable scalar code, which is slower than ONNX.
+    /// The earlier runtime's full FP32 path. The current runtime has none,
+    /// so this always falls back to ONNX and says why.
+    #[deprecated(note = "the native runtime has no FP32 path; this always runs ONNX")]
     NativeFp32,
 }
 
 impl Inference {
-    /// `auto`, `onnx`, `native-int8` or `native-fp32`.
+    /// `auto`, `onnx` or `native`. The earlier words `native-int8` and
+    /// `native-w7a8` (the native engine) and `native-fp32` are still
+    /// accepted.
+    #[allow(deprecated)]
     pub fn parse(word: &str) -> Option<Inference> {
         Some(match word {
             "auto" => Inference::Auto,
             "onnx" => Inference::Onnx,
-            "native-int8" => Inference::NativeInt8,
+            "native" | "native-int8" | "native-w7a8" => Inference::NativeInt8,
             "native-fp32" => Inference::NativeFp32,
             _ => return None,
         })
     }
 
     /// The word [`Inference::parse`] accepts.
+    #[allow(deprecated)]
     pub fn word(self) -> &'static str {
         match self {
             Inference::Auto => "auto",
             Inference::Onnx => "onnx",
-            Inference::NativeInt8 => "native-int8",
+            Inference::NativeInt8 => "native",
             Inference::NativeFp32 => "native-fp32",
         }
     }
@@ -64,7 +75,10 @@ impl Inference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
     Onnx,
+    /// The native engine (W7A8).
     NativeInt8,
+    /// Never reported by the current runtime.
+    #[deprecated(note = "the native runtime has no FP32 path")]
     NativeFp32,
 }
 
@@ -75,87 +89,138 @@ impl Engine {
 }
 
 impl std::fmt::Display for Engine {
+    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Engine::Onnx => "onnx",
-            Engine::NativeInt8 => "native int8",
+            Engine::NativeInt8 => "native w7a8",
             Engine::NativeFp32 => "native fp32",
         })
     }
 }
 
-// native_api.h
+// dpdfnet.h
 const ABI_VERSION: u32 = 1;
-const PRESET_FP32: u32 = 0;
-const PRESET_INT8_SELECTIVE: u32 = 1;
 
 #[repr(C)]
 struct CModel {
     _opaque: [u8; 0],
 }
 
-/// Mirror of `dpdf_native_api_v1` (frozen layout).
+/// Mirror of `dpdfnet_model_info`.
 #[repr(C)]
-struct ApiV1 {
+struct ModelInfo {
     abi_version: u32,
-    struct_size: u32,
-    model_name: *const c_char,
+    name: *const c_char,
     weights_sha256: *const c_char,
     sample_rate: u32,
-    hop_size: u32,
-    spectrum_size: usize,
-    state_size: usize,
-    weight_count: usize,
-    preset_supported: Option<unsafe extern "C" fn(u32) -> c_int>,
-    create: Option<unsafe extern "C" fn(*const f32, usize, u32) -> *mut CModel>,
-    init_state: Option<unsafe extern "C" fn(*mut f32) -> c_int>,
-    process: Option<
-        unsafe extern "C" fn(*mut CModel, *const f32, *const f32, *mut f32, *mut f32) -> c_int,
-    >,
-    destroy: Option<unsafe extern "C" fn(*mut CModel)>,
-    owned_bytes: Option<unsafe extern "C" fn(*const CModel) -> usize>,
+    hop_samples: u32,
+    spectrum_floats: usize,
+    state_floats: usize,
+    weight_floats: usize,
 }
 
-extern "C" {
-    fn dpdfnet8_48khz_hr_get_api(abi_version: u32) -> *const ApiV1;
-    fn dpdfnet2_48khz_hr_get_api(abi_version: u32) -> *const ApiV1;
+/// `dpdfnet_model_id`, a C enum.
+type ModelId = std::ffi::c_int;
+
+#[cfg(hushmic_native_runtime)]
+mod ffi {
+    use super::{CModel, ModelId, ModelInfo};
+    use std::ffi::c_int;
+    extern "C" {
+        pub fn dpdfnet_get_model_info(id: ModelId) -> *const ModelInfo;
+        pub fn dpdfnet_cpu_supported() -> c_int;
+        pub fn dpdfnet_create(id: ModelId, weights: *const f32, count: usize) -> *mut CModel;
+        pub fn dpdfnet_init_state(id: ModelId, state: *mut f32) -> c_int;
+        pub fn dpdfnet_process(
+            model: *mut CModel,
+            spectrum: *const f32,
+            state: *const f32,
+            output: *mut f32,
+            next_state: *mut f32,
+        ) -> c_int;
+        pub fn dpdfnet_destroy(model: *mut CModel);
+        // Not public API: the predicate each model's quantized matrices use
+        // at creation to pick the AVX-VNNI kernels over the AVX2 ones (0
+        // when the VNNI kernels are not built in). Bound so the engine can
+        // say which kernels really run; a rename upstream fails the link.
+        pub fn dpdfnet8_private_has_avx_vnni() -> c_int;
+        pub fn dpdfnet2_private_has_avx_vnni() -> c_int;
+    }
 }
 
-/// One compiled-in model: its getter and the SHA-256 of the ONNX export
-/// its C code was generated from.
+/// The runtime is x86-64 Linux only; elsewhere no model is available and
+/// the engine is never created.
+#[cfg(not(hushmic_native_runtime))]
+#[allow(clippy::missing_safety_doc)]
+mod ffi {
+    use super::{CModel, ModelId, ModelInfo};
+    use std::ffi::c_int;
+    pub unsafe fn dpdfnet_get_model_info(_: ModelId) -> *const ModelInfo {
+        std::ptr::null()
+    }
+    pub unsafe fn dpdfnet_cpu_supported() -> c_int {
+        0
+    }
+    pub unsafe fn dpdfnet_create(_: ModelId, _: *const f32, _: usize) -> *mut CModel {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn dpdfnet_init_state(_: ModelId, _: *mut f32) -> c_int {
+        -1
+    }
+    pub unsafe fn dpdfnet_process(
+        _: *mut CModel,
+        _: *const f32,
+        _: *const f32,
+        _: *mut f32,
+        _: *mut f32,
+    ) -> c_int {
+        -1
+    }
+    pub unsafe fn dpdfnet_destroy(_: *mut CModel) {}
+    pub unsafe fn dpdfnet8_private_has_avx_vnni() -> c_int {
+        0
+    }
+    pub unsafe fn dpdfnet2_private_has_avx_vnni() -> c_int {
+        0
+    }
+}
+
+/// One compiled-in model: its runtime ID and the SHA-256 of the ONNX
+/// export the runtime was made from.
 struct Registered {
-    get_api: unsafe extern "C" fn(u32) -> *const ApiV1,
+    id: ModelId,
     onnx_sha256: &'static str,
+    has_avx_vnni: fn() -> bool,
 }
 
 const REGISTRY: [Registered; 2] = [
     Registered {
-        get_api: dpdfnet8_48khz_hr_get_api,
+        id: 8,
         onnx_sha256: env!("HUSHMIC_NATIVE_ONNX_SHA256_dpdfnet8_48khz_hr"),
+        // SAFETY: a CPU feature query without arguments.
+        has_avx_vnni: || unsafe { ffi::dpdfnet8_private_has_avx_vnni() != 0 },
     },
     Registered {
-        get_api: dpdfnet2_48khz_hr_get_api,
+        id: 2,
         onnx_sha256: env!("HUSHMIC_NATIVE_ONNX_SHA256_dpdfnet2_48khz_hr"),
+        // SAFETY: a CPU feature query without arguments.
+        has_avx_vnni: || unsafe { ffi::dpdfnet2_private_has_avx_vnni() != 0 },
     },
 ];
 
-/// The checked function table: every entry present, sizes as HushMic's
-/// STFT needs them.
+/// The checked model metadata: sizes as HushMic's STFT needs them.
 struct Api {
+    id: ModelId,
     name: &'static str,
     weights_sha256: &'static str,
     state_size: usize,
     weight_count: usize,
-    preset_supported: unsafe extern "C" fn(u32) -> c_int,
-    create: unsafe extern "C" fn(*const f32, usize, u32) -> *mut CModel,
-    init_state: unsafe extern "C" fn(*mut f32) -> c_int,
-    process: unsafe extern "C" fn(*mut CModel, *const f32, *const f32, *mut f32, *mut f32) -> c_int,
-    destroy: unsafe extern "C" fn(*mut CModel),
 }
 
 fn static_str(p: *const c_char) -> Option<&'static str> {
-    // SAFETY: non-null table strings are C literals that live as long as
-    // the library, which is linked in.
+    // SAFETY: non-null metadata strings are C literals that live as long
+    // as the library, which is linked in.
     (!p.is_null())
         .then(|| unsafe { CStr::from_ptr(p) }.to_str().ok())
         .flatten()
@@ -163,38 +228,34 @@ fn static_str(p: *const c_char) -> Option<&'static str> {
 
 impl Api {
     fn get(r: &Registered) -> Result<Api, String> {
-        // SAFETY: the getter only reads its argument.
-        let raw = unsafe { (r.get_api)(ABI_VERSION) };
-        // SAFETY: non-null means a pointer to the library's static table.
-        let t = unsafe { raw.as_ref() }.ok_or("the native runtime does not offer ABI v1")?;
-        if t.abi_version != ABI_VERSION || (t.struct_size as usize) < std::mem::size_of::<ApiV1>() {
-            return Err(format!(
-                "native ABI mismatch (version {}, table {} bytes)",
-                t.abi_version, t.struct_size
-            ));
+        if !cfg!(hushmic_native_runtime) {
+            return Err("native engine not built for this platform".into());
+        }
+        // SAFETY: a lookup; unknown IDs return NULL.
+        let raw = unsafe { ffi::dpdfnet_get_model_info(r.id) };
+        // SAFETY: non-null means a pointer to the library's static metadata.
+        let t = unsafe { raw.as_ref() }.ok_or("the native runtime does not know this model")?;
+        if t.abi_version != ABI_VERSION {
+            return Err(format!("native ABI mismatch (version {})", t.abi_version));
         }
         if t.sample_rate != crate::SAMPLE_RATE
-            || t.hop_size as usize != crate::HOP
-            || t.spectrum_size != SPEC_LEN
+            || t.hop_samples as usize != crate::HOP
+            || t.spectrum_floats != SPEC_LEN
         {
             return Err(format!(
                 "native model shape mismatch ({} Hz, hop {}, spectrum {})",
-                t.sample_rate, t.hop_size, t.spectrum_size
+                t.sample_rate, t.hop_samples, t.spectrum_floats
             ));
         }
-        let incomplete = || "native function table is incomplete".to_string();
+        let incomplete = || "native model metadata is incomplete".to_string();
         Ok(Api {
-            name: static_str(t.model_name).ok_or_else(incomplete)?,
+            id: r.id,
+            name: static_str(t.name).ok_or_else(incomplete)?,
             weights_sha256: static_str(t.weights_sha256)
                 .filter(|s| s.len() == 64)
                 .ok_or_else(incomplete)?,
-            state_size: t.state_size,
-            weight_count: t.weight_count,
-            preset_supported: t.preset_supported.ok_or_else(incomplete)?,
-            create: t.create.ok_or_else(incomplete)?,
-            init_state: t.init_state.ok_or_else(incomplete)?,
-            process: t.process.ok_or_else(incomplete)?,
-            destroy: t.destroy.ok_or_else(incomplete)?,
+            state_size: t.state_floats,
+            weight_count: t.weight_floats,
         })
     }
 }
@@ -260,25 +321,27 @@ fn read_weights(path: &Path, api: &Api) -> Result<Vec<f32>, String> {
     Ok(weights)
 }
 
-/// One native model instance: owns the C model (weights and scratch
-/// arena). A process call mutates the arena, so it takes `&mut self`.
+/// One native model instance: owns the C context (packed weights and
+/// scratch). A process call mutates the scratch, so it takes `&mut self`.
 pub(crate) struct NativeModel {
     api: Api,
     ptr: NonNull<CModel>,
     pub(crate) engine: Engine,
+    /// The kernel set the runtime picked at creation.
+    pub(crate) kernels: &'static str,
 }
 
-// SAFETY: the C model has no thread affinity, and the only call that
+// SAFETY: the C context has no thread affinity, and the only call that
 // touches it (process, via `run`) takes `&mut self`, so it can never run
-// concurrently; shared references only read the table's constants. This
-// keeps `Denoiser` `Send + Sync` as with ONNX.
+// concurrently; shared references only read the metadata. This keeps
+// `Denoiser` `Send + Sync` as with ONNX.
 unsafe impl Send for NativeModel {}
 unsafe impl Sync for NativeModel {}
 
 impl NativeModel {
-    /// Load the native build of the model in `onnx` with the engine
-    /// `inference` asks for (never `Onnx`). Returns the model and its
-    /// initial state, or why it cannot run natively.
+    /// Load the native build of the model in `onnx` (`inference` is never
+    /// `Onnx`). Returns the model and its initial state, or why it cannot
+    /// run natively.
     pub(crate) fn load(
         onnx: &Path,
         inference: Inference,
@@ -286,18 +349,19 @@ impl NativeModel {
         NativeModel::load_with(onnx, inference, None)
     }
 
-    /// `load`, with `supported` standing in for the runtime's preset probe
+    /// `load`, with `supported` standing in for the runtime's CPU probe
     /// (tests exercise the unsupported-CPU path with it).
+    #[allow(deprecated)]
     pub(crate) fn load_with(
         onnx: &Path,
         inference: Inference,
-        supported: Option<fn(u32) -> bool>,
+        supported: Option<fn() -> bool>,
     ) -> Result<(NativeModel, Vec<f32>), String> {
-        let (preset, engine) = match inference {
-            Inference::Auto | Inference::NativeInt8 => (PRESET_INT8_SELECTIVE, Engine::NativeInt8),
-            Inference::NativeFp32 => (PRESET_FP32, Engine::NativeFp32),
+        match inference {
+            Inference::Auto | Inference::NativeInt8 => {}
+            Inference::NativeFp32 => return Err("native fp32 is not in this runtime".into()),
             Inference::Onnx => return Err("ONNX requested".into()),
-        };
+        }
         let sha = file_sha256(onnx).map_err(|e| format!("{}: {e}", onnx.display()))?;
         let registered = REGISTRY
             .iter()
@@ -305,27 +369,33 @@ impl NativeModel {
             .ok_or("no native build of this model file")?;
         let api = Api::get(registered)?;
         let ok = match supported {
-            Some(probe) => probe(preset),
+            Some(probe) => probe(),
             // SAFETY: pure capability query.
-            None => unsafe { (api.preset_supported)(preset) != 0 },
+            None => unsafe { ffi::dpdfnet_cpu_supported() != 0 },
         };
         if !ok {
-            return Err(if preset == PRESET_INT8_SELECTIVE {
-                "CPU lacks AVX2/FMA for native int8".into()
-            } else {
-                "native fp32 unsupported by this build".into()
-            });
+            return Err("CPU lacks AVX2/FMA for the native engine".into());
         }
         let weights = read_weights(&weights_path(onnx, api.name), &api)?;
-        // SAFETY: `weights` holds exactly weight_count floats; create
-        // copies what it keeps, so the buffer may drop afterwards.
-        let raw = unsafe { (api.create)(weights.as_ptr(), weights.len(), preset) };
+        // SAFETY: `weights` holds exactly weight_count floats, checked
+        // against the expected SHA-256; create copies what it keeps, so the
+        // buffer may drop afterwards.
+        let raw = unsafe { ffi::dpdfnet_create(api.id, weights.as_ptr(), weights.len()) };
         drop(weights);
         let ptr = NonNull::new(raw).ok_or("native model creation failed")?;
-        let model = NativeModel { api, ptr, engine };
+        // The same query creation just used to pick the kernels.
+        let vnni = (registered.has_avx_vnni)();
+        let model = NativeModel {
+            api,
+            ptr,
+            engine: Engine::NativeInt8,
+            kernels: if vnni { "avx-vnni" } else { "avx2" },
+        };
+        // The runtime's seeds (normalization state), not zeros; every reset
+        // copies this vector back.
         let mut init_state = vec![0f32; model.api.state_size];
-        // SAFETY: init_state writes exactly state_size floats.
-        if unsafe { (model.api.init_state)(init_state.as_mut_ptr()) } != 0 {
+        // SAFETY: init_state writes exactly state_floats floats.
+        if unsafe { ffi::dpdfnet_init_state(model.api.id, init_state.as_mut_ptr()) } != 0 {
             return Err("native state initialisation failed".into());
         }
         Ok((model, init_state))
@@ -353,10 +423,10 @@ impl NativeModel {
         // already state_size.
         state_out.resize(n, 0.0);
         // SAFETY: spectrum sizes are SPEC_LEN by type and checked against
-        // the table at load; state sizes checked above. The four buffers
-        // are distinct Rust borrows, so none overlap.
+        // the metadata at load; state sizes checked above. The four buffers
+        // are distinct Rust borrows, so none overlap. No allocation inside.
         let rc = unsafe {
-            (self.api.process)(
+            ffi::dpdfnet_process(
                 self.ptr.as_ptr(),
                 spec.as_ptr(),
                 state_in.as_ptr(),
@@ -373,17 +443,19 @@ impl NativeModel {
 
 impl Drop for NativeModel {
     fn drop(&mut self) {
-        // SAFETY: ptr came from this table's create and is destroyed once.
-        unsafe { (self.api.destroy)(self.ptr.as_ptr()) }
+        // SAFETY: ptr came from dpdfnet_create and is destroyed once.
+        unsafe { ffi::dpdfnet_destroy(self.ptr.as_ptr()) }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(hushmic_native_runtime)]
     use std::path::PathBuf;
 
     #[test]
+    #[allow(deprecated)]
     fn inference_words_round_trip() {
         for i in [
             Inference::Auto,
@@ -393,17 +465,26 @@ mod tests {
         ] {
             assert_eq!(Inference::parse(i.word()), Some(i));
         }
-        assert_eq!(Inference::parse("native"), None);
+        // The earlier word still selects the native engine.
+        assert_eq!(Inference::parse("native-int8"), Some(Inference::NativeInt8));
+        assert_eq!(Inference::parse("native-w7a8"), Some(Inference::NativeInt8));
         assert_eq!(Inference::parse("native-fp16"), None);
         assert_eq!(Inference::parse("ONNX"), None);
         assert_eq!(Inference::default(), Inference::Auto);
     }
 
     #[test]
-    fn every_model_offers_a_complete_v1_table() {
+    fn engine_words() {
+        assert_eq!(Engine::NativeInt8.to_string(), "native w7a8");
+        assert_eq!(Engine::Onnx.to_string(), "onnx");
+    }
+
+    #[cfg(hushmic_native_runtime)]
+    #[test]
+    fn every_model_offers_complete_metadata() {
         let mut names = Vec::new();
         for r in &REGISTRY {
-            let api = Api::get(r).expect("v1 table");
+            let api = Api::get(r).expect("metadata");
             assert_eq!(api.weights_sha256.len(), 64);
             assert!(api.state_size > 577 && api.weight_count > 0);
             assert_eq!(r.onnx_sha256.len(), 64);
@@ -412,26 +493,19 @@ mod tests {
         assert_eq!(names, ["dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr"]);
     }
 
+    #[cfg(hushmic_native_runtime)]
     #[test]
-    fn other_abi_versions_are_refused() {
-        for r in &REGISTRY {
-            for v in [0, 2, u32::MAX] {
-                // SAFETY: the getter only reads its argument.
-                assert!(unsafe { (r.get_api)(v) }.is_null(), "version {v}");
+    fn unknown_models_and_bad_arguments_are_refused() {
+        // SAFETY: lookups and argument checks; nothing is created.
+        unsafe {
+            for id in [0, 1, 3, 7, -1] {
+                assert!(ffi::dpdfnet_get_model_info(id).is_null(), "id {id}");
+                assert_ne!(ffi::dpdfnet_init_state(id, [0f32; 4].as_mut_ptr()), 0);
             }
-        }
-    }
-
-    #[test]
-    fn fp32_is_always_available_and_unknown_presets_are_not() {
-        for r in &REGISTRY {
-            let api = Api::get(r).unwrap();
-            // SAFETY: pure capability queries.
-            unsafe {
-                assert_ne!((api.preset_supported)(PRESET_FP32), 0);
-                assert_eq!((api.preset_supported)(7), 0);
-                assert!((api.create)(std::ptr::null(), 0, 7).is_null());
-            }
+            assert!(ffi::dpdfnet_create(2, std::ptr::null(), 0).is_null());
+            assert!(ffi::dpdfnet_create(2, [0f32; 4].as_ptr(), 4).is_null());
+            assert_ne!(ffi::dpdfnet_init_state(2, std::ptr::null_mut()), 0);
+            ffi::dpdfnet_destroy(std::ptr::null_mut());
         }
     }
 
@@ -446,6 +520,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(hushmic_native_runtime)]
     fn dev_model(name: &str) -> Option<PathBuf> {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets/models")
@@ -461,24 +536,171 @@ mod tests {
         present.then_some(p)
     }
 
+    #[cfg(hushmic_native_runtime)]
     #[test]
-    fn an_unsupported_int8_preset_is_an_error_not_a_downgrade() {
+    #[allow(deprecated)]
+    fn an_unsupported_cpu_or_fp32_request_is_an_error_not_a_downgrade() {
         let Some(onnx) = dev_model("dpdfnet2_48khz_hr.onnx") else {
             eprintln!("skipping: dev assets not provisioned");
             return;
         };
-        let e =
-            NativeModel::load_with(&onnx, Inference::Auto, Some(|p| p != PRESET_INT8_SELECTIVE))
-                .err()
-                .expect("must not load");
-        assert_eq!(e, "CPU lacks AVX2/FMA for native int8");
-        // FP32 is a separate request and still loads.
-        let (m, _) = NativeModel::load_with(
-            &onnx,
-            Inference::NativeFp32,
-            Some(|p| p != PRESET_INT8_SELECTIVE),
-        )
-        .expect("fp32 loads");
-        assert_eq!(m.engine, Engine::NativeFp32);
+        let e = NativeModel::load_with(&onnx, Inference::Auto, Some(|| false))
+            .err()
+            .expect("must not load");
+        assert_eq!(e, "CPU lacks AVX2/FMA for the native engine");
+        let e = NativeModel::load(&onnx, Inference::NativeFp32)
+            .err()
+            .expect("no fp32 path");
+        assert_eq!(e, "native fp32 is not in this runtime");
+    }
+
+    /// The state a native model starts from (and every reset restores) is
+    /// the runtime's seeds: the same normalization seeds the ONNX export
+    /// carries in its metadata, zeros elsewhere.
+    #[cfg(all(hushmic_native_runtime, feature = "load-dynamic"))]
+    #[test]
+    fn native_seeds_equal_the_onnx_seeds() {
+        let rt =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/lib/libonnxruntime.so");
+        if !rt.exists() || unsafe { ffi::dpdfnet_cpu_supported() } == 0 {
+            eprintln!("skipping: runtime or AVX2/FMA missing");
+            return;
+        }
+        crate::runtime::init_runtime(rt).expect("runtime");
+        for name in ["dpdfnet8_48khz_hr.onnx", "dpdfnet2_48khz_hr.onnx"] {
+            let Some(onnx) = dev_model(name) else {
+                eprintln!("skipping: dev assets not provisioned");
+                return;
+            };
+            let (_, native) = NativeModel::load(&onnx, Inference::Auto).expect("native");
+            let reference = crate::model::Model::load(&onnx).expect("onnx").init_state;
+            assert_eq!(native.len(), reference.len(), "{name}");
+            assert!(native.iter().any(|&v| v != 0.0), "{name}: all zeros");
+            let max = native
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(max <= 1e-5, "{name}: seeds differ by {max}");
+        }
+    }
+
+    /// SHA-256 over little-endian f32 bits.
+    #[cfg(hushmic_native_runtime)]
+    fn bits_sha256(v: &[f32]) -> String {
+        let mut h = Sha256::new();
+        for x in v {
+            h.update(x.to_le_bytes());
+        }
+        hex(&h.finalize())
+    }
+
+    /// The running glibc's version (`gnu_get_libc_version`), if glibc.
+    #[cfg(hushmic_native_runtime)]
+    fn glibc_version() -> Option<String> {
+        #[cfg(target_env = "gnu")]
+        {
+            extern "C" {
+                fn gnu_get_libc_version() -> *const c_char;
+            }
+            // SAFETY: returns a static NUL-terminated string.
+            static_str(unsafe { gnu_get_libc_version() }).map(str::to_string)
+        }
+        #[cfg(not(target_env = "gnu"))]
+        None
+    }
+
+    /// Golden output: the first 300 hops of a committed fixture through the
+    /// native engine from its initial state, hashed bit for bit. Upstream
+    /// guarantees the AVX-VNNI kernels give the same bits as the AVX2 ones;
+    /// this checks it (recorded on AVX2, verified equal on an AVX-VNNI
+    /// i7-13700KF). The spectra going in are hashed separately, so a
+    /// mismatch says whether the FFT or the runtime moved.
+    ///
+    /// The bits also depend on the C library's libm (the runtime calls
+    /// expf/tanhf and friends; the STFT window uses sinf): glibc 2.44 gives
+    /// other hashes than 2.35/2.39 on the same binary and CPU. So the exact
+    /// compare runs only on a glibc listed below (the dev box and both CI
+    /// unit-test images); elsewhere the hashes are printed and the compare
+    /// is skipped. The libm-independent check that runs everywhere is the
+    /// ONNX parity floor in tests/native.rs
+    /// (`native_matches_onnx_through_the_full_denoiser`).
+    #[cfg(hushmic_native_runtime)]
+    #[test]
+    fn golden_output_is_the_same_on_every_kernel_set() {
+        const HOPS: usize = 300;
+        /// (glibc, spectra, dpdfnet8, dpdfnet2).
+        const GOLDEN: [(&str, &str, &str, &str); 2] = [
+            // ubuntu:22.04 (GitLab unit-tests), gcc 11.4
+            (
+                "2.35",
+                "ef70b390c176bcd482650b8763c898b232cf28255a69b57a3b4d5e72b98d9678",
+                "fc259a4715c2a9240bc894e1f7ddfce2efb5028a9e9e9aa4cab1690585741770",
+                "b8c3bfa9af0582a2c16b196b5309d495a6e4476c0ae5e5b6fcc8f426552d55f7",
+            ),
+            // ubuntu 24.04 (dev box, GitHub ubuntu-latest), gcc 13.3
+            (
+                "2.39",
+                "ef70b390c176bcd482650b8763c898b232cf28255a69b57a3b4d5e72b98d9678",
+                "fc259a4715c2a9240bc894e1f7ddfce2efb5028a9e9e9aa4cab1690585741770",
+                "b8c3bfa9af0582a2c16b196b5309d495a6e4476c0ae5e5b6fcc8f426552d55f7",
+            ),
+        ];
+        // SAFETY: a pure capability query.
+        if unsafe { ffi::dpdfnet_cpu_supported() } == 0 {
+            eprintln!("skipping: CPU without AVX2/FMA");
+            return;
+        }
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/noisy_public_48k.flac");
+        let audio: Vec<f32> = claxon::FlacReader::open(&fixture)
+            .expect("fixture")
+            .samples()
+            .take(HOPS * crate::HOP)
+            .map(|s| s.expect("flac sample") as f32 / 32768.0)
+            .collect();
+        assert_eq!(audio.len(), HOPS * crate::HOP);
+        let mut analysis = crate::stft::Analysis::new();
+        let mut spectra = Vec::with_capacity(HOPS * SPEC_LEN);
+        let mut spec = [0f32; SPEC_LEN];
+        for hop in audio.as_chunks::<{ crate::HOP }>().0 {
+            analysis.push_hop(hop, &mut spec);
+            spectra.extend_from_slice(&spec);
+        }
+        let spectra_sha = bits_sha256(&spectra);
+        let glibc = glibc_version();
+        let recorded = GOLDEN.iter().find(|g| Some(g.0) == glibc.as_deref());
+        for (i, name) in ["dpdfnet8_48khz_hr.onnx", "dpdfnet2_48khz_hr.onnx"]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(onnx) = dev_model(name) else {
+                eprintln!("skipping: dev assets not provisioned");
+                return;
+            };
+            let (mut m, mut state) = NativeModel::load(&onnx, Inference::Auto).expect("native");
+            let mut next = vec![0f32; state.len()];
+            let mut out = [0f32; SPEC_LEN];
+            let mut all = Vec::with_capacity(HOPS * SPEC_LEN + state.len());
+            for s in spectra.as_chunks::<SPEC_LEN>().0 {
+                m.run(s, &state, &mut out, &mut next).expect("process");
+                std::mem::swap(&mut state, &mut next);
+                all.extend_from_slice(&out);
+            }
+            all.extend_from_slice(&state);
+            let got = bits_sha256(&all);
+            eprintln!(
+                "{name} ({}, glibc {}): {got}; spectra {spectra_sha}",
+                m.kernels,
+                glibc.as_deref().unwrap_or("?")
+            );
+            let Some(&(_, spectra_want, m8, m2)) = recorded else {
+                eprintln!("different libm, exact compare skipped");
+                continue;
+            };
+            assert_eq!(spectra_sha, spectra_want, "the input spectra changed (FFT)");
+            let want = [m8, m2][i];
+            assert_eq!(got, want, "{name} on {} kernels", m.kernels);
+        }
     }
 }

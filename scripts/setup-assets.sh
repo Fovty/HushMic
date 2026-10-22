@@ -31,10 +31,10 @@ declare -A MODEL_SHA256=(
 
 # Packed FP32 weights for the native engine, from the DPDFNet repository at
 # the commit whose C sources are vendored in crates/hushmic-denoiser/native/
-# (keep the two in step). The sums are upstream's SHA256SUMS; the runtime
-# checks them again before loading.
-DPDFNET_NATIVE_COMMIT="6a5dbd3ea5dbea88c30a2be8e7c689b5eb26b533"
-DPDFNET_NATIVE_URL="https://raw.githubusercontent.com/ceva-ip/DPDFNet/${DPDFNET_NATIVE_COMMIT}/native_inference/artifacts/v1"
+# (keep the two in step). The sums are upstream's models/SHA256SUMS; the
+# runtime checks them again before loading.
+DPDFNET_NATIVE_COMMIT="afa8292f3b8083c3daadd06dbcfe4ff877dd3172"
+DPDFNET_NATIVE_URL="https://raw.githubusercontent.com/ceva-ip/DPDFNet/${DPDFNET_NATIVE_COMMIT}/optimized_inference/models"
 # Fallback: every HushMic release since 0.10 attaches the same files. The
 # workspace version's release first, then the latest one (a tree bumped
 # ahead of its release has no assets yet); the sha256 pins below still

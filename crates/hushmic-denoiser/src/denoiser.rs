@@ -54,12 +54,16 @@ impl Denoiser {
     /// (feature `native`). The native engine reads the packed weights
     /// `<model>.weights.f32` from the model's directory and checks them
     /// before use. Every native failure — a model file without a native
-    /// build, missing or damaged weights, a CPU without AVX2/FMA for INT8 —
+    /// build, missing or damaged weights, a CPU without AVX2/FMA —
     /// falls back to ONNX; [`Denoiser::fallback_reason`] then says why.
     /// Errors are those of [`Denoiser::from_file`] (the ONNX path).
     ///
     /// The native engine does not need ONNX Runtime, but the ONNX fallback
     /// does, so the runtime handling is the same as in `from_file`.
+    ///
+    /// The native engine keeps kernel scratch on the stack: the thread that
+    /// calls [`Denoiser::process_hop`] needs at least 1 MiB of it (Rust's
+    /// spawned threads get 2 MiB unless `RUST_MIN_STACK` says otherwise).
     #[cfg(feature = "native")]
     pub fn from_file_with(
         model_path: impl AsRef<Path>,
@@ -83,6 +87,14 @@ impl Denoiser {
     #[cfg(feature = "native")]
     pub fn engine(&self) -> crate::Engine {
         self.model.engine()
+    }
+
+    /// The kernel set the native engine picked when it was created:
+    /// `"avx-vnni"` on CPUs with AVX-VNNI (when the build has those
+    /// kernels), else `"avx2"`. `None` on ONNX (feature `native`).
+    #[cfg(feature = "native")]
+    pub fn native_kernels(&self) -> Option<&'static str> {
+        self.model.native_kernels()
     }
 
     /// Why this instance runs ONNX although [`Denoiser::from_file_with`]

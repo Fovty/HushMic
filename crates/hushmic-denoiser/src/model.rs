@@ -154,6 +154,14 @@ impl Model {
     }
 
     #[cfg(feature = "native")]
+    pub fn native_kernels(&self) -> Option<&'static str> {
+        match &self.engine {
+            Engine::Onnx(_) => None,
+            Engine::Native(n) => Some(n.kernels),
+        }
+    }
+
+    #[cfg(feature = "native")]
     pub fn engine(&self) -> crate::native::Engine {
         match &self.engine {
             Engine::Onnx(_) => crate::native::Engine::Onnx,

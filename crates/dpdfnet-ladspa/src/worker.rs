@@ -250,6 +250,10 @@ impl WorkerHandle {
         let (tid_tx, tid_rx) = std::sync::mpsc::channel::<libc::pid_t>();
         let thread = thread::Builder::new()
             .name("hushmic-dsp".into())
+            // The native runtime keeps kernel scratch on the stack and asks
+            // for at least 1 MiB. This is Rust's default, pinned so a
+            // RUST_MIN_STACK in the host's environment cannot shrink it.
+            .stack_size(2 << 20)
             .spawn(move || {
                 // SAFETY: gettid has no preconditions.
                 let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;

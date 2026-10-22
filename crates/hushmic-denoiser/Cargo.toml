@@ -16,10 +16,12 @@ categories = ["multimedia::audio"]
 # features are additive and could never subtract it.
 default = ["load-dynamic"]
 load-dynamic = ["ort/load-dynamic", "dep:libloading"]
-# The DPDFNet authors' C runtime (vendored under native/) as a second
-# inference engine: about half the CPU of ONNX Runtime per hop with INT8 on
-# x86-64 CPUs with AVX2, chosen per model at load time with ONNX as the
-# fallback (Denoiser::from_file_with). Needs a C compiler at build time.
+# The DPDFNet authors' optimized C runtime (vendored under native/) as a
+# second inference engine: about half the CPU of ONNX Runtime per hop with
+# W7A8 matrix math on x86-64 CPUs with AVX2 and FMA, chosen per model at
+# load time with ONNX as the fallback (Denoiser::from_file_with). Needs a C
+# compiler that also assembles .S files (GCC) at build time on x86-64 Linux;
+# elsewhere nothing is compiled and ONNX runs.
 # Off by default so the crate's default API and build needs stay as they
 # are; HushMic's plugin turns it on.
 native = ["dep:cc", "dep:sha2"]

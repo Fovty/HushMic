@@ -2,8 +2,8 @@
 //! model tier must be the bare `Denoiser`, bit for bit (the wrapper adds
 //! nothing to the audio), and the raw tier must be the exact delayed input.
 //! Models load the way the plugin loads them: on the product default engine
-//! (native INT8 where the CPU has it), with the pinned-tier pins repeated
-//! on ONNX.
+//! (native where the CPU has it), with the pinned-tier pins repeated on
+//! ONNX.
 
 mod common;
 
@@ -61,6 +61,11 @@ fn dev_denoiser_on(model: &str, engine: Engine) -> Option<Denoiser> {
         && mp.with_extension("weights.f32").exists()
     {
         assert!(d.engine().is_native(), "{:?}", d.fallback_reason());
+        let label = dpdfnet_ladspa::engine_label(&d);
+        assert!(
+            label == "native w7a8 avx2" || label == "native w7a8 avx-vnni",
+            "{label}"
+        );
     }
     Some(d)
 }

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "model": "dpdfnet2_48khz_hr",
+  "implementation": "optimized-w7a8",
+  "sample_rate": 48000,
+  "hop_samples": 480,
+  "fft_size": 960,
+  "spectrum_floats": 962,
+  "state_floats": 56436,
+  "weight_floats": 2582444,
+  "weights_sha256": "cb7248b8fccbff7b32f254ec2ed0061e604514b2ccd98d997cd081a876424e7b",
+  "source_onnx_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+  "weight_format": "IEEE-754 float32, little endian, fixed graph order",
+  "license": "Apache-2.0"
+}
