@@ -2,6 +2,7 @@ use crate::attn::AttnLimiter;
 use crate::error::Error;
 use crate::mode::{GainRamp, Mode};
 use crate::model::Model;
+use crate::recall::{frame_db, Recall};
 use crate::stft::{Analysis, Synthesis, HOP, SPEC_LEN};
 use std::path::Path;
 
@@ -18,6 +19,7 @@ pub struct Denoiser {
     spec_e: [f32; SPEC_LEN],
     state_out: Vec<f32>,
     attn: AttnLimiter,
+    recall: Recall,
     gain: GainRamp,
     mode: Mode,
     attn_limit_db: f32,
@@ -108,6 +110,7 @@ impl Denoiser {
     fn with_model(model: Model) -> Denoiser {
         let state = model.init_state.clone();
         let state_out = vec![0f32; model.state_size];
+        let recall = Recall::new(model.state_size);
         Denoiser {
             analysis: Analysis::new(),
             synthesis: Synthesis::new(),
@@ -117,6 +120,7 @@ impl Denoiser {
             spec_e: [0f32; SPEC_LEN],
             state_out,
             attn: AttnLimiter::new(),
+            recall,
             gain: GainRamp::new(),
             mode: Mode::Process,
             attn_limit_db: f32::INFINITY,
@@ -135,6 +139,7 @@ impl Denoiser {
         self.state.clear();
         self.state.extend_from_slice(&self.model.init_state);
         self.attn.reset();
+        self.recall.reset();
         self.gain.reset_to(self.mode == Mode::Mute);
     }
 
@@ -197,6 +202,7 @@ impl Denoiser {
         match &result {
             Ok(()) => {
                 std::mem::swap(&mut self.state, &mut self.state_out);
+                self.recall.after_hop(&mut self.state, frame_db(&self.spec_e));
             }
             Err(_) => {
                 // Keep the recurrent state as-is (last good frame) and emit a

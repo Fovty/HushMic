@@ -34,6 +34,7 @@ mod mode;
 mod model;
 #[cfg(feature = "native")]
 mod native;
+mod recall;
 mod runtime;
 mod stft;
 mod stream;
