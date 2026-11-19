@@ -1200,7 +1200,11 @@ fn main() {
                             }
                         };
                         let s = control::Status {
-                            version: env!("CARGO_PKG_VERSION").to_string(),
+                            // HUSHMIC_BUILD_REV: the commit scripts/local-run.sh built, to tell local from packaged builds.
+                            version: match option_env!("HUSHMIC_BUILD_REV") {
+                                Some(rev) => format!("{} ({rev})", env!("CARGO_PKG_VERSION")),
+                                None => env!("CARGO_PKG_VERSION").to_string(),
+                            },
                             mode: cfg.enabled.then(|| controller.mode()),
                             mic_configured: cfg.mic.clone(),
                             mic_active: controller.active_mic().map(str::to_string),

@@ -13,7 +13,7 @@ grep -qw avx_vnni /proc/cpuinfo || { echo "this CPU has no AVX-VNNI" >&2; exit 1
 
 if [[ ${1:-} != --no-build ]]; then
   [[ -f $REPO/assets/models/dpdfnet8_48khz_hr.weights.f32 ]] || "$REPO/scripts/setup-assets.sh"
-  (cd "$REPO" && HUSHMIC_BUILD_MODEL=$P/share/hushmic/models/dpdfnet8_48khz_hr.onnx \
+  (cd "$REPO" && HUSHMIC_BUILD_REV=$(git describe --always --dirty --exclude="*") HUSHMIC_BUILD_MODEL=$P/share/hushmic/models/dpdfnet8_48khz_hr.onnx \
     HUSHMIC_BUILD_DYLIB=$P/lib/hushmic/libonnxruntime.so \
     mise exec rust@stable -- cargo build --release --locked -p hushmic -p dpdfnet-ladspa)
 fi
