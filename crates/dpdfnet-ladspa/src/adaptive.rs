@@ -358,6 +358,15 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         }
     }
 
+    fn poll_control(&mut self) {
+        if let Some(engine) = self.quality.as_mut() {
+            engine.poll_control();
+        }
+        if let Some(engine) = self.light.as_mut() {
+            engine.poll_control();
+        }
+    }
+
     fn set_lag_hops(&mut self, hops: u32) {
         self.lag = hops;
     }

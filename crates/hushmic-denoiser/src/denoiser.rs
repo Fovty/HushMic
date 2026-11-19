@@ -17,6 +17,7 @@ pub struct Denoiser {
     spec: [f32; SPEC_LEN],
     spec_e: [f32; SPEC_LEN],
     state_out: Vec<f32>,
+    remote_was_active: bool,
     attn: AttnLimiter,
     gain: GainRamp,
     mode: Mode,
@@ -116,6 +117,7 @@ impl Denoiser {
             spec: [0f32; SPEC_LEN],
             spec_e: [0f32; SPEC_LEN],
             state_out,
+            remote_was_active: false,
             attn: AttnLimiter::new(),
             gain: GainRamp::new(),
             mode: Mode::Process,
@@ -134,6 +136,7 @@ impl Denoiser {
         self.synthesis.reset();
         self.state.clear();
         self.state.extend_from_slice(&self.model.init_state);
+        self.remote_was_active = false;
         self.attn.reset();
         self.gain.reset_to(self.mode == Mode::Mute);
     }
@@ -187,7 +190,27 @@ impl Denoiser {
         input: &[f32; HOP],
         output: &mut [f32; HOP],
     ) -> Result<(), Error> {
+        self.process_hop_with_spectral_provider(input, output, |_, _| false)
+    }
+
+    /// Substitute only model inference for this hop. The alternate provider
+    /// owns its own recurrent state. A false result uses a fresh CPU model
+    /// state on the first fallback hop and retains the continuous DSP state.
+    pub fn process_hop_with_spectral_provider(
+        &mut self,
+        input: &[f32; HOP],
+        output: &mut [f32; HOP],
+        enhance: impl FnOnce(&[f32; SPEC_LEN], &mut [f32; SPEC_LEN]) -> bool,
+    ) -> Result<(), Error> {
         self.analysis.push_hop(input, &mut self.spec);
+        if enhance(&self.spec, &mut self.spec_e) {
+            self.remote_was_active = true;
+            self.render_hop(output);
+            return Ok(());
+        }
+        if std::mem::take(&mut self.remote_was_active) {
+            self.state.copy_from_slice(&self.model.init_state);
+        }
         let result = self.model.run(
             &self.spec,
             &self.state,
@@ -206,9 +229,13 @@ impl Denoiser {
                 self.spec_e = [0f32; SPEC_LEN];
             }
         }
+        self.render_hop(output);
+        result.map_err(Error::Inference)
+    }
+
+    fn render_hop(&mut self, output: &mut [f32; HOP]) {
         self.attn.apply(&self.spec, &mut self.spec_e); // blend noisy floor / bypass mix
         self.synthesis.add_frame(&self.spec_e, output);
         self.gain.process(output); // mute ramp, after synthesis
-        result.map_err(Error::Inference)
     }
 }

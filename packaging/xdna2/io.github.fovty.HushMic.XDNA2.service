@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.fovty.HushMic.XDNA2
+Exec=/usr/bin/dpdfnet-xdna2-service
+SystemdService=dpdfnet-xdna2.service

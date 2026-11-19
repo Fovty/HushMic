@@ -140,6 +140,8 @@ pub trait HopEngine: Send + 'static {
     fn reset(&mut self);
     fn set_mode(&mut self, mode: Mode);
     fn set_attenuation_limit_db(&mut self, db: f32);
+    /// Apply queued backend changes while the worker is waiting for audio.
+    fn poll_control(&mut self) {}
     /// Overdue hops after allowing for a fresh host callback burst,
     /// smoothed over one callback. Default: ignored.
     fn set_lag_hops(&mut self, _hops: u32) {}
@@ -559,6 +561,7 @@ fn worker_loop(
             mode_cache = mode;
         }
         if input.slots() < HOP {
+            engine.poll_control();
             // Timeout guards a lost wakeup; the RT side unparks on every
             // push, so this is normally a pure park.
             // The lag window survives the park: with a cycle of several

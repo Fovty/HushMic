@@ -1,0 +1,30 @@
+[package]
+name = "dpdfnet-xdna2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+zbus = { version = "5", features = ["blocking-api"] }
+sha2 = "0.11"
+
+[features]
+host = ["dep:serde", "dep:serde_json", "dep:libloading"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true
+
+[dependencies.serde_json]
+version = "1"
+optional = true
+
+[dependencies.libloading]
+version = "0.9"
+optional = true
+
+[[bin]]
+name = "dpdfnet-xdna2-service"
+required-features = ["host"]
