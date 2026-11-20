@@ -130,16 +130,17 @@ impl Denoiser {
     }
 
     /// Clear all stream state (STFT rings, recurrent model state, ramps) for
-    /// a fresh session. Configuration survives: the current [`Mode`] and
-    /// attenuation limit stay in force — in particular, a `Denoiser` reset
-    /// while muted stays silent from the very first sample.
+    /// a fresh session, then put back the last talker's model memory so a
+    /// restart keeps favouring that voice. Configuration survives: the current
+    /// [`Mode`] and attenuation limit stay in force — in particular, a
+    /// `Denoiser` reset while muted stays silent from the very first sample.
     pub fn reset(&mut self) {
         self.analysis.reset();
         self.synthesis.reset();
         self.state.clear();
         self.state.extend_from_slice(&self.model.init_state);
         self.attn.reset();
-        self.recall.reset();
+        self.recall.reset(&mut self.state);
         self.gain.reset_to(self.mode == Mode::Mute);
     }
 
@@ -202,7 +203,8 @@ impl Denoiser {
         match &result {
             Ok(()) => {
                 std::mem::swap(&mut self.state, &mut self.state_out);
-                self.recall.after_hop(&mut self.state, frame_db(&self.spec_e));
+                let (in_db, out_db) = (frame_db(&self.spec), frame_db(&self.spec_e));
+                self.recall.after_hop(&mut self.state, in_db, out_db);
             }
             Err(_) => {
                 // Keep the recurrent state as-is (last good frame) and emit a

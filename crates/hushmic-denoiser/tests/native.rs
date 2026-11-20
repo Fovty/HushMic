@@ -204,7 +204,11 @@ fn reset_and_fresh_instances_are_deterministic() {
     for model in MODELS {
         let Some(mp) = assets(model) else { return };
         let noisy = read_flac("noisy_keyboard_48k.flac");
-        let clip = &noisy[..300 * HOP];
+        // quiet enough that Recall never snapshots, so reset must equal fresh
+        let clip = &noisy[..300 * HOP]
+            .iter()
+            .map(|s| s * 0.003)
+            .collect::<Vec<_>>();
         let mut d = Denoiser::from_file_with(&mp, Inference::NativeInt8).unwrap();
         assert_eq!(d.engine(), Engine::NativeInt8);
         let first = stream(&mut d, clip);

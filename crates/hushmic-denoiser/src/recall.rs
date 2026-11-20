@@ -3,22 +3,25 @@
 //! DPDFNet decides which voice to keep from its recurrent memory of the last
 //! several seconds. After ~10 s of silence that memory of the near talker has
 //! faded, and the next voice — even a distant, reverberant one — is accepted as
-//! the talker for its whole phrase. So: remember the recurrent part of the state
-//! while the model passes speech, and after a long silence put it back on the
-//! first sounding frame. The input-norm part (`state[..NORM_STATE]`) is left to
-//! keep tracking the room.
+//! the talker for its whole phrase. So: remember the state (norms included)
+//! while the model passes speech, and put it back every 2 s of quiet input and
+//! output, never on a sounding hop (stale conv buffers would clip the onset),
+//! and on reset (so a stream restart keeps the talker). The output-side tail
+//! is left alone (see [`OUTPUT_TAIL`]).
 
 use crate::stft::{FREQ_BINS, HOP, SPEC_LEN};
 
-/// erb_norm (481) + spec_norm (96) running means at the head of the DPDFNet
-/// state; the recurrent and conv memory follows.
-const NORM_STATE: usize = 481 + 96;
 /// Model output below this is the model's silence (room tone comes out ~-119 dB).
 const SILENT_DB: f32 = -75.0;
 /// Model output above this is speech worth remembering.
 const SPEECH_DB: f32 = -60.0;
-/// 2 s of silent output before the next sound triggers a restore.
+/// Input below this is room tone (~-73 dB), not a suppressed talker.
+const QUIET_INPUT_DB: f32 = -60.0;
+/// Re-assert the talker every 2 s so its memory never fades across a long pause.
 const RESTORE_AFTER_HOPS: u32 = 200;
+/// State tail (DF temporal conv + 3 decoder convs, same in dpdfnet2/8): a
+/// speech-time copy replays the last speech for ~3 hops, so never restore it.
+const OUTPUT_TAIL: usize = 30720 + 2886 + 2880 + 4810;
 
 /// Hop level in dBFS of the time signal a spectrum frame resynthesizes to:
 /// with the Vorbis window, sum(w^2) = HOP, so mean |X_k|^2 / HOP ~ sample power.
@@ -37,35 +40,40 @@ pub(crate) struct Recall {
 impl Recall {
     pub(crate) fn new(state_size: usize) -> Recall {
         Recall {
-            snapshot: vec![0f32; state_size.saturating_sub(NORM_STATE)],
+            snapshot: vec![0f32; state_size.saturating_sub(OUTPUT_TAIL)],
             has_snapshot: false,
             quiet_hops: 0,
         }
     }
 
-    pub(crate) fn reset(&mut self) {
-        self.has_snapshot = false;
+    /// Call with the freshly initialised state: puts the remembered talker back.
+    pub(crate) fn reset(&mut self, state: &mut [f32]) {
+        if self.has_snapshot {
+            state[..self.snapshot.len()].copy_from_slice(&self.snapshot);
+        }
         self.quiet_hops = 0;
     }
 
-    /// Call after each good model hop with the new state and the model's output
-    /// level (before any attenuation blend). Returns true when it restored.
-    pub(crate) fn after_hop(&mut self, state: &mut [f32], out_db: f32) -> bool {
-        if state.len() != NORM_STATE + self.snapshot.len() || self.snapshot.is_empty() {
+    /// Call after each good model hop with the new state, the input hop level
+    /// and the model's output level (before any attenuation blend). Returns
+    /// true when it restored.
+    pub(crate) fn after_hop(&mut self, state: &mut [f32], in_db: f32, out_db: f32) -> bool {
+        let n = self.snapshot.len();
+        if state.len() != n + OUTPUT_TAIL || n == 0 {
             return false;
         }
         let mut restored = false;
-        if out_db < SILENT_DB {
+        if out_db < SILENT_DB && in_db < QUIET_INPUT_DB {
             self.quiet_hops = self.quiet_hops.saturating_add(1);
-        } else {
-            if self.has_snapshot && self.quiet_hops >= RESTORE_AFTER_HOPS {
-                state[NORM_STATE..].copy_from_slice(&self.snapshot);
+            if self.has_snapshot && self.quiet_hops.is_multiple_of(RESTORE_AFTER_HOPS) {
+                state[..n].copy_from_slice(&self.snapshot);
                 restored = true;
             }
+        } else {
             self.quiet_hops = 0;
         }
         if out_db > SPEECH_DB {
-            self.snapshot.copy_from_slice(&state[NORM_STATE..]);
+            self.snapshot.copy_from_slice(&state[..n]);
             self.has_snapshot = true;
         }
         restored
@@ -99,42 +107,86 @@ mod tests {
         assert!((db + 24.8).abs() < 0.5, "{db}");
     }
 
-    fn state(v: f32) -> Vec<f32> {
-        vec![v; NORM_STATE + 4]
+    const QUIET: (f32, f32) = (-73.0, -119.0); // room tone in, silence out
+    const N: usize = 4 + OUTPUT_TAIL;
+
+    fn quiet(r: &mut Recall, s: &mut [f32], hops: u32) -> bool {
+        (0..hops).any(|_| r.after_hop(s, QUIET.0, QUIET.1))
     }
 
     #[test]
-    fn restores_memory_not_norms_after_long_silence() {
-        let mut r = Recall::new(NORM_STATE + 4);
-        let mut s = state(1.0);
-        assert!(!r.after_hop(&mut s, -40.0)); // speech: remembered
-        for _ in 0..RESTORE_AFTER_HOPS {
-            s = state(2.0); // memory drifts during silence
-            assert!(!r.after_hop(&mut s, -119.0));
-        }
-        s = state(3.0);
-        assert!(r.after_hop(&mut s, -50.0)); // first sound after 2 s
-        assert!(s[..NORM_STATE].iter().all(|&v| v == 3.0), "norms untouched");
-        assert!(s[NORM_STATE..].iter().all(|&v| v == 1.0), "memory restored");
+    fn restores_prefix_during_silence_not_on_onset() {
+        let mut r = Recall::new(N);
+        let mut s = vec![1.0; N];
+        assert!(!r.after_hop(&mut s, -30.0, -40.0)); // speech: remembered
+        s = vec![2.0; N]; // state drifts during silence
+        assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
+        assert!(r.after_hop(&mut s, QUIET.0, QUIET.1), "2 s of quiet");
+        assert_eq!(s[..4], [1.0; 4], "norms included");
+        assert!(s[4..].iter().all(|&v| v == 2.0), "output tail left alone");
+        s = vec![2.0; N];
+        assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
+        assert!(r.after_hop(&mut s, QUIET.0, QUIET.1), "again at 4 s");
+        s = vec![3.0; N];
+        assert!(!r.after_hop(&mut s, -30.0, -50.0), "not on the onset");
+        assert!(s.iter().all(|&v| v == 3.0));
     }
 
     #[test]
-    fn short_pause_and_no_speech_do_not_restore() {
-        let mut r = Recall::new(NORM_STATE + 4);
-        let mut s = state(1.0);
-        for _ in 0..RESTORE_AFTER_HOPS {
-            r.after_hop(&mut s, -119.0);
+    fn suppressed_loud_input_does_not_count() {
+        let mut r = Recall::new(N);
+        let mut s = vec![1.0; N];
+        r.after_hop(&mut s, -30.0, -40.0);
+        for _ in 0..2 * RESTORE_AFTER_HOPS {
+            assert!(!r.after_hop(&mut s, -40.0, QUIET.1), "other talker, cut");
         }
-        assert!(!r.after_hop(&mut s, -50.0), "nothing remembered yet");
-        r.after_hop(&mut s, -40.0);
-        for _ in 0..RESTORE_AFTER_HOPS - 1 {
-            r.after_hop(&mut s, -119.0);
-        }
-        assert!(!r.after_hop(&mut s, -50.0), "pause too short");
-        r.reset();
-        for _ in 0..RESTORE_AFTER_HOPS {
-            r.after_hop(&mut s, -119.0);
-        }
-        assert!(!r.after_hop(&mut s, -50.0), "reset forgets the snapshot");
+    }
+
+    #[test]
+    fn no_restore_without_snapshot_or_before_the_count() {
+        let mut r = Recall::new(N);
+        let mut s = vec![1.0; N];
+        assert!(
+            !quiet(&mut r, &mut s, 2 * RESTORE_AFTER_HOPS),
+            "nothing remembered"
+        );
+        r.after_hop(&mut s, -30.0, -40.0);
+        assert!(
+            !quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1),
+            "pause too short"
+        );
+        r.after_hop(&mut s, -30.0, -50.0); // sound resets the count
+        assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
+    }
+
+    #[test]
+    fn state_without_room_for_the_tail_is_left_alone() {
+        let mut r = Recall::new(4);
+        let mut s = vec![1.0; 4];
+        r.after_hop(&mut s, -30.0, -40.0);
+        s = vec![2.0; 4];
+        assert!(!quiet(&mut r, &mut s, 2 * RESTORE_AFTER_HOPS));
+        r.reset(&mut s);
+        assert_eq!(s, [2.0; 4]);
+    }
+
+    #[test]
+    fn reset_restores_and_keeps_the_snapshot() {
+        let mut r = Recall::new(N);
+        let mut s = vec![1.0; N];
+        r.after_hop(&mut s, -30.0, -40.0);
+        s = vec![0.0; N]; // re-initialised state
+        r.reset(&mut s);
+        assert_eq!(s[..4], [1.0; 4]);
+        assert!(s[4..].iter().all(|&v| v == 0.0), "tail stays initialised");
+        s = vec![0.0; N];
+        r.reset(&mut s);
+        assert_eq!(s[..4], [1.0; 4], "snapshot kept");
+        assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
+        r.reset(&mut s);
+        assert!(
+            !quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1),
+            "count zeroed"
+        );
     }
 }
