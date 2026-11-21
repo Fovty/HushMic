@@ -8,7 +8,7 @@
 //! so the RT-side aligner sees one continuous stream whatever is live.
 
 use crate::ladder::{Event, Policy, Step, Tier};
-use crate::worker::HopEngine;
+use crate::worker::{HopEngine, HopOutput};
 use hushmic_denoiser::{GainRamp, Mode, HOP, LATENCY_SAMPLES};
 use std::time::{Duration, Instant};
 
@@ -49,10 +49,20 @@ impl RawDelay {
 
     /// `out[i]` is the input from `LATENCY_SAMPLES` samples ago.
     pub fn process(&mut self, input: &[f32; HOP], out: &mut [f32; HOP]) {
-        for (i, &x) in input.iter().enumerate() {
-            out[i] = self.buf[self.pos];
-            self.buf[self.pos] = x;
-            self.pos += 1;
+        self.process_samples(input, out);
+    }
+
+    fn process_samples(&mut self, mut input: &[f32], mut out: &mut [f32]) {
+        while !input.is_empty() {
+            let count = input.len().min(self.buf.len() - self.pos);
+            let (head, remaining) = input.split_at(count);
+            let (dst, tail) = out.split_at_mut(count);
+            let delay = &mut self.buf[self.pos..self.pos + count];
+            dst.copy_from_slice(delay);
+            delay.copy_from_slice(head);
+            input = remaining;
+            out = tail;
+            self.pos += count;
             if self.pos == self.buf.len() {
                 self.pos = 0;
             }
@@ -152,8 +162,9 @@ impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
     fn run_into(
         &mut self,
         tier: Tier,
-        input: &[f32; HOP],
-        out: &mut [f32; HOP],
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        out: &mut HopOutput<'_>,
     ) -> (Result<(), String>, f32) {
         let engine = match tier {
             Tier::Quality => self.quality.as_mut(),
@@ -161,11 +172,11 @@ impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
             Tier::Raw => None,
         };
         let Some(engine) = engine else {
-            out.copy_from_slice(&self.raw_out);
+            out.write(&self.raw_out);
             return (Ok(()), 0.0);
         };
         let t0 = (self.clock)();
-        let r = engine.process_hop(input, out);
+        let r = engine.process_hop_output(input, scratch, out);
         let cost = (self.clock)().duration_since(t0).as_secs_f32() / HOP_BUDGET.as_secs_f32();
         (r, cost)
     }
@@ -229,11 +240,30 @@ impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
 
 impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
     fn process_hop(&mut self, input: &[f32; HOP], output: &mut [f32; HOP]) -> Result<(), String> {
+        self.process_hop_parts((input, &[]), &mut [0.0; HOP], output)
+    }
+
+    fn process_hop_parts(
+        &mut self,
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        output: &mut [f32; HOP],
+    ) -> Result<(), String> {
+        self.process_hop_output(input, scratch, &mut HopOutput::array(output))
+    }
+
+    fn process_hop_output(
+        &mut self,
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        output: &mut HopOutput<'_>,
+    ) -> Result<(), String> {
         // The raw path runs every hop so its delay line is always warm and
         // its mute ramp has always reached its target before raw goes live.
-        let mut raw = [0.0f32; HOP];
-        self.raw.process(input, &mut raw);
-        self.raw_ramp.process(&mut raw);
+        let (first, second) = self.raw_out.split_at_mut(input.0.len());
+        self.raw.process_samples(input.0, first);
+        self.raw.process_samples(input.1, second);
+        self.raw_ramp.process(&mut self.raw_out);
         // A separate gain preserves mute and reaches either target in one hop.
         // The policy holds the duck through the entire fade back to a model.
         let target = if self.policy.duck_raw() {
@@ -246,12 +276,11 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         } else {
             self.raw_duck_gain
         };
-        for (i, sample) in raw.iter_mut().enumerate() {
+        for (i, sample) in self.raw_out.iter_mut().enumerate() {
             let a = (i + 1) as f32 / HOP as f32;
             *sample *= start * (1.0 - a) + target * a;
         }
         self.raw_duck_gain = target;
-        self.raw_out = raw;
         self.hops += 1;
 
         let step = self.policy.step();
@@ -261,7 +290,7 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         };
         let (result, live_cost, shadow_cost) = match step {
             Step::Steady { live } => {
-                let (r, c) = self.run_into(live, input, output);
+                let (r, c) = self.run_into(live, input, scratch, output);
                 (r, c, None)
             }
             Step::Shadow {
@@ -269,21 +298,28 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
                 shadow,
                 kind: _,
             } => {
-                let (r, c) = self.run_into(live, input, output);
-                let mut scratch = [0.0f32; HOP];
-                let (_, sc) = self.run_into(shadow, input, &mut scratch);
+                let (r, c) = self.run_into(live, input, scratch, output);
+                let mut shadow_out = [0.0f32; HOP];
+                let (_, sc) = self.run_into(
+                    shadow,
+                    input,
+                    scratch,
+                    &mut HopOutput::array(&mut shadow_out),
+                );
                 (r, c, Some(sc))
             }
             Step::Crossfade { from, to, hop, of } => {
-                let (r, c) = self.run_into(from, input, output);
-                let mut scratch = [0.0f32; HOP];
-                let (_, sc) = self.run_into(to, input, &mut scratch);
+                let (r, c) = self.run_into(from, input, scratch, output);
+                let mut next_out = [0.0f32; HOP];
+                let (_, sc) =
+                    self.run_into(to, input, scratch, &mut HopOutput::array(&mut next_out));
                 let of = of.max(1) as f32;
                 let start = hop as f32 / of;
                 let step_per_sample = 1.0 / (of * HOP as f32);
-                for (i, o) in output.iter_mut().enumerate() {
+                let (left, right) = output.initialized_parts();
+                for (i, o) in left.iter_mut().chain(right).enumerate() {
                     let a = (start + step_per_sample * (i as f32 + 1.0)).min(1.0);
-                    *o = *o * (1.0 - a) + scratch[i] * a;
+                    *o = *o * (1.0 - a) + next_out[i] * a;
                 }
                 (r, c, Some(sc))
             }
@@ -463,6 +499,26 @@ mod tests {
     }
 
     type Seen = Arc<Mutex<Vec<(f32, Option<f32>, u32)>>>;
+
+    #[test]
+    fn wrapped_input_matches_contiguous_input_for_raw_and_model_tiers() {
+        let f = Fakes::new();
+        for tier in [Tier::Raw, Tier::Quality] {
+            let mut wrapped = f.engine(Some(f.gain(2.0, 0.1)), None, Pinned(tier));
+            let mut contiguous = f.engine(Some(f.gain(2.0, 0.1)), None, Pinned(tier));
+            let mut scratch = [0.0; HOP];
+            let mut out = [0.0; HOP];
+            let mut expected = [0.0; HOP];
+            for split in [1, 253, HOP - 1, HOP, 16, 32, 247, 128] {
+                let input = std::array::from_fn(|i| ((i + split) % 241) as f32 / 256.0);
+                wrapped
+                    .process_hop_parts(input.split_at(split), &mut scratch, &mut out)
+                    .unwrap();
+                contiguous.process_hop(&input, &mut expected).unwrap();
+                assert_eq!(out, expected);
+            }
+        }
+    }
 
     /// A policy that replays a scripted step sequence and records observes.
     struct Scripted {

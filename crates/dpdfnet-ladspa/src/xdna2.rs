@@ -1,5 +1,5 @@
 //! Optional host extension. All D-Bus work happens off the inference and RT threads.
-use crate::worker::HopEngine;
+use crate::worker::{contiguous_hop, HopEngine, HopOutput};
 use dpdfnet_xdna2::{self as provider, Stream};
 use hushmic_denoiser::{Denoiser, Mode, HOP};
 use std::{
@@ -27,12 +27,26 @@ const UNKNOWN_POLICY: u8 = u8::MAX;
 // Close an unused session before amdxdna's five-second runtime suspend.
 const SESSION_IDLE: Duration = Duration::from_secs(2);
 
+enum RemoteStream {
+    Spectral(Stream),
+    Pcm(provider::pcm::Stream),
+}
+
+impl RemoteStream {
+    fn reset(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Spectral(stream) => stream.reset(),
+            Self::Pcm(stream) => stream.reset(),
+        }
+    }
+}
+
 struct Link {
     status: AtomicU32,
     policy: AtomicU8,
     generation: AtomicU64,
     completed: AtomicU64,
-    ready: Mutex<Option<(u64, Stream)>>,
+    ready: Mutex<Option<(u64, RemoteStream)>>,
     path: PathBuf,
     mono: bool,
     alive: AtomicBool,
@@ -115,12 +129,14 @@ impl Link {
             }
             self.policy.store(mode, Ordering::Relaxed);
         }
+        let full_pcm = mode == provider::PREFER_NPU
+            && std::env::var_os("HUSHMIC_XDNA2_FULL_PCM").as_deref() == Some("1".as_ref());
         let (status, stream) = if mode == provider::CPU {
             (CPU, None)
-        } else if !ready || (mode == provider::AUTO && !automatic) {
+        } else if (!ready && !full_pcm) || (mode == provider::AUTO && !automatic) {
             (UNQUALIFIED, None)
         } else {
-            self.open(generation)
+            self.open(generation, full_pcm)
         };
         let mut pending = self.ready.lock().unwrap();
         if self.current(generation) {
@@ -129,7 +145,7 @@ impl Link {
         }
     }
 
-    fn open(&self, generation: u64) -> (u32, Option<Stream>) {
+    fn open(&self, generation: u64, full_pcm: bool) -> (u32, Option<RemoteStream>) {
         let Ok(hash) = provider::file_hash(&self.path) else {
             return (UNQUALIFIED, None);
         };
@@ -139,7 +155,16 @@ impl Link {
             if !self.current(generation) {
                 break;
             }
-            match Stream::open(&hash) {
+            let stream = if full_pcm {
+                match provider::pcm::Stream::open(&hash) {
+                    Ok(stream) => Ok(RemoteStream::Pcm(stream)),
+                    Err(error) if provider::session_busy(&error) => Err(error),
+                    Err(_) => Stream::open(&hash).map(RemoteStream::Spectral),
+                }
+            } else {
+                Stream::open(&hash).map(RemoteStream::Spectral)
+            };
+            match stream {
                 Ok(stream) => return (WAITING_FOR_AUDIO, Some(stream)),
                 Err(error) if provider::session_busy(&error) => {
                     if attempt < 7 {
@@ -235,7 +260,8 @@ pub fn clear_pending() {
 pub struct Engine {
     cpu: Denoiser,
     link: Option<Arc<Link>>,
-    stream: Option<Stream>,
+    stream: Option<RemoteStream>,
+    previous_pcm: bool,
     generation: u64,
     idle_deadline: Option<Instant>,
     resume_on_audio: bool,
@@ -251,6 +277,7 @@ impl Engine {
             cpu,
             link,
             stream: None,
+            previous_pcm: false,
             generation: 0,
             idle_deadline: None,
             resume_on_audio: false,
@@ -262,6 +289,7 @@ impl Engine {
             cpu,
             link: None,
             stream: None,
+            previous_pcm: false,
             generation: 0,
             idle_deadline: None,
             resume_on_audio: false,
@@ -314,6 +342,24 @@ impl Drop for Engine {
 
 impl HopEngine for Engine {
     fn process_hop(&mut self, input: &[f32; HOP], output: &mut [f32; HOP]) -> Result<(), String> {
+        self.process_hop_parts((input, &[]), &mut [0.0; HOP], output)
+    }
+
+    fn process_hop_parts(
+        &mut self,
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        output: &mut [f32; HOP],
+    ) -> Result<(), String> {
+        self.process_hop_output(input, scratch, &mut HopOutput::array(output))
+    }
+
+    fn process_hop_output(
+        &mut self,
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        output: &mut HopOutput<'_>,
+    ) -> Result<(), String> {
         self.refresh();
         if self.idle_deadline.is_some() || self.resume_on_audio {
             let now = Instant::now();
@@ -330,25 +376,46 @@ impl HopEngine for Engine {
                 self.idle_deadline = Some(now + SESSION_IDLE);
             }
         }
+        if let Some(RemoteStream::Pcm(stream)) = &mut self.stream {
+            let (attenuation, bypass) = self.cpu.external_pcm_controls();
+            if let Ok(parts) = output.receive_pcm(stream, input, attenuation, bypass) {
+                self.previous_pcm = true;
+                self.cpu.finish_external_pcm(parts);
+                if let Some(link) = &self.link {
+                    link.publish(self.generation, NPU);
+                }
+                return Ok(());
+            }
+            self.stream = None;
+            if let Some(link) = &self.link {
+                link.publish(self.generation, LOST);
+            }
+        }
+        if std::mem::take(&mut self.previous_pcm) {
+            self.cpu.reset_signal_history();
+        }
         let stream = &mut self.stream;
         let link = &self.link;
         let generation = self.generation;
-        self.cpu
-            .process_hop_with_spectral_provider(input, output, |spectrum, enhanced| {
-                if let Some(session) = stream {
-                    let success = session.step(spectrum, enhanced).is_ok();
-                    if !success {
-                        *stream = None;
+        let input = contiguous_hop(input, scratch);
+        output.render(|audio| {
+            self.cpu
+                .process_hop_with_spectral_provider(input, audio, |spectrum, enhanced| {
+                    if let Some(RemoteStream::Spectral(session)) = stream {
+                        let success = session.step(spectrum, enhanced).is_ok();
+                        if !success {
+                            *stream = None;
+                        }
+                        if let Some(link) = link {
+                            link.publish(generation, if success { NPU } else { LOST });
+                        }
+                        success
+                    } else {
+                        false
                     }
-                    if let Some(link) = link {
-                        link.publish(generation, if success { NPU } else { LOST });
-                    }
-                    success
-                } else {
-                    false
-                }
-            })
-            .map_err(|e| e.to_string())
+                })
+                .map_err(|e| e.to_string())
+        })
     }
 
     fn poll_control(&mut self) {
@@ -360,6 +427,7 @@ impl HopEngine for Engine {
         self.refresh();
         self.retire_idle_session(Instant::now());
         self.cpu.reset();
+        self.previous_pcm = false;
         if self
             .stream
             .as_mut()

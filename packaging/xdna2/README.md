@@ -27,3 +27,11 @@ control ports.
 separate test service. The latter admits an unqualified profile only
 under explicitly selected Prefer NPU. Production packages rely on the
 qualified catalog and normal user permissions.
+
+The separate experimental `OpenPcmSession` method uses the `pcm_profiles`
+registry in the development catalog. Start the test service with a private
+`HUSHMIC_XDNA2_PCM_RECEIPTS` directory. Explicit Prefer NPU and
+`HUSHMIC_XDNA2_FULL_PCM=1` in the LADSPA host select this full-PCM route.
+The existing LADSPA ports and spectral service method are shared with the
+standard package. The broker returns the worker's direct PCM socket and
+retains the device lease until that worker exits.

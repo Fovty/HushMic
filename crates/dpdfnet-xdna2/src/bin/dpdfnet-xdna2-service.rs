@@ -22,6 +22,8 @@ use std::{
 };
 use zbus::{fdo, zvariant::OwnedFd as BusFd};
 
+mod pcm_session;
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const FIRST: Stamp = Stamp {
     kind: READY,
@@ -44,6 +46,8 @@ struct Profile {
 struct Providers {
     version: u32,
     profiles: BTreeMap<String, Profile>,
+    #[serde(default)]
+    pcm_profiles: BTreeMap<String, pcm_session::Profile>,
 }
 
 fn local_path(variable: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
@@ -89,6 +93,7 @@ struct Broker {
     settings: PathBuf,
     policy: Mutex<u8>,
     profiles: BTreeMap<String, Profile>,
+    pcm_profiles: BTreeMap<String, pcm_session::Profile>,
     lease: Arc<Mutex<bool>>,
     development: bool,
 }
@@ -151,6 +156,24 @@ impl Broker {
             .map(BusFd::from)
             .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
+
+    fn open_pcm_session(&self, model_hash: &str) -> fdo::Result<BusFd> {
+        if !self.development || *self.policy.lock().unwrap() != PREFER_NPU {
+            return Err(fdo::Error::NotSupported(
+                "Experimental PCM session is disabled".into(),
+            ));
+        }
+        let profile = self
+            .pcm_profiles
+            .values()
+            .find(|p| p.model_sha256 == model_hash)
+            .ok_or_else(|| fdo::Error::NotSupported("PCM model is unavailable".into()))?;
+        let lease = Lease::acquire(self.lease.clone())
+            .ok_or_else(|| fdo::Error::LimitsExceeded("NPU is busy".into()))?;
+        pcm_session::start(profile, lease)
+            .map(BusFd::from)
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
 }
 
 struct Lease(Arc<Mutex<bool>>);
@@ -204,38 +227,45 @@ fn start(profile: &Profile, lease: Lease) -> Result<OwnedFd> {
         });
     }
     let (started, startup) = mpsc::channel();
-    thread::Builder::new().name("dpdfnet-xdna2-relay".into()).spawn(move || {
-        let lease = lease;
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = started.send(Err(error));
-                return;
+    thread::Builder::new()
+        .name("dpdfnet-xdna2-relay".into())
+        .spawn(move || {
+            let lease = lease;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = started.send(Err(error));
+                    return;
+                }
+            };
+            drop(command);
+            let ready = control
+                .recv(&mut [0.0; WORDS], deadline(900))
+                .and_then(|stamp| {
+                    if stamp == FIRST {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Missing NPU worker readiness",
+                        ))
+                    }
+                });
+            let is_ready = ready.is_ok();
+            if started.send(ready).is_ok() && is_ready {
+                let _ = bridge(&relay, &control);
             }
-        };
-        drop(command);
-        let ready = control.recv(&mut [0.0; WORDS], deadline(900)).and_then(|stamp| {
-            if stamp == FIRST {
-                Ok(())
-            } else {
-                Err(io::Error::new(io::ErrorKind::InvalidData, "Missing NPU worker readiness"))
+            drop(relay);
+            drop(control);
+            // The audio deadline has already expired. The worker can still be
+            // inside an XRT call. Keep the lease until it exits, without sending
+            // a signal into a driver that may be waking or releasing the device.
+            if let Err(error) = child.wait() {
+                eprintln!("Could not reap NPU worker {}: {error}", child.id());
+                // A wait failure does not prove the device has been released.
+                std::mem::forget(lease);
             }
-        });
-        let is_ready = ready.is_ok();
-        if started.send(ready).is_ok() && is_ready {
-            let _ = bridge(&relay, &control);
-        }
-        drop(relay);
-        drop(control);
-        // The audio deadline has already expired. The worker can still be
-        // inside an XRT call. Keep the lease until it exits, without sending
-        // a signal into a driver that may be waking or releasing the device.
-        if let Err(error) = child.wait() {
-            eprintln!("Could not reap NPU worker {}: {error}", child.id());
-            // A wait failure does not prove the device has been released.
-            std::mem::forget(lease);
-        }
-    })?;
+        })?;
     startup.recv_timeout(Duration::from_secs(1))??;
     Ok(client.0)
 }
@@ -324,6 +354,18 @@ fn main() -> Result<()> {
     if args.len() == 3 && args[0] == "--worker" {
         return worker(Path::new(&args[1]), Path::new(&args[2]));
     }
+    if matches!(args.len(), 4 | 5) && args[0] == "--pcm-worker" {
+        let expected = match args.get(4) {
+            Some(hash) => Some(hash.to_str().ok_or("Invalid PCM client model identity")?),
+            None => None,
+        };
+        return pcm_session::worker(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            expected,
+        );
+    }
     if !args.is_empty() {
         return Err("Unsupported service arguments".into());
     }
@@ -343,6 +385,7 @@ fn main() -> Result<()> {
         settings,
         policy,
         profiles: providers.profiles,
+        pcm_profiles: providers.pcm_profiles,
         lease: Arc::new(Mutex::new(false)),
         development: env::var_os("HUSHMIC_XDNA2_DEVELOPMENT").as_deref() == Some("1".as_ref()),
     };

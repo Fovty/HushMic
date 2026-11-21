@@ -1,4 +1,6 @@
 //! Local transport shared by the host service and the optional HushMic client.
+pub mod pcm;
+
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,

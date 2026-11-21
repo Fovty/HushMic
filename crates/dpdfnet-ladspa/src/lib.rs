@@ -495,25 +495,14 @@ impl Plugin for DpdfnetPlugin {
             emit_silence(&mut output, sample_count);
             return;
         }
-        w.note_quantum(sample_count);
         w.wake();
         let plan = self.aligner.plan(sample_count, w.output_available());
-        for _ in 0..plan.discard {
-            let _ = w.pop_output();
-        }
-        let mut i = 0;
-        for _ in 0..plan.lead_zeros {
-            output[i] = 0.0;
-            i += 1;
-        }
-        for _ in 0..plan.real {
-            output[i] = w.pop_output().unwrap_or(0.0);
-            i += 1;
-        }
-        for _ in 0..plan.tail_zeros {
-            output[i] = 0.0;
-            i += 1;
-        }
+        w.discard_output(plan.discard);
+        let (lead, rest) = output[..sample_count].split_at_mut(plan.lead_zeros);
+        let (real, tail) = rest.split_at_mut(plan.real);
+        lead.fill(0.0);
+        w.read_output(real);
+        tail.fill(0.0);
     }
 }
 

@@ -132,13 +132,31 @@ impl Denoiser {
     /// attenuation limit stay in force — in particular, a `Denoiser` reset
     /// while muted stays silent from the very first sample.
     pub fn reset(&mut self) {
+        self.reset_signal_history();
+        self.gain.reset_to(self.mode == Mode::Mute);
+    }
+
+    /// Restart the analysis, recurrent state, limiter delay and synthesis
+    /// after leaving a full-PCM provider. The mute ramp keeps its position.
+    pub fn reset_signal_history(&mut self) {
         self.analysis.reset();
         self.synthesis.reset();
         self.state.clear();
         self.state.extend_from_slice(&self.model.init_state);
         self.remote_was_active = false;
         self.attn.reset();
-        self.gain.reset_to(self.mode == Mode::Mute);
+    }
+
+    /// Mix controls for a provider that owns analysis and synthesis.
+    pub fn external_pcm_controls(&self) -> (f32, f32) {
+        self.attn.controls_for_next_hop()
+    }
+
+    /// Commit an accepted provider hop and apply the same local mute ramp.
+    pub fn finish_external_pcm(&mut self, (first, second): (&mut [f32], &mut [f32])) {
+        self.attn.advance_bypass();
+        self.gain.process(first);
+        self.gain.process(second);
     }
 
     /// Cap how deep suppression may go by blending the latency-aligned noisy
