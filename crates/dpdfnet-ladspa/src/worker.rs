@@ -9,11 +9,13 @@
 //! host-inserted dropouts.
 
 use hushmic_denoiser::{Denoiser, Mode, HOP};
+use rtrb::CopyToUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use std::{mem::MaybeUninit, slice};
 
 /// Fallback run budget when the process has no finite RTTIME limit.
 /// The guard reserves at least 80 ms for another hop. This is a mitigation,
@@ -128,6 +130,123 @@ impl LagWindow {
 /// construction — the rings never reallocate.
 pub const RING_CAPACITY: usize = 32_768;
 
+pub(crate) fn contiguous_hop<'a>(
+    (first, second): (&'a [f32], &'a [f32]),
+    scratch: &'a mut [f32; HOP],
+) -> &'a [f32; HOP] {
+    if second.is_empty() {
+        return first.try_into().expect("ring hop length");
+    }
+    let (left, right) = scratch.split_at_mut(first.len());
+    left.copy_from_slice(first);
+    right.copy_from_slice(second);
+    scratch
+}
+
+/// Output for one hop. Only a completed render or full PCM reply initializes
+/// a ring reservation. The consumer cannot see the reservation before commit.
+pub struct HopOutput<'a>(OutputStorage<'a>);
+
+enum OutputStorage<'a> {
+    Array(&'a mut [f32; HOP]),
+    Ring {
+        first: &'a mut [MaybeUninit<f32>],
+        second: &'a mut [MaybeUninit<f32>],
+        initialized: bool,
+    },
+}
+
+impl<'a> HopOutput<'a> {
+    pub(crate) fn array(output: &'a mut [f32; HOP]) -> Self {
+        Self(OutputStorage::Array(output))
+    }
+
+    pub fn write(&mut self, audio: &[f32; HOP]) {
+        match &mut self.0 {
+            OutputStorage::Array(output) => output.copy_from_slice(audio),
+            OutputStorage::Ring {
+                first,
+                second,
+                initialized,
+            } => {
+                let (left, right) = audio.split_at(first.len());
+                left.copy_to_uninit(first);
+                right.copy_to_uninit(second);
+                *initialized = true;
+            }
+        }
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        process: impl FnOnce(&mut [f32; HOP]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match &mut self.0 {
+            OutputStorage::Array(output) => process(output),
+            OutputStorage::Ring { .. } => {
+                let mut staged = [0.0; HOP];
+                let result = process(&mut staged);
+                self.write(&staged);
+                result
+            }
+        }
+    }
+
+    fn ensure_initialized(&mut self) {
+        if matches!(
+            self.0,
+            OutputStorage::Ring {
+                initialized: false,
+                ..
+            }
+        ) {
+            self.write(&[0.0; HOP]);
+        }
+    }
+
+    pub(crate) fn initialized_parts(&mut self) -> (&mut [f32], &mut [f32]) {
+        self.ensure_initialized();
+        match &mut self.0 {
+            OutputStorage::Array(output) => (output.as_mut_slice(), &mut []),
+            OutputStorage::Ring { first, second, .. } => {
+                // SAFETY: ensure_initialized guarantees every sample is initialized.
+                unsafe {
+                    (
+                        slice::from_raw_parts_mut(first.as_mut_ptr().cast(), first.len()),
+                        slice::from_raw_parts_mut(second.as_mut_ptr().cast(), second.len()),
+                    )
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "xdna2")]
+    pub(crate) fn receive_pcm(
+        &mut self,
+        stream: &mut dpdfnet_xdna2::pcm::Stream,
+        input: (&[f32], &[f32]),
+        attenuation: f32,
+        bypass: f32,
+    ) -> std::io::Result<(&mut [f32], &mut [f32])> {
+        match &mut self.0 {
+            OutputStorage::Array(output) => {
+                stream.step_parts(input, (output.as_mut_slice(), &mut []), attenuation, bypass)?;
+                Ok((output.as_mut_slice(), &mut []))
+            }
+            OutputStorage::Ring {
+                first,
+                second,
+                initialized,
+            } => {
+                *initialized = false;
+                let result = stream.step_into(input, (first, second), attenuation, bypass)?;
+                *initialized = true;
+                Ok(result)
+            }
+        }
+    }
+}
+
 /// The seam between the worker and the DSP: implemented by the real
 /// [`Denoiser`] and by test fakes, so the whole threading/alignment
 /// machinery is testable without ONNX Runtime or model files.
@@ -137,9 +256,27 @@ pub const RING_CAPACITY: usize = 32_768;
 /// transient failures.
 pub trait HopEngine: Send + 'static {
     fn process_hop(&mut self, input: &[f32; HOP], output: &mut [f32; HOP]) -> Result<(), String>;
+    fn process_hop_parts(
+        &mut self,
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        output: &mut [f32; HOP],
+    ) -> Result<(), String> {
+        self.process_hop(contiguous_hop(input, scratch), output)
+    }
+    fn process_hop_output(
+        &mut self,
+        input: (&[f32], &[f32]),
+        scratch: &mut [f32; HOP],
+        output: &mut HopOutput<'_>,
+    ) -> Result<(), String> {
+        output.render(|audio| self.process_hop_parts(input, scratch, audio))
+    }
     fn reset(&mut self);
     fn set_mode(&mut self, mode: Mode);
     fn set_attenuation_limit_db(&mut self, db: f32);
+    /// Apply queued backend changes while the worker is waiting for audio.
+    fn poll_control(&mut self) {}
     /// Overdue hops after allowing for a fresh host callback burst,
     /// smoothed over one callback. Default: ignored.
     fn set_lag_hops(&mut self, _hops: u32) {}
@@ -343,13 +480,11 @@ impl WorkerHandle {
     /// caller restarts the stream (see [`Self::request_reset`]).
     pub fn push_input(&mut self, samples: &[f32]) -> usize {
         self.note_quantum(samples.len());
-        for (i, &s) in samples.iter().enumerate() {
-            if self.input.push(s).is_err() {
-                self.shared.overflow_report.store(true, Ordering::Release);
-                return i;
-            }
+        let (accepted, pending) = self.input.push_partial_slice(samples);
+        if !pending.is_empty() {
+            self.shared.overflow_report.store(true, Ordering::Release);
         }
-        samples.len()
+        accepted.len()
     }
 
     /// RT-safe: samples currently poppable from the output ring.
@@ -362,10 +497,24 @@ impl WorkerHandle {
         self.output.pop().ok()
     }
 
+    /// RT-safe: copy the available output and zero-fill any shortfall.
+    pub(crate) fn read_output(&mut self, samples: &mut [f32]) {
+        let (_, remainder) = self.output.pop_partial_slice(samples);
+        remainder.fill(0.0);
+    }
+
+    /// RT-safe: discard up to the requested number of produced samples.
+    pub(crate) fn discard_output(&mut self, samples: usize) {
+        let count = samples.min(self.output.slots());
+        if let Ok(chunk) = self.output.read_chunk(count) {
+            chunk.commit_all();
+        }
+    }
+
     /// Throw away everything in the output ring (activation only —
     /// stale pre-reset audio must not leak into the new session).
     pub fn drain_output(&mut self) {
-        while self.output.pop().is_ok() {}
+        self.discard_output(usize::MAX);
     }
 
     /// A panic escaped the engine; the node is silent until re-instantiated.
@@ -540,7 +689,10 @@ fn worker_loop(
         }
         let epoch = shared.reset_epoch.load(Ordering::Acquire);
         if epoch != seen_epoch {
-            while input.pop().is_ok() {}
+            let count = input.slots();
+            if let Ok(chunk) = input.read_chunk(count) {
+                chunk.commit_all();
+            }
             lag_window.0.clear();
             engine.reset();
             err_logged = false; // a fresh session logs its own first failure
@@ -559,6 +711,7 @@ fn worker_loop(
             mode_cache = mode;
         }
         if input.slots() < HOP {
+            engine.poll_control();
             // Timeout guards a lost wakeup; the RT side unparks on every
             // push, so this is normally a pure park.
             // The lag window survives the park: with a cycle of several
@@ -583,13 +736,34 @@ fn worker_loop(
             .div_ceil(HOP)
             .max(1);
         engine.set_lag_hops(lag_window.observe(queued, per_cycle));
-        for s in hop_in.iter_mut() {
-            *s = input.pop().unwrap_or(0.0);
-        }
+        let chunk = input
+            .read_chunk(HOP)
+            .expect("checked ring input availability");
+        let mut reserved = if cfg!(feature = "xdna2") && output.slots() >= HOP {
+            output.write_chunk_uninit(HOP).ok()
+        } else {
+            None
+        };
         let started = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            engine.process_hop(&hop_in, &mut hop_out)
+            let mut destination = match &mut reserved {
+                Some(reservation) => {
+                    let (first, second) = reservation.as_mut_slices();
+                    HopOutput(OutputStorage::Ring {
+                        first,
+                        second,
+                        initialized: false,
+                    })
+                }
+                None => HopOutput::array(&mut hop_out),
+            };
+            let result =
+                engine.process_hop_output(chunk.as_slices(), &mut hop_in, &mut destination);
+            destination.ensure_initialized();
+            result
         }));
+        // Keep both input spans valid through inference and any CPU fallback.
+        chunk.commit_all();
         guard.account(started.elapsed());
         match result {
             Ok(Ok(())) => {}
@@ -607,19 +781,30 @@ fn worker_loop(
                 return;
             }
         }
-        let mut pushed = 0;
-        while pushed < HOP {
+        if let Some(reservation) = reserved {
+            if shared.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            if shared.reset_epoch.load(Ordering::Acquire) == seen_epoch {
+                // SAFETY: The successful catch path initialized every sample.
+                // A concurrent later reset uses the ack-then-drain protocol.
+                unsafe { reservation.commit_all() };
+            }
+            continue;
+        }
+        let mut pending = hop_out.as_slice();
+        while !pending.is_empty() {
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
             if shared.reset_epoch.load(Ordering::Acquire) != seen_epoch {
                 break; // abandon the partial hop; the reset drains everything
             }
-            match output.push(hop_out[pushed]) {
-                Ok(()) => pushed += 1,
-                // Output ring full: the RT side stopped popping (host
-                // paused the stream). Wait for space.
-                Err(_) => park_accounted(&mut guard, Duration::from_millis(1)),
+            let (accepted, remainder) = output.push_partial_slice(pending);
+            pending = remainder;
+            if accepted.is_empty() {
+                // Output ring full: the RT side stopped popping.
+                park_accounted(&mut guard, Duration::from_millis(1));
             }
         }
     }
@@ -631,6 +816,55 @@ mod replay;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_while_rendering_a_reserved_hop_discards_it_before_ack() {
+        use std::sync::mpsc;
+
+        struct HeldHop(Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>);
+        impl HopEngine for HeldHop {
+            fn process_hop(
+                &mut self,
+                input: &[f32; HOP],
+                output: &mut [f32; HOP],
+            ) -> Result<(), String> {
+                if let Some((started, resume)) = self.0.take() {
+                    started.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                output.copy_from_slice(input);
+                Ok(())
+            }
+            fn reset(&mut self) {}
+            fn set_mode(&mut self, _: Mode) {}
+            fn set_attenuation_limit_db(&mut self, _: f32) {}
+        }
+
+        let (started, in_render) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        let mut worker = WorkerHandle::spawn_timeshare(HeldHop(Some((started, wait)))).unwrap();
+        assert_eq!(worker.push_input(&[0.5; HOP]), HOP);
+        worker.wake();
+        in_render.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.request_reset();
+        resume.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !worker.reset_acked() {
+            assert!(Instant::now() < until, "worker did not acknowledge reset");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(worker.output_available(), 0);
+        assert_eq!(worker.push_input(&[0.25; HOP]), HOP);
+        worker.wake();
+        let until = Instant::now() + Duration::from_secs(3);
+        while worker.output_available() < HOP {
+            assert!(Instant::now() < until, "worker did not publish the new hop");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let mut output = [0.0; HOP];
+        worker.read_output(&mut output);
+        assert_eq!(output, [0.25; HOP]);
+    }
 
     #[test]
     fn late_grant_discards_timeshare_run() {

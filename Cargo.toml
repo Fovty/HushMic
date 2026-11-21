@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dpdfnet-ladspa", "crates/hushmic", "crates/hushmic-denoiser"]
+members = ["crates/dpdfnet-ladspa", "crates/hushmic", "crates/hushmic-denoiser", "crates/dpdfnet-xdna2"]
 
 [workspace.package]
 edition = "2021"

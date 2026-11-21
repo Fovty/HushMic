@@ -1,0 +1,8 @@
+[Unit]
+Description=HushMic DPDFNet XDNA2 service
+
+[Service]
+Type=dbus
+BusName=io.github.fovty.HushMic.XDNA2
+ExecStart=/usr/bin/dpdfnet-xdna2-service
+NoNewPrivileges=yes

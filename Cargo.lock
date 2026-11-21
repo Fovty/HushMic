@@ -829,10 +829,23 @@ name = "dpdfnet-ladspa"
 version = "0.11.0"
 dependencies = [
  "claxon",
+ "dpdfnet-xdna2",
  "hushmic-denoiser",
  "ladspa",
  "libc",
  "rtrb",
+]
+
+[[package]]
+name = "dpdfnet-xdna2"
+version = "0.11.0"
+dependencies = [
+ "libc",
+ "libloading 0.9.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zbus",
 ]
 
 [[package]]

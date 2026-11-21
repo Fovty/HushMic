@@ -10,6 +10,13 @@ pub mod ladder;
 pub mod log;
 pub mod rt;
 pub mod worker;
+#[cfg(feature = "xdna2")]
+mod xdna2;
+
+#[cfg(feature = "xdna2")]
+type SelectedEngine = xdna2::Engine;
+#[cfg(not(feature = "xdna2"))]
+type SelectedEngine = Denoiser;
 
 pub use adaptive::{AdaptiveEngine, RawDelay};
 pub use align::{
@@ -262,7 +269,7 @@ fn runtime_note(ours: Option<&str>, requested: &str) -> Option<String> {
 /// and both go through `load_denoiser`, so both tiers run on the selected
 /// engine. The runtime is committed even when both models end up native:
 /// any fallback to ONNX needs it.
-fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
+fn init_engine() -> Option<AdaptiveEngine<SelectedEngine, Box<dyn Policy>>> {
     let dylib = std::env::var("ORT_DYLIB_PATH")
         .ok()
         .filter(|s| !s.is_empty()) // empty counts as unset, as in ort itself
@@ -339,6 +346,11 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
             }
         });
     let (tiers, main_tier) = plan_tiers(&main_path, light.is_some());
+    #[cfg(feature = "xdna2")]
+    let (main, light) = (
+        xdna2::Engine::main(main),
+        light.map(xdna2::Engine::secondary),
+    );
     let (quality, light) = match main_tier {
         Tier::Light => (None, Some(main)),
         _ => (Some(main), light),
@@ -379,6 +391,8 @@ impl DpdfnetPlugin {
         } else {
             init_engine()
         };
+        #[cfg(feature = "xdna2")]
+        xdna2::clear_pending();
         DpdfnetPlugin {
             worker: engine.and_then(WorkerHandle::spawn),
             aligner: Aligner::new(),
@@ -481,25 +495,14 @@ impl Plugin for DpdfnetPlugin {
             emit_silence(&mut output, sample_count);
             return;
         }
-        w.note_quantum(sample_count);
         w.wake();
         let plan = self.aligner.plan(sample_count, w.output_available());
-        for _ in 0..plan.discard {
-            let _ = w.pop_output();
-        }
-        let mut i = 0;
-        for _ in 0..plan.lead_zeros {
-            output[i] = 0.0;
-            i += 1;
-        }
-        for _ in 0..plan.real {
-            output[i] = w.pop_output().unwrap_or(0.0);
-            i += 1;
-        }
-        for _ in 0..plan.tail_zeros {
-            output[i] = 0.0;
-            i += 1;
-        }
+        w.discard_output(plan.discard);
+        let (lead, rest) = output[..sample_count].split_at_mut(plan.lead_zeros);
+        let (real, tail) = rest.split_at_mut(plan.real);
+        lead.fill(0.0);
+        w.read_output(real);
+        tail.fill(0.0);
     }
 }
 

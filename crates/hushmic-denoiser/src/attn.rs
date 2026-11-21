@@ -58,17 +58,23 @@ impl AttnLimiter {
         self.bypass_mix = 0.0; // fresh session fades in from processed
     }
 
+    pub(crate) fn controls_for_next_hop(&self) -> (f32, f32) {
+        let step = 1.0 / BYPASS_RAMP_HOPS as f32;
+        let delta = self.bypass_target - self.bypass_mix;
+        let bypass = if delta.abs() <= step {
+            self.bypass_target
+        } else {
+            self.bypass_mix + step * delta.signum()
+        };
+        (if self.enabled { self.alpha } else { 0.0 }, bypass)
+    }
+
+    pub(crate) fn advance_bypass(&mut self) {
+        self.bypass_mix = self.controls_for_next_hop().1;
+    }
+
     pub fn apply(&mut self, noisy: &[f32; SPEC_LEN], enhanced: &mut [f32; SPEC_LEN]) {
-        // step the bypass mix once per hop; land exactly on the target
-        if self.bypass_mix != self.bypass_target {
-            let step = 1.0 / BYPASS_RAMP_HOPS as f32;
-            let d = self.bypass_target - self.bypass_mix;
-            if d.abs() <= step {
-                self.bypass_mix = self.bypass_target;
-            } else {
-                self.bypass_mix += step * d.signum();
-            }
-        }
+        self.advance_bypass();
         // maintain a delay line of the last NOISY_FRAME_OFFSET noisy frames
         self.ring.push_back(*noisy);
         let delayed = if self.ring.len() > NOISY_FRAME_OFFSET {

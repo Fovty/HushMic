@@ -13,12 +13,14 @@ crate-type = ["cdylib", "rlib"]   # cdylib for the LADSPA .so; rlib for the test
 # engine runs is still decided per model at load time, with ONNX as the
 # fallback. `--no-default-features` builds an ONNX-only plugin.
 default = ["native"]
+xdna2 = ["dep:dpdfnet-xdna2"]
 native = ["hushmic-denoiser/native"]
 
 [dependencies]
 ladspa = "0.3.4"
 hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.11.0" }
 rtrb = "0.4.0"
+dpdfnet-xdna2 = { path = "../dpdfnet-xdna2", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
