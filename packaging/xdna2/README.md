@@ -34,4 +34,6 @@ registry in the development catalog. Start the test service with a private
 `HUSHMIC_XDNA2_FULL_PCM=1` in the LADSPA host select this full-PCM route.
 The existing LADSPA ports and spectral service method are shared with the
 standard package. The broker returns the worker's direct PCM socket and
-retains the device lease until that worker exits.
+retains the device lease until that worker exits. An installed PCM-only
+development catalog can advertise availability for Prefer NPU. Automatic
+selection still requires a qualified spectral profile.

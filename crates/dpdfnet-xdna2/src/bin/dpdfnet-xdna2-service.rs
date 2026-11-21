@@ -113,9 +113,10 @@ impl Broker {
         });
         let profiles = self.profiles.values();
         let ready = device
-            && profiles
+            && (profiles
                 .clone()
-                .any(|p| p.qualified_for_live_audio || self.development);
+                .any(|p| p.qualified_for_live_audio || self.development)
+                || (self.development && !self.pcm_profiles.is_empty()));
         let automatic = device
             && profiles
                 .clone()
