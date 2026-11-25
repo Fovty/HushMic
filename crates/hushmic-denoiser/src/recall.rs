@@ -4,10 +4,12 @@
 //! several seconds. After ~10 s of silence that memory of the near talker has
 //! faded, and the next voice — even a distant, reverberant one — is accepted as
 //! the talker for its whole phrase. So: remember the state (norms included)
-//! while the model passes speech, and put it back every 2 s of quiet input and
-//! output, never on a sounding hop (stale conv buffers would clip the onset),
-//! and on reset (so a stream restart keeps the talker). The output-side tail
-//! is left alone (see [`OUTPUT_TAIL`]).
+//! while the model passes speech, and put it back every 2 s of silent output,
+//! never on a sounding hop (stale conv buffers would clip the onset), and on
+//! reset (so a stream restart keeps the talker). Silent output with loud input
+//! counts too: a background talker who keeps going never pauses 2 s, and is
+//! accepted within a minute unless the memory is re-asserted under them. The
+//! output-side tail is left alone (see [`OUTPUT_TAIL`]).
 
 use crate::stft::{FREQ_BINS, HOP, SPEC_LEN};
 
@@ -15,8 +17,6 @@ use crate::stft::{FREQ_BINS, HOP, SPEC_LEN};
 const SILENT_DB: f32 = -75.0;
 /// Model output above this is speech worth remembering.
 const SPEECH_DB: f32 = -60.0;
-/// Input below this is room tone (~-73 dB), not a suppressed talker.
-const QUIET_INPUT_DB: f32 = -60.0;
 /// Re-assert the talker every 2 s so its memory never fades across a long pause.
 const RESTORE_AFTER_HOPS: u32 = 200;
 /// State tail (DF temporal conv + 3 decoder convs, same in dpdfnet2/8): a
@@ -54,16 +54,15 @@ impl Recall {
         self.quiet_hops = 0;
     }
 
-    /// Call after each good model hop with the new state, the input hop level
-    /// and the model's output level (before any attenuation blend). Returns
-    /// true when it restored.
-    pub(crate) fn after_hop(&mut self, state: &mut [f32], in_db: f32, out_db: f32) -> bool {
+    /// Call after each good model hop with the new state and the model's output
+    /// level (before any attenuation blend). Returns true when it restored.
+    pub(crate) fn after_hop(&mut self, state: &mut [f32], out_db: f32) -> bool {
         let n = self.snapshot.len();
         if state.len() != n + OUTPUT_TAIL || n == 0 {
             return false;
         }
         let mut restored = false;
-        if out_db < SILENT_DB && in_db < QUIET_INPUT_DB {
+        if out_db < SILENT_DB {
             self.quiet_hops = self.quiet_hops.saturating_add(1);
             if self.has_snapshot && self.quiet_hops.is_multiple_of(RESTORE_AFTER_HOPS) {
                 state[..n].copy_from_slice(&self.snapshot);
@@ -107,39 +106,29 @@ mod tests {
         assert!((db + 24.8).abs() < 0.5, "{db}");
     }
 
-    const QUIET: (f32, f32) = (-73.0, -119.0); // room tone in, silence out
+    const QUIET: f32 = -119.0; // the model's silence
     const N: usize = 4 + OUTPUT_TAIL;
 
     fn quiet(r: &mut Recall, s: &mut [f32], hops: u32) -> bool {
-        (0..hops).any(|_| r.after_hop(s, QUIET.0, QUIET.1))
+        (0..hops).any(|_| r.after_hop(s, QUIET))
     }
 
     #[test]
     fn restores_prefix_during_silence_not_on_onset() {
         let mut r = Recall::new(N);
         let mut s = vec![1.0; N];
-        assert!(!r.after_hop(&mut s, -30.0, -40.0)); // speech: remembered
+        assert!(!r.after_hop(&mut s, -40.0)); // speech: remembered
         s = vec![2.0; N]; // state drifts during silence
         assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
-        assert!(r.after_hop(&mut s, QUIET.0, QUIET.1), "2 s of quiet");
+        assert!(r.after_hop(&mut s, QUIET), "2 s of quiet");
         assert_eq!(s[..4], [1.0; 4], "norms included");
         assert!(s[4..].iter().all(|&v| v == 2.0), "output tail left alone");
         s = vec![2.0; N];
         assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
-        assert!(r.after_hop(&mut s, QUIET.0, QUIET.1), "again at 4 s");
+        assert!(r.after_hop(&mut s, QUIET), "again at 4 s");
         s = vec![3.0; N];
-        assert!(!r.after_hop(&mut s, -30.0, -50.0), "not on the onset");
+        assert!(!r.after_hop(&mut s, -50.0), "not on the onset");
         assert!(s.iter().all(|&v| v == 3.0));
-    }
-
-    #[test]
-    fn suppressed_loud_input_does_not_count() {
-        let mut r = Recall::new(N);
-        let mut s = vec![1.0; N];
-        r.after_hop(&mut s, -30.0, -40.0);
-        for _ in 0..2 * RESTORE_AFTER_HOPS {
-            assert!(!r.after_hop(&mut s, -40.0, QUIET.1), "other talker, cut");
-        }
     }
 
     #[test]
@@ -150,12 +139,12 @@ mod tests {
             !quiet(&mut r, &mut s, 2 * RESTORE_AFTER_HOPS),
             "nothing remembered"
         );
-        r.after_hop(&mut s, -30.0, -40.0);
+        r.after_hop(&mut s, -40.0);
         assert!(
             !quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1),
             "pause too short"
         );
-        r.after_hop(&mut s, -30.0, -50.0); // sound resets the count
+        r.after_hop(&mut s, -50.0); // sound resets the count
         assert!(!quiet(&mut r, &mut s, RESTORE_AFTER_HOPS - 1));
     }
 
@@ -163,7 +152,7 @@ mod tests {
     fn state_without_room_for_the_tail_is_left_alone() {
         let mut r = Recall::new(4);
         let mut s = vec![1.0; 4];
-        r.after_hop(&mut s, -30.0, -40.0);
+        r.after_hop(&mut s, -40.0);
         s = vec![2.0; 4];
         assert!(!quiet(&mut r, &mut s, 2 * RESTORE_AFTER_HOPS));
         r.reset(&mut s);
@@ -174,7 +163,7 @@ mod tests {
     fn reset_restores_and_keeps_the_snapshot() {
         let mut r = Recall::new(N);
         let mut s = vec![1.0; N];
-        r.after_hop(&mut s, -30.0, -40.0);
+        r.after_hop(&mut s, -40.0);
         s = vec![0.0; N]; // re-initialised state
         r.reset(&mut s);
         assert_eq!(s[..4], [1.0; 4]);

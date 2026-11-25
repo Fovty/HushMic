@@ -203,8 +203,8 @@ impl Denoiser {
         match &result {
             Ok(()) => {
                 std::mem::swap(&mut self.state, &mut self.state_out);
-                let (in_db, out_db) = (frame_db(&self.spec), frame_db(&self.spec_e));
-                self.recall.after_hop(&mut self.state, in_db, out_db);
+                self.recall
+                    .after_hop(&mut self.state, frame_db(&self.spec_e));
             }
             Err(_) => {
                 // Keep the recurrent state as-is (last good frame) and emit a
