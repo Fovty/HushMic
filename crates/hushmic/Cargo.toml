@@ -74,7 +74,7 @@ symphonia-adapter-libopus = { version = "0.2.9", default-features = false, optio
 flacenc = { version = "0.5.1", default-features = false }
 # The engine for the file pass, the same crate and native runtime the
 # plugin runs.
-hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.11.0", features = ["native"] }
+hushmic-denoiser = { path = "../hushmic-denoiser", version = "1.0.0", features = ["native"] }
 
 [features]
 opus = ["dep:symphonia-adapter-libopus"]

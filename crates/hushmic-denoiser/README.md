@@ -27,7 +27,7 @@ release tag:
 
 ```toml
 [dependencies]
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.11.0" }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v1.0.0" }
 ```
 
 ## What you need at runtime
@@ -63,7 +63,7 @@ feature and configure [`ort`](https://crates.io/crates/ort) yourself; cargo
 merges the features:
 
 ```toml
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.11.0", default-features = false }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v1.0.0", default-features = false }
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 ```
 
@@ -81,7 +81,7 @@ the CPU time of ONNX Runtime, and about a quarter to a third with AVX-VNNI. Its 
 to 39 dB (waveform SNR).
 
 ```toml
-hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v0.11.0", features = ["native"] }
+hushmic-denoiser = { git = "https://github.com/Fovty/HushMic", tag = "v1.0.0", features = ["native"] }
 ```
 
 ```rust

@@ -888,7 +888,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "dpdfnet-ladspa"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "claxon",
  "hushmic-denoiser",
@@ -1601,7 +1601,7 @@ checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "hushmic"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "ab_glyph",
  "directories",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "hushmic-denoiser"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "cc",
  "claxon",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "hushmic-shm"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "libc",
 ]
