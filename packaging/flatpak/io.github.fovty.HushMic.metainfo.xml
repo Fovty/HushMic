@@ -48,9 +48,7 @@
 
   <screenshots>
     <!-- Keep pinned to a PUBLISHED release tag, not a branch: the CI lint
-         fetches these URLs, so they must exist when a pipeline runs. The
-         window's screenshots go in with the post-release packaging pin,
-         once a published tag has them (v1.0.0):
+         fetches these URLs, so they must exist when a pipeline runs. -->
     <screenshot type="default">
       <image>https://raw.githubusercontent.com/Fovty/HushMic/v1.0.0/docs/img/hushmic-live.png</image>
       <caption>Live: the sound going in and coming out, the app using it, and a replay of the last 10 seconds with the original at the same moment</caption>
@@ -66,11 +64,6 @@
     <screenshot>
       <image>https://raw.githubusercontent.com/Fovty/HushMic/v1.0.0/docs/img/hushmic-settings.png</image>
       <caption>Settings: start on login, notifications, appearance and the tray icon</caption>
-    </screenshot>
-    -->
-    <screenshot type="default">
-      <image>https://raw.githubusercontent.com/Fovty/HushMic/v0.3.0/docs/img/hushmic-ab-window.png</image>
-      <caption>Live A/B mic test: raw input next to the cleaned output other apps receive</caption>
     </screenshot>
   </screenshots>
 
