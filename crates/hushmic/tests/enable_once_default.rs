@@ -135,12 +135,15 @@ exit 0"#,
     std::thread::sleep(Duration::from_secs(3));
     std::fs::write(&up, b"").unwrap();
 
-    let taken = wait_for(&store, "hushmic_source", Duration::from_secs(8));
+    // At once on an idle machine. The takeover first puts the user's
+    // default on the disk and waits for it, so a disk that stalls holds
+    // it up (12 s seen in CI): the limit is for that, not for the usual case.
+    let taken = wait_for(&store, "hushmic_source", Duration::from_secs(60));
     // SIGTERM: the teardown hands the default back.
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }
-    let restored = wait_for(&store, "builtin", Duration::from_secs(10));
+    let restored = wait_for(&store, "builtin", Duration::from_secs(30));
     let out = child.wait_with_output().unwrap();
     let log = String::from_utf8_lossy(&out.stderr);
     // Chain files outside the scratch dir (a disk-backed one): ours too.
