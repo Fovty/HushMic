@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - 'v*'
+  # The package jobs again for a release that is out (a recipe fixed after
+  # its tag): run from main, which then supplies the recipes, with the tag
+  # to package. The build and the release itself are skipped.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Released tag to package again (for example v1.0.0)"
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -11,6 +22,7 @@ permissions:
 jobs:
   release:
     name: Build and publish release artifacts
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     # Build inside the OLDEST supported base: artifacts inherit the build
     # host's glibc requirement, and building straight on ubuntu-latest
@@ -118,14 +130,14 @@ jobs:
   aur:
     name: Publish to AUR
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ !cancelled() && needs.release.result != 'failure' && !contains(inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set pkgver from the release tag
-        run: sed -i -e "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" -e "s/^pkgrel=.*/pkgrel=1/" packaging/PKGBUILD
+        run: sed -i -e "s/^pkgver=.*/pkgver=${TAG#v}/" -e "s/^pkgrel=.*/pkgrel=1/" packaging/PKGBUILD
 
       # Clones the AUR repo, re-hashes the new tag tarball (updpkgsums) and
       # regenerates .SRCINFO in an Arch container, then commits and pushes.
@@ -138,21 +150,21 @@ jobs:
           commit_username: Fovty
           commit_email: 38868829+Fovty@users.noreply.github.com
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "Update to ${{ github.ref_name }}"
+          commit_message: "Update to ${{ inputs.tag || github.ref_name }}"
           ssh_keyscan_types: ed25519
           updpkgsums: true
 
   aur-bin:
     name: Publish hushmic-bin to the AUR
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ !cancelled() && needs.release.result != 'failure' && !contains(inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set pkgver from the release tag
-        run: sed -i -e "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" -e "s/^pkgrel=.*/pkgrel=1/" packaging/aur-bin/PKGBUILD
+        run: sed -i -e "s/^pkgver=.*/pkgver=${TAG#v}/" -e "s/^pkgrel=.*/pkgrel=1/" packaging/aur-bin/PKGBUILD
 
       # Same flow as the source package, but the source= here is the release
       # ASSET this run just published, so updpkgsums re-hashes the artifact
@@ -165,14 +177,14 @@ jobs:
           commit_username: Fovty
           commit_email: 38868829+Fovty@users.noreply.github.com
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "Update to ${{ github.ref_name }}"
+          commit_message: "Update to ${{ inputs.tag || github.ref_name }}"
           ssh_keyscan_types: ed25519
           updpkgsums: true
 
   copr:
     name: Build the Fedora COPR package
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ !cancelled() && needs.release.result != 'failure' && !contains(inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     # Fedora tooling (rpmbuild/spectool/copr-cli) isn't on the stock runner;
     # only the SRPM is assembled here — COPR does the per-chroot builds. Pinned
@@ -193,7 +205,7 @@ jobs:
         # Block scalar: the sed expression contains ": ", which YAML would
         # otherwise read as a mapping and fail to parse the whole workflow.
         run: |
-          V="${GITHUB_REF_NAME#v}"
+          V="${TAG#v}"
           sed -i "s/^Version:.*/Version:        $V/" packaging/hushmic.spec
           # The changelog has to move with the version: rpm derives
           # SOURCE_DATE_EPOCH from the newest entry and clamps every packaged
@@ -239,7 +251,7 @@ jobs:
   nix:
     name: Trigger the NixOS flake update
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       # Fire the self-maintained hushmic-nix fork's updater the moment a release

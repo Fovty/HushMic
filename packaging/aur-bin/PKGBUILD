@@ -23,7 +23,7 @@ conflicts=('hushmic')
 # Prebuilt payload: stripping it would only churn the binary and the 23 MB
 # bundled ONNX Runtime, and debug extraction has no sources to point at.
 options=('!strip' '!debug')
-source=("$url/releases/download/v$pkgver/hushmic-$pkgver-x86_64.tar.gz")
+source=("https://github.com/Fovty/hushmic/releases/download/v$pkgver/hushmic-$pkgver-x86_64.tar.gz")
 sha256sums=('4c6e24cd15c896ba44aa9a4a9d06e818019754f319abacdb8b30bfd1230a41a5')
 
 package() {

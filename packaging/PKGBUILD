@@ -11,7 +11,7 @@ depends=('pipewire' 'pipewire-pulse' 'wireplumber' 'onnxruntime' 'opus')
 # without ffmpeg Save writes FLAC and a video keeps its sound only
 optdepends=('ffmpeg: Save in the original format')
 makedepends=('rust' 'cargo' 'python' 'curl')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Fovty/hushmic/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('84417cb490560afc08ad7548b3119a76d300ac5a7214ae5340dbebc0db4f2da3')
 # GitHub archive dirs use the CANONICAL repo name (Fovty/HushMic), so the
 # tarball extracts to HushMic-<ver>/ regardless of the URL's casing.

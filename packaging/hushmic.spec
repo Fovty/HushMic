@@ -18,7 +18,7 @@ Summary:        Real-time microphone noise suppression as a virtual mic
 
 License:        MIT OR Apache-2.0
 URL:            https://hushmic.org
-Source0:        %{url}/releases/download/v%{version}/hushmic-%{version}-x86_64.tar.gz
+Source0:        https://github.com/Fovty/hushmic/releases/download/v%{version}/hushmic-%{version}-x86_64.tar.gz
 
 # The release ships a prebuilt x86-64 binary (glibc 2.35 floor).
 ExclusiveArch:  x86_64
