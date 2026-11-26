@@ -63,6 +63,31 @@ fn config_set_and_get_work_on_the_file_without_a_daemon() {
     assert!(err.contains("nope.onnx"), "{err}");
     let (code, out, err) = run(&home, &["config", "set", "model", "dpdfnet2_48khz_hr"]);
     assert_eq!(code, 0, "{out}{err}");
+    // the window's word for it, said back as typed (F13); the id is what
+    // is written
+    let (code, out, err) = run(&home, &["config", "set", "model", "light"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.starts_with("model = light"), "{out}");
+    let (_, out, _) = run(&home, &["config", "get", "model"]);
+    assert_eq!(out.trim(), "dpdfnet2_48khz_hr");
+    let (code, _, err) = run(&home, &["config", "set", "model", "quality"]);
+    assert_eq!(code, 1);
+    assert!(
+        err.starts_with("the quality model is not installed"),
+        "{err}"
+    );
+    // out of range is refused, the file unchanged
+    let (code, _, err) = run(&home, &["config", "set", "attn_limit", "9999"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("must be 0-100"), "{err}");
+    let (_, out, _) = run(&home, &["config", "get", "attn_limit"]);
+    assert_eq!(out.trim(), "24");
+    // the app's bookkeeping is not listed
+    let (_, out, _) = run(&home, &["config"]);
+    assert!(
+        !out.contains("close_notice_sent") && !out.lines().any(|l| l.starts_with("enabled =")),
+        "{out}"
+    );
     let (code, _, err) = run(&home, &["config", "set", "enabled", "false"]);
     assert_eq!(code, 1);
     assert!(err.contains("hushmic mode"), "{err}");
@@ -91,7 +116,11 @@ fn config_set_and_get_work_on_the_file_without_a_daemon() {
     let entry = home.join(".config/autostart/hushmic.desktop");
     let (code, out, err) = run(&home, &["config", "set", "autostart", "true"]);
     assert_eq!(code, 0, "{out}{err}");
-    assert!(out.starts_with("autostart = true"), "{out}");
+    // says what was done: the entry is written now
+    assert!(
+        out.starts_with("autostart = true (saved; HushMic starts when you log in)"),
+        "{out}"
+    );
     let text = std::fs::read_to_string(&entry).expect("autostart entry written");
     assert!(text.contains("--tray"), "{text}");
     let (code, _, _) = run(&home, &["config", "set", "autostart", "false"]);
@@ -105,5 +134,188 @@ fn config_set_and_get_work_on_the_file_without_a_daemon() {
     // an unrelated control verb still reports "not running"
     let (code, _, err) = run(&home, &["status"]);
     assert_eq!(code, 2, "{err}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// F13 / A106 N-T1: with a microphone of its own settings, `set` saves
+/// model and strength for it; `--defaults` sets the defaults and leaves
+/// the microphone's own alone. One parenthesis says both (N-C1); no value
+/// after --defaults is a usage error (N-C2).
+#[test]
+fn config_set_defaults_leaves_a_microphones_own_alone() {
+    let home =
+        std::env::temp_dir().join(format!("hushmic-offline-defaults-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("run")).unwrap();
+    std::fs::create_dir_all(home.join(".config/hushmic")).unwrap();
+    std::fs::create_dir_all(home.join("models")).unwrap();
+    std::fs::write(home.join("models/dpdfnet2_48khz_hr.onnx"), b"x").unwrap();
+    let cfg_path = home.join(".config/hushmic/config.toml");
+    std::fs::write(
+        &cfg_path,
+        "mic = \"usbmic\"\nattn_limit = 30.0\n\n[mic_prefs.usbmic]\n\
+         model = \"dpdfnet2_48khz_hr\"\nattn_limit = 24.0\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&home, &["config", "set", "attn_limit", "18"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(
+        out.trim(),
+        "attn_limit = 18 (saved for usbmic; the defaults stay 30; applies when HushMic starts)"
+    );
+    let (code, out, err) = run(&home, &["config", "set", "--defaults", "attn_limit", "12"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(
+        out.trim(),
+        "attn_limit = 12 (the defaults; microphones with their own settings keep theirs; \
+         saved; applies when HushMic starts)"
+    );
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(cfg["attn_limit"].as_float(), Some(12.0), "{text}");
+    assert_eq!(
+        cfg["mic_prefs"]["usbmic"]["attn_limit"].as_float(),
+        Some(18.0),
+        "the microphone keeps its own: {text}"
+    );
+    let (code, _, err) = run(&home, &["config", "set", "--defaults", "attn_limit"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("usage: hushmic config"), "{err}");
+    assert!(!err.contains("unknown key"), "{err}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(feature = "speakers")]
+#[test]
+fn the_speakers_command_works_on_the_file_without_a_daemon() {
+    let home = std::env::temp_dir().join(format!("hushmic-offline-spk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("run")).unwrap();
+    std::fs::create_dir_all(home.join("models")).unwrap();
+    let (code, out, err) = run(&home, &["speakers"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(
+        out,
+        "speakers: off\noutput: default (the system output)\nstrength: maximum (100 dB)\n"
+    );
+    // nothing written by looking
+    assert!(!home.join(".config/hushmic/config.toml").exists());
+    for (args, says) in [
+        (&["speakers", "on"][..], "speakers.enabled = true"),
+        (
+            &["speakers", "strength", "gentle"][..],
+            "speakers.attn_limit = 6",
+        ),
+        (
+            &["speakers", "output", "alsa_output.dac"][..],
+            "speakers.output = alsa_output.dac",
+        ),
+    ] {
+        let (code, out, err) = run(&home, args);
+        assert_eq!(code, 0, "{args:?}: {out}{err}");
+        assert_eq!(
+            out.trim(),
+            format!("{says} (saved; applies when HushMic starts)"),
+            "{args:?}"
+        );
+    }
+    let text = std::fs::read_to_string(home.join(".config/hushmic/config.toml")).unwrap();
+    let cfg: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(cfg["speakers"]["enabled"].as_bool(), Some(true), "{text}");
+    assert_eq!(
+        cfg["speakers"]["attn_limit"].as_float(),
+        Some(6.0),
+        "{text}"
+    );
+    assert_eq!(
+        cfg["speakers"]["output"].as_str(),
+        Some("alsa_output.dac"),
+        "{text}"
+    );
+    // the microphone's settings are not touched
+    assert!(
+        cfg.get("attn_limit")
+            .is_some_and(|v| v.as_float() == Some(100.0)),
+        "{text}"
+    );
+    let (_, out, _) = run(&home, &["speakers"]);
+    assert_eq!(
+        out,
+        "speakers: on (applies when HushMic starts)\noutput: alsa_output.dac\nstrength: gentle (6 dB)\n"
+    );
+    let (code, _, err) = run(&home, &["speakers", "loud"]);
+    assert_eq!(code, 1);
+    assert!(err.starts_with("usage: hushmic speakers\n"), "{err}");
+    let (code, _, err) = run(&home, &["speakers", "strength", "300"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("speakers.attn_limit must be 0-100"), "{err}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A build without HushMic Speakers has no command, key or help for it,
+/// reads a config that has its section without a word, and leaves the
+/// section in the file.
+#[cfg(not(feature = "speakers"))]
+#[test]
+fn a_build_without_speakers_has_no_command_or_key_for_it() {
+    let home = std::env::temp_dir().join(format!("hushmic-offline-nospk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("run")).unwrap();
+    std::fs::create_dir_all(home.join("models")).unwrap();
+    let cfg_path = home.join(".config/hushmic/config.toml");
+    std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+    let section = "[speakers]\nenabled = true\noutput = \"alsa_output.dac\"\nattn_limit = 6.0\n";
+    std::fs::write(&cfg_path, format!("attn_limit = 100.0\n\n{section}")).unwrap();
+
+    let (code, out, err) = run(&home, &["config"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(err.is_empty(), "{err}");
+    assert!(!out.contains("speakers"), "{out}");
+    let (code, out, err) = run(&home, &["config", "--json"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!out.contains("speakers"), "{out}");
+    for args in [
+        &["config", "get", "speakers.enabled"][..],
+        &["config", "set", "speakers.enabled", "false"],
+    ] {
+        let (code, out, err) = run(&home, args);
+        assert_eq!(code, 1, "{args:?}: {out}{err}");
+        assert!(err.contains("unknown key 'speakers.enabled'"), "{err}");
+        assert!(!err.contains("speakers.output"), "{err}");
+    }
+    for args in [
+        &["speakers"][..],
+        &["speakers", "on"],
+        &["speakers", "--help"],
+        &["help", "speakers"],
+        &["devices", "outputs"],
+    ] {
+        let (code, out, err) = run(&home, args);
+        assert_ne!(code, 0, "{args:?}: {out}{err}");
+        assert!(
+            !out.contains("peakers") && !err.contains("HushMic Speakers"),
+            "{args:?}: {out}{err}"
+        );
+    }
+    for args in [
+        &["--help"][..],
+        &["config", "--help"],
+        &["devices", "--help"],
+    ] {
+        let (code, out, err) = run(&home, args);
+        assert_eq!(code, 0, "{args:?}: {out}{err}");
+        assert!(
+            !out.contains("peakers") && !out.contains("outputs"),
+            "{args:?}: {out}"
+        );
+    }
+    // a write of another key leaves the section as it was
+    let (code, out, err) = run(&home, &["config", "set", "attn_limit", "strong"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        text.contains("attn_limit = 24.0\n") && text.ends_with(section),
+        "{text}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

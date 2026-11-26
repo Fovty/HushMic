@@ -6,11 +6,12 @@
 
 ## How it was tested
 
-<!-- Distro / desktop you tested on, and what you checked. For audio or tray
-     changes, note that you verified the virtual mic and tray actually work. -->
+<!-- Distro / desktop you tested on, and what you checked. For audio, window or
+     tray changes, note that you verified them in the running app. -->
 
 ## Checklist
 
-- [ ] `cargo test`, `cargo clippy`, and `cargo fmt --check` pass
-- [ ] Tested on a real desktop (tray + virtual mic behave), not just the build
+- [ ] `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` pass, and `cargo test` for what the change touches
+- [ ] Tested on a real desktop (window, tray and virtual mic behave), not just the build
 - [ ] Docs / README updated if user-facing behavior changed
+- [ ] New or changed interface text is in the English catalog (`crates/hushmic/i18n/en/hushmic.ftl`); other languages come through Weblate

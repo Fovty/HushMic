@@ -110,5 +110,11 @@ exec sleep 30"#,
     assert_eq!(c.active_mic(), Some("mic_a"));
 
     let _ = c.disable();
+    // Chain files outside the scratch dir (a disk-backed one): ours too.
+    if let Some(d) = hushmic::meter::dir_for(Some(&root.join("run"))) {
+        if !d.starts_with(&root) {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

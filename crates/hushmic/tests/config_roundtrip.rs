@@ -45,3 +45,58 @@ fn toml_roundtrips() {
     assert_eq!(back.attn_limit, 24.0);
     assert!(back.set_default && back.autostart && !back.enabled);
 }
+
+#[cfg(feature = "speakers")]
+#[test]
+fn the_speakers_section_appears_only_once_used() {
+    use hushmic::config::SpeakersConfig;
+    // An untouched config has no [speakers] section, and reading one back
+    // without it gives the defaults: off, the system default, Maximum.
+    let plain = toml::to_string_pretty(&Config::default()).unwrap();
+    assert!(!plain.contains("speakers"), "{plain}");
+    let back: Config = toml::from_str(&plain).unwrap();
+    assert_eq!(back.speakers, None);
+    assert_eq!(back.speakers(), SpeakersConfig::default());
+    assert!(!back.speakers().enabled);
+    assert_eq!(back.speakers().output, None);
+    assert_eq!(back.speakers().attn_limit, 100.0);
+
+    // Once used it round-trips, after the top-level keys.
+    let mut c = Config::default();
+    c.speakers_mut().enabled = true;
+    c.speakers_mut().output = Some("alsa_output.usb-dac".into());
+    c.speakers_mut().attn_limit = 12.0;
+    let s = toml::to_string_pretty(&c).unwrap();
+    assert!(s.contains("[speakers]"), "{s}");
+    let back: Config = toml::from_str(&s).unwrap();
+    assert_eq!(back.speakers, c.speakers);
+    // A system-default output writes no key.
+    c.speakers_mut().output = None;
+    let s = toml::to_string_pretty(&c).unwrap();
+    assert!(!s.contains("output"), "{s}");
+
+    // A partial hand-written section takes the rest from the defaults, and
+    // sanitize clamps it like the globals.
+    let mut hand: Config =
+        toml::from_str("[speakers]\nattn_limit = 1e9\noutput = \"  \"\n").unwrap();
+    hand.sanitize();
+    let s = hand.speakers();
+    assert!(!s.enabled);
+    assert_eq!(s.attn_limit, 100.0);
+    assert_eq!(s.output, None);
+}
+
+/// A build without HushMic Speakers keeps a `[speakers]` section a build
+/// with it wrote: the file loads, and a save writes the section back as it
+/// was (a value its own build would clamp too).
+#[cfg(not(feature = "speakers"))]
+#[test]
+fn a_speakers_section_is_kept_as_it_is() {
+    let section =
+        "[speakers]\nenabled = true\noutput = \"alsa_output.usb-dac\"\nattn_limit = 250.0\n";
+    let mut c: Config = toml::from_str(&format!("attn_limit = 24.0\n\n{section}")).unwrap();
+    c.sanitize();
+    c.attn_limit = 6.0;
+    let s = toml::to_string_pretty(&c).unwrap();
+    assert!(s.ends_with(section), "{s}");
+}

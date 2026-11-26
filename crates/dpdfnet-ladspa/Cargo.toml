@@ -18,6 +18,7 @@ native = ["hushmic-denoiser/native"]
 [dependencies]
 ladspa = "0.3.4"
 hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.11.0" }
+hushmic-shm = { path = "../hushmic-shm" }
 rtrb = "0.4.0"
 libc = "0.2"
 
@@ -28,4 +29,9 @@ claxon = "0.4" # FLAC decode for the committed public parity fixture
 # process-global, so each host case runs in its own subprocess.
 [[test]]
 name = "host_light_model"
+harness = false
+
+# Self-exec too: the control file is mapped once per process.
+[[test]]
+name = "control_file"
 harness = false

@@ -1,5 +1,5 @@
 use hushmic::config::Config;
-use hushmic::controller::{render_conf, Paths, RunMode, LATENCY_SAMPLES};
+use hushmic::controller::{render_conf, render_host_conf, Paths, RunMode, LATENCY_SAMPLES};
 use std::path::PathBuf;
 
 fn test_paths() -> Paths {
@@ -62,7 +62,12 @@ fn latency_constant_and_rendered_seconds_agree() {
 /// does not make the chain runnable) and on nothing forcing the chain to
 /// run without consumers. Measured on PipeWire 0.3.65, 1.0.5 and 1.6.9:
 /// 0 % CPU idle; a chain without `node.passive` would run whenever the
-/// mic does. Every rendering variant must keep both.
+/// mic does. Every rendering variant must keep both. The chain's output
+/// and the host's feed are passive too (the daemon links them passively):
+/// a non-passive output kept the mic open on every version measured
+/// (0.3.48 to 1.6.10). The shared link group changes none of it: with an
+/// app recording the mic directly the chain stays idle on 1.0.5 and
+/// 1.6.10 and runs on 0.3.48 and 0.3.65, exactly as the single chain did.
 #[test]
 fn every_conf_lets_pipewire_idle_the_chain() {
     let mics = [None, Some("alsa_input.realmic".to_string())];
@@ -85,11 +90,21 @@ fn every_conf_lets_pipewire_idle_the_chain() {
                         capture.contains("node.passive   = true"),
                         "capture stream must stay passive: {c}"
                     );
-                    let playback = c.split("playback.props = {").nth(1).expect("playback");
-                    // A passive source would not run for its consumers.
+                    // never a second "HushMic" beside the microphone
+                    // apps pick (UX panel round 2, A11)
                     assert!(
-                        !playback.contains("node.passive"),
-                        "the source itself must not be passive: {c}"
+                        capture.contains("node.description = \"HushMic input (internal)\""),
+                        "{c}"
+                    );
+                    // mixers name streams by media.name (A115 SF-L1)
+                    assert!(
+                        capture.contains("media.name       = \"HushMic input (internal)\""),
+                        "{c}"
+                    );
+                    let playback = c.split("playback.props = {").nth(1).expect("playback");
+                    assert!(
+                        playback.contains("node.passive        = true"),
+                        "the chain's output must be passive: {c}"
                     );
                     // Each of these forces the chain to run, or joins it to
                     // a scheduling group that a mic consumer keeps running.
@@ -98,7 +113,6 @@ fn every_conf_lets_pipewire_idle_the_chain() {
                         "node.want-driver",
                         "node.suspend-on-idle",
                         "node.pause-on-idle",
-                        "node.link-group",
                         "node.group",
                     ] {
                         assert!(
@@ -108,6 +122,70 @@ fn every_conf_lets_pipewire_idle_the_chain() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn the_source_host_runs_for_its_consumers_and_idles_without() {
+    let h = render_host_conf();
+    let (capture, playback) = h
+        .split_once("capture.props = {")
+        .and_then(|(_, rest)| rest.split_once("playback.props = {"))
+        .expect("both blocks");
+    assert!(
+        capture.contains("node.name           = \"hushmic_feed\""),
+        "{h}"
+    );
+    assert!(capture.contains("node.passive        = true"), "{h}");
+    assert!(capture.contains("node.autoconnect    = false"), "{h}");
+    assert!(capture.contains("node.dont-move      = true"), "{h}");
+    // A passive source would not run for its consumers.
+    assert!(!playback.contains("node.passive"), "{h}");
+    assert!(
+        playback.contains("node.name        = \"hushmic_source\""),
+        "{h}"
+    );
+    assert!(playback.contains("media.class      = Audio/Source"), "{h}");
+    assert!(playback.contains("node.force-quantum = 480"), "{h}");
+    // One link group across both hosts: never fed by itself.
+    for block in [capture, playback] {
+        let group = block.lines().find(|l| l.contains("node.link-group"));
+        assert!(group.is_some_and(|l| l.ends_with("= \"hushmic\"")), "{h}");
+    }
+    let chain = render_conf(
+        &Config::default(),
+        &test_paths(),
+        false,
+        RunMode::Suppress,
+        false,
+    );
+    assert_eq!(chain.matches("= \"hushmic\"").count(), 2, "{chain}");
+    assert!(h.contains("libpipewire-module-protocol-native"), "{h}");
+}
+
+/// WirePlumber 0.4 saves and restores a stream's volume under the first of
+/// media.role, application.id, application.name, media.name, node.name, and
+/// ignores state.restore-props there. With one application.name on every
+/// HushMic stream, the internal feed's reset to 100 % would be restored onto
+/// hushmic_input (the user's hot-mic knob) at the next chain start; without
+/// it each stream keeps its own media.name key ("HushMic" for the input, as
+/// before the source host).
+#[test]
+fn no_stream_shares_a_saved_volume_with_hushmic_input() {
+    let chain = render_conf(
+        &Config::default(),
+        &test_paths(),
+        false,
+        RunMode::Suppress,
+        true,
+    );
+    for conf in [chain, render_host_conf()] {
+        for key in ["application.name", "application.id", "media.role"] {
+            assert!(
+                !conf.lines().any(|l| l.trim_start().starts_with(key)),
+                "{key} would key saved volumes before media.name: {conf}"
+            );
         }
     }
 }
@@ -156,16 +234,20 @@ fn conf_contains_required_fields() {
         c.contains("target.object  = \"alsa_input.realmic\""),
         "mic pin missing"
     );
+    // The chain is not the source apps see: its output is internal,
+    // linked into the source host by the daemon.
     assert!(
-        c.contains("media.class      = Audio/Source"),
-        "not exposed as a source"
+        !c.contains("media.class"),
+        "the chain must not be a device: {c}"
     );
     assert!(c.contains("audio.rate     = 48000"));
-    assert!(c.contains("node.name        = \"hushmic_source\""));
+    assert!(c.contains("node.name           = \"hushmic_dsp_out\""));
+    assert!(c.contains("node.autoconnect    = false"));
 
-    // Issue #10: the source node must pin the graph quantum — with the
-    // async DSP the pin's job is to make the quantum KNOWN and SMALL so
-    // the plugin's output margin (and the declared latency) is exact.
+    // Issue #10: the graph quantum is pinned while the chain runs — with
+    // the async DSP the pin's job is to make the quantum KNOWN and SMALL so
+    // the plugin's output margin (and the declared latency) is exact. The
+    // source host pins the same value.
     assert!(
         c.contains("node.force-quantum = 480"),
         "quantum pin missing from playback props"
@@ -429,4 +511,33 @@ fn picking_the_same_mic_again_ends_a_recovery_fallback() {
         "a latched fallback ends with the pick"
     );
     assert!(!c.end_mic_fallback(), "and only once");
+}
+
+/// The troubleshooting page names the streams as mixers show them: by
+/// their media.name (A115 SF-L1).
+#[test]
+fn troubleshooting_names_the_streams_as_mixers_show_them() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/troubleshooting.md"),
+    )
+    .unwrap();
+    let c = render_conf(
+        &Config::default(),
+        &test_paths(),
+        false,
+        RunMode::Suppress,
+        false,
+    );
+    for block in ["capture.props = {", "playback.props = {"] {
+        let props = c.split(block).nth(1).expect(block);
+        let name = props
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("media.name"))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or_else(|| panic!("{block} has a media.name: {c}"));
+        assert!(
+            doc.contains(&format!("**{name}**")),
+            "troubleshooting.md names {name}"
+        );
+    }
 }

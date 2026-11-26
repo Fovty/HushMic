@@ -264,14 +264,34 @@ modules:
         HUSHMIC_BUILD_DYLIB: /app/lib/hushmic/libonnxruntime.so
     build-commands:
       - cargo --offline fetch --manifest-path Cargo.toml
-      - cargo --offline build --release
+      # Opus files decode through the runtime's libopus; everything else
+      # Save writes through the runtime's /usr/bin/ffmpeg
+      - cargo --offline build --release --features hushmic/opus
       - install -Dm755 target/release/hushmic /app/bin/hushmic
       - install -Dm644 target/release/libdpdfnet_ladspa.so /app/lib/ladspa/libdpdfnet_ladspa.so
       - install -Dm644 packaging/hushmic.desktop /app/share/applications/hushmic.desktop
-      - install -Dm644 packaging/hushmic-256.png /app/share/icons/hicolor/256x256/apps/hushmic.png
+      # "Open with": exported files must carry the app id, and so must its icon
+      - |
+        sed 's/^Icon=hushmic$/Icon=io.github.fovty.HushMic/' packaging/hushmic-clean.desktop \
+          > io.github.fovty.HushMic.Clean.desktop
+        install -Dm644 io.github.fovty.HushMic.Clean.desktop \
+          /app/share/applications/io.github.fovty.HushMic.Clean.desktop
       # only ${FLATPAK_ID}-prefixed icon names get exported to the host theme
+      # (rename-icon does that for the app icon, at every size)
       - |
         set -e
+        # the app icon ladder exists from v1.0 on; drop the fallback once the
+        # source pin below is a v1.0 tag or later
+        if [ -d packaging/tray/hicolor/16x16/apps ]; then
+          for size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+            install -Dm644 "packaging/tray/hicolor/$size/apps/hushmic.png" \
+              "/app/share/icons/hicolor/$size/apps/hushmic.png"
+          done
+          install -Dm644 packaging/tray/hicolor/scalable/apps/hushmic.svg \
+            /app/share/icons/hicolor/scalable/apps/hushmic.svg
+        else
+          install -Dm644 packaging/hushmic-256.png /app/share/icons/hicolor/256x256/apps/hushmic.png
+        fi
         for size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256; do
           for name in hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute hushmic-tray-error; do
             install -Dm644 "packaging/tray/hicolor/$size/status/$name.png" \
@@ -291,6 +311,6 @@ modules:
       # release tag; for the working tree use "type: dir, path: ../.." instead
       - type: git
         url: https://github.com/Fovty/hushmic.git
-        tag: v0.10.4
-        commit: 4641f0ad205fa49b36592ea2bc7b15d686419173
+        tag: v0.11.0
+        commit: 045daab15ef1afbb4411f355cbdfe9ad54534de9
       - cargo-sources.json

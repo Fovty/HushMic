@@ -17,7 +17,7 @@ Release:        1%{?dist}
 Summary:        Real-time microphone noise suppression as a virtual mic
 
 License:        MIT OR Apache-2.0
-URL:            https://github.com/Fovty/hushmic
+URL:            https://hushmic.org
 Source0:        %{url}/releases/download/v%{version}/hushmic-%{version}-x86_64.tar.gz
 
 # The release ships a prebuilt x86-64 binary (glibc 2.35 floor).
@@ -38,6 +38,12 @@ Requires:       pipewire-utils
 Requires:       pipewire-pulseaudio
 Requires:       wireplumber
 Requires:       hicolor-icon-theme
+# Save writes the original's format and keeps a video's picture through the
+# ffmpeg program (Fedora's ffmpeg-free or RPM Fusion's ffmpeg); without it
+# Save writes FLAC and a video keeps its sound only.
+Recommends:     /usr/bin/ffmpeg
+# Opus recordings decode through the system libopus, linked.
+Requires:       opus
 
 %description
 HushMic runs DPDFNet noise suppression on your microphone in real time and
@@ -81,14 +87,16 @@ install -Dm644 share/hushmic/models/dpdfnet2_48khz_hr.weights.f32 \
 
 install -Dm644 share/applications/hushmic.desktop \
   %{buildroot}%{_datadir}/applications/hushmic.desktop
+install -Dm644 share/applications/hushmic-clean.desktop \
+  %{buildroot}%{_datadir}/applications/hushmic-clean.desktop
 
 # systemd user unit (`systemctl --user enable --now hushmic.service`)
 install -Dm644 lib/systemd/user/hushmic.service \
   %{buildroot}%{_userunitdir}/hushmic.service
 
-# App icon + the tray status ladder (five SNI names x eight sizes) + the
-# monochrome -symbolic SVGs the desktop recolors; copying the tree keeps every
-# size, state and format the release ships.
+# App icon (every size + scalable) + the tray status ladder (five SNI names x
+# eight sizes) + the monochrome -symbolic SVGs the desktop recolors; copying
+# the tree keeps every size, state and format the release ships.
 find share/icons -type f \( -name '*.png' -o -name '*.svg' \) -print0 \
   | while IFS= read -r -d '' _icon; do
   install -Dm644 "$_icon" "%{buildroot}%{_prefix}/$_icon"
@@ -96,6 +104,7 @@ done
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/hushmic.desktop
+desktop-file-validate %{buildroot}%{_datadir}/applications/hushmic-clean.desktop
 
 %post
 %systemd_user_post hushmic.service
@@ -116,9 +125,11 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/hushmic.desktop
 %dir %{_datadir}/hushmic
 %{_datadir}/hushmic/models/
 %{_datadir}/applications/hushmic.desktop
+%{_datadir}/applications/hushmic-clean.desktop
 %{_userunitdir}/hushmic.service
 %{_datadir}/icons/hicolor/*/*/hushmic*.png
 %{_datadir}/icons/hicolor/*/*/hushmic*-symbolic.svg
+%{_datadir}/icons/hicolor/scalable/apps/hushmic.svg
 
 %changelog
 * Wed Jul 15 2026 Fovty <38868829+Fovty@users.noreply.github.com> - 0.2.1-1

@@ -17,6 +17,17 @@ use std::path::Path;
 /// lost to a crash, the previous file survives untouched — stale-but-intact
 /// beats empty.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_renamed(path, contents, true)
+}
+
+/// Replace `path` with `contents` by a rename, without the fsync: for
+/// state where a write lost to a crash costs nothing worth the disk
+/// flush, but a half-written file would still be wrong.
+pub fn replace(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_renamed(path, contents, false)
+}
+
+fn write_renamed(path: &Path, contents: &[u8], sync: bool) -> std::io::Result<()> {
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(d)?;
     }
@@ -29,7 +40,10 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let write = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
-        f.sync_all()
+        if sync {
+            f.sync_all()?;
+        }
+        Ok(())
     })();
     if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
@@ -62,5 +76,6 @@ mod tests {
     #[test]
     fn rejects_pathless_target() {
         assert!(atomic_write(Path::new("/"), b"x").is_err());
+        assert!(replace(Path::new("/"), b"x").is_err());
     }
 }

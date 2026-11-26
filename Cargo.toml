@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/dpdfnet-ladspa", "crates/hushmic", "crates/hushmic-denoiser"]
+members = ["crates/dpdfnet-ladspa", "crates/hushmic", "crates/hushmic-denoiser", "crates/hushmic-shm"]
+# A patched dependency, not a member (vendor/smithay-clipboard/README.hushmic.md).
+exclude = ["vendor/smithay-clipboard"]
 
 [workspace.package]
 edition = "2021"
@@ -11,3 +13,8 @@ version = "0.11.0"
 # Symbols are ~27% of the binary and ship no user value; panics keep the
 # message, backtraces come from debug builds.
 strip = true
+
+# Drops on Wayland ride on egui's clipboard device: smithay-clipboard 0.7.3
+# with a small patch (vendor/smithay-clipboard/README.hushmic.md).
+[patch.crates-io]
+smithay-clipboard = { path = "vendor/smithay-clipboard" }

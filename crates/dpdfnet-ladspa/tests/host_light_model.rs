@@ -4,6 +4,10 @@
 //! commit are process-global, so this harness-less test re-executes itself,
 //! one subprocess per case with a controlled environment, and reads the
 //! plugin's stderr. Asset-gated like the other suites.
+//!
+//! On the timing sweep's realtime list, which allows a 25% CPU quota. Its
+//! CPU check judges a hang by CPU used, not by a clock, so the sweep proves
+//! it at the 6% the other suites get; a failure there is a real finding.
 
 mod common;
 
@@ -12,12 +16,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The variables the app sets for its chain; every case starts without them.
-const HOST_VARS: [&str; 6] = [
+const HOST_VARS: [&str; 7] = [
     "HUSHMIC_MODEL_PATH",
     "HUSHMIC_FALLBACK_MODEL_PATH",
     "HUSHMIC_INFERENCE",
     "HUSHMIC_DSP_TIER",
     "HUSHMIC_DSP_DWELL_HOPS",
+    "HUSHMIC_VOICE_HOLD",
     "ORT_DYLIB_PATH",
 ];
 
@@ -87,6 +92,18 @@ fn main() {
     assert!(log.contains("light model unavailable"), "{log}");
     assert!(!log.contains("for dpdfnet2_48khz_hr\n"), "{log}");
 
+    // Pinned to the main model: the light one is not loaded (issue #36).
+    let log = case("pinned quality", &named(&[("HUSHMIC_DSP_TIER", "quality")]));
+    assert_eq!(log.matches("inference: ").count(), 1, "{log}");
+    assert!(log.contains("the light model is not loaded"), "{log}");
+    assert!(!log.contains("ignored"), "{log}");
+
+    // The voice hold is off unless the host's environment turns it on.
+    let log = case("no voice hold", &named(&[]));
+    assert!(!log.contains("voice hold"), "{log}");
+    let log = case("voice hold", &named(&[("HUSHMIC_VOICE_HOLD", "1")]));
+    assert!(log.contains("voice hold: on"), "{log}");
+
     // A light main model loads once and has no fallback.
     let mut env = named(&[]);
     env[0].1 = light_s.clone();
@@ -114,7 +131,7 @@ fn main() {
     assert!(log.contains("is the main model itself"), "{log}");
     assert!(!log.contains("(next to the main model)"), "{log}");
     assert_eq!(log.matches("inference: ").count(), 1, "{log}");
-    cases += 5;
+    cases += 8;
     println!("host_light_model: {cases} cases ok");
 }
 
@@ -140,19 +157,41 @@ fn case<V: AsRef<std::ffi::OsStr>>(name: &str, env: &[(&str, V)]) -> String {
         let _ = stderr.read_to_string(&mut s);
         s
     });
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Hung means no CPU: a case that still runs (a slow init on a loaded
+    // runner) is waited for, one that used no CPU for a minute is not.
+    let mut cpu = (cpu_ticks(child.id()), Instant::now());
+    let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait on case") {
             break status;
         }
-        if Instant::now() >= deadline {
+        let now = cpu_ticks(child.id());
+        if now != cpu.0 {
+            cpu = (now, Instant::now());
+        }
+        let idle = cpu.1.elapsed() >= Duration::from_secs(60);
+        if idle || started.elapsed() >= Duration::from_secs(30 * 60) {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("case {name} timed out");
+            panic!(
+                "case {name} timed out ({})",
+                if idle { "no CPU for 60 s" } else { "30 min" }
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     let log = reader.join().expect("stderr reader");
     assert!(status.success(), "case {name} failed:\n{log}");
     log
+}
+
+/// The CPU a process has used so far (user + system clock ticks; None
+/// once it is gone).
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the command's closing parenthesis: utime and stime are
+    // the 12th and 13th of them.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
 }

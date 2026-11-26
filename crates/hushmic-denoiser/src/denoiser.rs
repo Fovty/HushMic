@@ -1,5 +1,6 @@
 use crate::attn::AttnLimiter;
 use crate::error::Error;
+use crate::hold::{frame_db, VoiceHold};
 use crate::mode::{GainRamp, Mode};
 use crate::model::Model;
 use crate::stft::{Analysis, Synthesis, HOP, SPEC_LEN};
@@ -18,6 +19,7 @@ pub struct Denoiser {
     spec_e: [f32; SPEC_LEN],
     state_out: Vec<f32>,
     attn: AttnLimiter,
+    hold: VoiceHold,
     gain: GainRamp,
     mode: Mode,
     attn_limit_db: f32,
@@ -108,6 +110,7 @@ impl Denoiser {
     fn with_model(model: Model) -> Denoiser {
         let state = model.init_state.clone();
         let state_out = vec![0f32; model.state_size];
+        let hold = VoiceHold::new(model.state_size);
         Denoiser {
             analysis: Analysis::new(),
             synthesis: Synthesis::new(),
@@ -117,6 +120,7 @@ impl Denoiser {
             spec_e: [0f32; SPEC_LEN],
             state_out,
             attn: AttnLimiter::new(),
+            hold,
             gain: GainRamp::new(),
             mode: Mode::Process,
             attn_limit_db: f32::INFINITY,
@@ -135,7 +139,28 @@ impl Denoiser {
         self.state.clear();
         self.state.extend_from_slice(&self.model.init_state);
         self.attn.reset();
+        self.hold.after_reset(&mut self.state);
         self.gain.reset_to(self.mode == Mode::Mute);
+    }
+
+    /// Keep to the talker the model last passed (off by default). The
+    /// model tells the talker from other voices by its memory of the last
+    /// seconds; after a pause of about ten seconds, or under a far voice
+    /// that does not stop, that memory fades and a voice from across the
+    /// room comes through. On, the memory of the last passed speech is put
+    /// back every two seconds while the model lets nothing through, so far
+    /// voices stay out. The price: a voice quieter than the talker's (a
+    /// guest beside them) starts cut and stays a few dB lower, more so on
+    /// the light model. For a live microphone with one talker; leave it
+    /// off for recordings of several people. Survives [`Denoiser::reset`];
+    /// turning it off forgets the talker.
+    pub fn set_voice_hold(&mut self, on: bool) {
+        self.hold.set_on(on);
+    }
+
+    /// Whether [`Denoiser::set_voice_hold`] is on.
+    pub fn voice_hold(&self) -> bool {
+        self.hold.is_on()
     }
 
     /// Cap how deep suppression may go by blending the latency-aligned noisy
@@ -197,6 +222,9 @@ impl Denoiser {
         match &result {
             Ok(()) => {
                 std::mem::swap(&mut self.state, &mut self.state_out);
+                if self.hold.is_on() {
+                    self.hold.after_hop(&mut self.state, frame_db(&self.spec_e));
+                }
             }
             Err(_) => {
                 // Keep the recurrent state as-is (last good frame) and emit a

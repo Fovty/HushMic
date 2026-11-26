@@ -1,6 +1,6 @@
-//! "Test my mic": record a few seconds of the raw microphone and of the
-//! cleaned `hushmic_source` side by side, then play both back — an audible
-//! is-it-even-working check, driven from the tray.
+//! `hushmic miccheck`: record a few seconds of the raw microphone and of
+//! the cleaned `hushmic_source` side by side, then play both back — an
+//! audible is-it-even-working check that needs no window.
 //!
 //! The recording/playback helpers are `pw-record`/`pw-play` (pw-cat), which
 //! ship in the same PipeWire tool package as the `pw-dump`/`pw-metadata`
@@ -143,26 +143,6 @@ pub fn raw_target(traced: Option<String>, cfg_mic: Option<&str>) -> Option<Strin
     traced.or_else(|| cfg_mic.map(String::from))
 }
 
-/// The raw-leg source for the A/B window, in priority order: the live traced
-/// feeder, then the tray-configured mic, then the system default source.
-///
-/// The default-source fallback is what stops the window from showing a false
-/// "no microphone" when the chain is up but not linked to any mic and the
-/// tray is on "System default": there is a real default mic to record the
-/// raw leg from even though nothing currently feeds `hushmic_input`. It must
-/// skip our own `hushmic_source` (when HushMic is itself the configured
-/// default) and any `.monitor` — neither is a real capture device to compare
-/// against. Empty string only when nothing resolves. Pure — no I/O.
-pub fn resolve_raw(
-    traced: Option<String>,
-    cfg_mic: Option<&str>,
-    default_source: Option<String>,
-) -> String {
-    raw_target(traced, cfg_mic)
-        .or_else(|| default_source.filter(|n| n != "hushmic_source" && !n.ends_with(".monitor")))
-        .unwrap_or_default()
-}
-
 /// `pw-record` invocation for one leg: mono 48 kHz WAV (the chain's native
 /// format) pinned to an explicit source node.
 pub fn record_command(target: &str, out: &Path) -> Command {
@@ -174,7 +154,21 @@ pub fn record_command(target: &str, out: &Path) -> Command {
 
 /// `pw-play` invocation: default output device (the user must hear it).
 pub fn play_command(file: &Path) -> Command {
+    play_command_to(file, None)
+}
+
+/// [`play_command`] to `target` when given: a real output while the
+/// default is HushMic Speakers (the comparison must not be cleaned twice).
+pub fn play_command_to(file: &Path, target: Option<&str>) -> Command {
     let mut c = Command::new("pw-play");
+    // named as HushMic's own player, so the daemon moves it when the
+    // default output changes while it plays
+    if let Some(p) = crate::miccheck::proc::Purpose::MicTest.props() {
+        c.args(["-P", &p]);
+    }
+    if let Some(t) = target {
+        c.args(["--target", t]);
+    }
     c.arg(file);
     c
 }
@@ -201,9 +195,8 @@ pub fn remove_recordings() {
 }
 
 fn remove_recordings_from(dirs: &[PathBuf]) {
-    // Includes the A/B window's transient playback WAVs: its backend deletes
-    // them on clean exit, but an abnormal death (crash, SIGKILL) skips that
-    // path just like the mic test's own.
+    // Includes the playback WAVs the A/B window of earlier versions could
+    // leave behind when it died abnormally (crash, SIGKILL).
     for d in dirs {
         for f in [
             RAW_NAME,
@@ -319,7 +312,8 @@ fn stderr_suffix(c: &mut Child) -> String {
 /// long, so anything beyond that plus a margin means the stream is stuck
 /// (output device vanished mid-test) and must be reaped, not waited on.
 fn play(file: &Path, cancel: &AtomicBool) -> Result<(), String> {
-    let mut child = spawn_bound(play_command(file))
+    let target = crate::miccheck::proc::own_output();
+    let mut child = spawn_bound(play_command_to(file, target.as_deref()))
         .map_err(|e| format!("could not start pw-play ({e}) — it ships with the PipeWire tools"))?;
     let deadline = Instant::now() + Duration::from_secs(RECORD_SECS + 5);
     loop {
@@ -551,32 +545,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_raw_falls_back_to_the_default_source() {
-        // Trace and configured mic win ahead of the default, in that order.
-        assert_eq!(
-            resolve_raw(Some("traced".into()), Some("cfg"), Some("dflt".into())),
-            "traced"
-        );
-        assert_eq!(resolve_raw(None, Some("cfg"), Some("dflt".into())), "cfg");
-        // The real fix: chain up but unlinked + "System default" selected ->
-        // record the raw leg from the actual default mic instead of "" (which
-        // rendered a false "no microphone detected").
-        assert_eq!(
-            resolve_raw(None, None, Some("alsa_input.mic".into())),
-            "alsa_input.mic"
-        );
-        // But never fall back to our own node or a monitor — those are not a
-        // real capture device to compare against.
-        assert_eq!(resolve_raw(None, None, Some("hushmic_source".into())), "");
-        assert_eq!(
-            resolve_raw(None, None, Some("alsa_output.x.monitor".into())),
-            ""
-        );
-        // Nothing to resolve.
-        assert_eq!(resolve_raw(None, None, None), "");
-    }
-
-    #[test]
     fn record_command_pins_target_and_format() {
         let c = record_command("alsa_input.x", Path::new("/run/user/1000/hushmic/raw.wav"));
         assert_eq!(c.get_program(), "pw-record");
@@ -606,7 +574,24 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["/tmp/x.wav"]); // no --target: default sink
+        // its properties, where this pw-play takes them, then no --target:
+        // the default sink
+        let skip = if args.first().map(String::as_str) == Some("-P") {
+            assert!(
+                args[1].contains(r#"node.name = "hushmic-mictest""#),
+                "{args:?}"
+            );
+            2
+        } else {
+            0
+        };
+        assert_eq!(args[skip..], ["/tmp/x.wav"]);
+        let c = play_command_to(Path::new("/tmp/x.wav"), Some("alsa_output.dac"));
+        let args: Vec<_> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[skip..], ["--target", "alsa_output.dac", "/tmp/x.wav"]);
     }
 
     #[test]

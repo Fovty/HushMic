@@ -1,5 +1,6 @@
-//! Shared diagnostics: `hushmic --doctor` and the About window's
-//! "Copy diagnostics" button both render the same plain-text report.
+//! Shared diagnostics: `hushmic --doctor` and the window's "Copy
+//! diagnostics" button (Settings › About) both render the same plain-text
+//! report.
 //! Read-only probes, no audio, no network; everything in the report is
 //! safe to paste into a public issue (device/model names only).
 //!
@@ -25,6 +26,13 @@ pub struct Report {
     pub enabled: bool,
     pub preferred_mic: Option<String>,
     pub active_mic: Option<String>,
+    /// Whether the preferred mic is plugged in; None = no preferred mic,
+    /// or the probe failed.
+    pub preferred_present: Option<bool>,
+    /// The `active mic:` words, as `status` says them (see
+    /// [`active_words`]), and the mic in use by name (None = unknown).
+    pub active_words: String,
+    pub in_use: Option<String>,
     /// The model and strength in effect (the active profile's, see
     /// `Config::active_profile`) and the device whose saved profile that
     /// is, by display name; None = the defaults apply.
@@ -37,13 +45,22 @@ pub struct Report {
     /// None = probe failed; Some = real capture sources by description.
     pub sources: Option<Vec<String>>,
     pub default_source: Option<String>,
+    /// The default WirePlumber links streams to, from the dump (it can
+    /// differ from the configured one above, which may be unset).
+    pub effective_default: Option<String>,
     /// None = probe failed. Some(false) is a problem only while
     /// `enabled` AND `instance_running` (otherwise a plain fact).
     pub hushmic_present: Option<bool>,
     pub can_set_default: bool,
     /// Which client the global shortcuts use in this session.
     pub shortcuts_backend: crate::shortcuts::Backend,
+    /// With the portal backend: whether the portal is really there (its
+    /// version) or why not. None for the other backends.
+    pub shortcuts_portal: Option<crate::shortcuts::PortalAnswer>,
     pub instance_running: bool,
+    /// The running instance's version as it reports it; None when none
+    /// runs or it did not answer.
+    pub instance_version: Option<String>,
     pub assets: Vec<AssetFact>,
     /// (command, on PATH). Missing = problem.
     pub commands: Vec<(&'static str, bool)>,
@@ -51,6 +68,8 @@ pub struct Report {
     pub log_tail: Option<String>,
     /// The configured engine choice (config `inference`).
     pub inference_setting: String,
+    /// The `voice_hold` setting.
+    pub voice_hold: bool,
     /// What the last chain's plugin ran each model on, from the whole
     /// filter-chain log; None = no log file yet.
     pub inference: Option<Vec<Inference>>,
@@ -73,13 +92,35 @@ pub struct Report {
     /// node (issue #10); 0 = node present but unpinned (pre-pin chain).
     /// None = chain not visible in the dump.
     pub chain_quantum_pin: Option<u32>,
-    /// PipeWire's scheduling state for `hushmic_source` (`running`,
+    /// PipeWire's scheduling state for the chain's capture (`hushmic_input`) (`running`,
     /// `idle`, `suspended`, ...); None = no node or no dump. Idle is normal:
     /// with no active consumer PipeWire does not run the chain at all.
     pub chain_node_state: Option<String>,
     /// System-wide `clock.force-quantum` from the settings metadata (the
     /// manual override); None = not forced.
     pub forced_quantum: Option<u32>,
+    /// The graph's `clock.min-quantum` (what the pin overrides while it
+    /// is in effect); None = unknown.
+    pub min_quantum: Option<u32>,
+    /// The engine worker's scheduling from the filter-chain log:
+    /// Ok(priority and how), Err(why not realtime); None = not logged.
+    pub worker_rt: Option<Result<String, String>>,
+    /// The last engine line's tier and cost (the share of real time a hop
+    /// takes); None = not logged.
+    pub engine_cost: Option<(String, f32)>,
+    /// The chain's output is linked into the source host (hushmic_source);
+    /// None = no dump.
+    pub chain_linked: Option<bool>,
+    /// App playbacks linked into HushMic's microphone input (the chain's
+    /// capture or the source host's feed), by name
+    /// (`pipewire::ChainGraph::intruders`); the running HushMic moves them
+    /// off, so one listed here keeps coming back.
+    pub stray_streams: Vec<String>,
+    /// Mixer controls on the chain's capture and the two internal streams.
+    pub stream_controls: Vec<crate::pipewire::StreamControls>,
+    /// The speakers cleaner's section.
+    #[cfg(feature = "speakers")]
+    pub speakers: crate::speakers::doctor::Report,
 }
 
 /// Gather every fact — the I/O half. Never panics: anything un-probeable
@@ -112,6 +153,38 @@ pub fn collect() -> Report {
                 .to_string()
         });
     let model_path = paths.model_dir.join(format!("{}.onnx", profile.model));
+    let capture_feeders =
+        crate::pipewire::pw_dump().map(|d| crate::pipewire::parse_feeders(&d, "hushmic_input"));
+    // the mic in use, by name: what feeds the capture, else what a chain
+    // started now runs on (UX panel round 2, A9). One that is not plugged
+    // in now is named as the running instance last saw it (A115 N-D1).
+    let status_json =
+        crate::control::ask_within(&["status", "--json"], std::time::Duration::from_secs(2));
+    let running = status_json
+        .as_deref()
+        .map(parse_mic_names)
+        .unwrap_or_default();
+    let name_of = |d: &str| mic_display_name(snapshot.as_deref(), &running, d);
+    let in_use = capture_feeders
+        .as_deref()
+        .and_then(|f| {
+            f.iter()
+                .find(|d| crate::config::can_own_profile(d))
+                .cloned()
+        })
+        .or_else(|| target.mic.clone())
+        .or_else(|| target.profile_device.clone());
+    let preferred_present = cfg
+        .mic
+        .as_deref()
+        .and_then(|m| snapshot.as_deref().map(|v| v.iter().any(|s| s.name == m)));
+    let active_words = active_words(
+        cfg.mic.as_deref(),
+        in_use.as_deref(),
+        preferred_present == Some(false),
+        &name_of,
+    );
+    let in_use = in_use.map(|d| name_of(&d));
     // Momentarily acquiring the lock is harmless (LOCK_NB; drop releases):
     // acquired = nothing was holding it. Err (unreadable path, foreign
     // owner) reads as "not running" — conservative, since the node-absent
@@ -121,6 +194,7 @@ pub fn collect() -> Report {
         crate::lock::try_lock(&crate::lock::default_lock_path()),
         Ok(None)
     );
+    let backend = crate::shortcuts::detect_backend(std::time::Duration::ZERO);
     Report {
         version: env!("CARGO_PKG_VERSION").into(),
         install_type: install_type(
@@ -134,8 +208,11 @@ pub fn collect() -> Report {
         pw_target_object: crate::pipewire::supports_target_object(),
         config_path: crate::config::Config::path().display().to_string(),
         enabled: cfg.enabled,
-        preferred_mic: cfg.mic.clone(),
+        preferred_mic: cfg.mic.as_deref().map(name_of),
         active_mic: crate::pipewire::resolve_effective_mic(cfg.mic.as_deref(), snapshot.as_deref()),
+        preferred_present,
+        active_words,
+        in_use,
         model: profile.model.clone(),
         attn_limit: profile.attn_limit,
         profile: profile_name,
@@ -148,12 +225,18 @@ pub fn collect() -> Report {
                 .collect()
         }),
         default_source: crate::pipewire::get_default_source(),
+        effective_default: dump
+            .as_deref()
+            .and_then(crate::pipewire::parse_effective_default_source),
         hushmic_present: snapshot
             .as_deref()
             .map(|v| v.iter().any(|s| s.name == "hushmic_source")),
         can_set_default: crate::pipewire::can_set_default(),
-        shortcuts_backend: crate::shortcuts::detect_backend(std::time::Duration::ZERO),
+        shortcuts_backend: backend,
+        shortcuts_portal: (backend == crate::shortcuts::Backend::Portal)
+            .then(|| crate::shortcuts::portal_within(std::time::Duration::from_secs(2))),
         instance_running,
+        instance_version: status_json.as_deref().and_then(instance_version_of),
         assets: vec![
             AssetFact {
                 what: "LADSPA plugin",
@@ -177,19 +260,47 @@ pub fn collect() -> Report {
             .collect(),
         log_tail: log.as_deref().map(|s| tail(s, 40)),
         inference_setting: cfg.inference.as_str().to_string(),
+        voice_hold: cfg.voice_hold,
         inference: log.as_deref().map(inference_from_log),
         latency_supported: crate::pipewire::supports_latency_report(),
         latency_reported: crate::pipewire::chain_reported_latency(),
-        capture_feeders: crate::pipewire::pw_dump()
-            .map(|d| crate::pipewire::parse_feeders(&d, "hushmic_input")),
+        capture_feeders: capture_feeders.clone(),
         prior_default,
         chain_quantum_pin: dump
             .as_deref()
             .and_then(crate::pipewire::chain_pins_quantum),
         chain_node_state: dump
             .as_deref()
-            .and_then(|d| crate::pipewire::node_state(d, "hushmic_source")),
+            .and_then(|d| crate::pipewire::node_state(d, crate::pipewire::CHAIN_INPUT)),
         forced_quantum: crate::pipewire::settings_force_quantum(),
+        min_quantum: crate::pipewire::settings_min_quantum(),
+        worker_rt: log.as_deref().and_then(worker_rt_from_log),
+        engine_cost: log.as_deref().and_then(engine_cost_from_log),
+        chain_linked: dump
+            .as_deref()
+            .map(|d| crate::pipewire::chain_graph(d).linked),
+        stray_streams: dump
+            .as_deref()
+            .map(|d| {
+                crate::pipewire::chain_graph(d)
+                    .intruders
+                    .into_iter()
+                    .map(|i| {
+                        if i.name.is_empty() {
+                            format!("node {}", i.id)
+                        } else {
+                            i.name
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        stream_controls: dump
+            .as_deref()
+            .map(crate::pipewire::stream_controls)
+            .unwrap_or_default(),
+        #[cfg(feature = "speakers")]
+        speakers: crate::speakers::doctor::collect(&cfg, dump.as_deref(), status_json.as_deref()),
     }
 }
 
@@ -200,10 +311,39 @@ fn on_path(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `--doctor`'s exit code for a problem count from [`render`]: 0 when
+/// nothing is wrong, 1 otherwise (warnings never count).
+pub fn exit_code(problems: usize) -> i32 {
+    if problems == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 /// Render the report: plain `key: value` text, failing checks prefixed
 /// `!!`, last line the problem summary. Returns (text, problem count);
-/// `--doctor` exits 1 when the count is nonzero.
+/// `--doctor` exits with [`exit_code`] of the count.
+impl Report {
+    /// The running instance's version when it is not this command's.
+    fn other_version(&self) -> Option<&str> {
+        self.instance_version
+            .as_deref()
+            .filter(|v| self.instance_running && *v != self.version)
+    }
+}
+
+/// The `version` of a `status --json` answer.
+fn instance_version_of(status: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(status)
+        .ok()?
+        .get("version")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 pub fn render(r: &Report) -> (String, usize) {
+    use crate::shortcuts::PortalAnswer;
     let mut out = String::new();
     let mut problems = 0usize;
     // A line whose check failed: `!!`-prefixed and counted.
@@ -212,6 +352,15 @@ pub fn render(r: &Report) -> (String, usize) {
             problems += 1;
             out.push_str("!! ");
         }
+        out.push_str(&s);
+        out.push('\n');
+    };
+    // Something to know that is not a fault: `!`-prefixed, counted apart
+    // (the exit code stays 0).
+    let mut warnings = 0usize;
+    let mut warn = |out: &mut String, s: String| {
+        warnings += 1;
+        out.push_str("! ");
         out.push_str(&s);
         out.push('\n');
     };
@@ -244,14 +393,16 @@ pub fn render(r: &Report) -> (String, usize) {
             r.preferred_mic.as_deref().unwrap_or("(system default)")
         ),
     );
-    line(
-        &mut out,
-        false,
-        format!(
-            "  active mic: {}",
-            r.active_mic.as_deref().unwrap_or("(system default)")
-        ),
-    );
+    line(&mut out, false, format!("  active mic: {}", r.active_words));
+    if let (Some(false), Some(m)) = (r.preferred_present, r.preferred_mic.as_deref()) {
+        warn(
+            &mut out,
+            format!(
+                "the preferred mic {m} is not plugged in; HushMic uses {} until it is back",
+                r.in_use.as_deref().unwrap_or("the system default")
+            ),
+        );
+    }
     line(&mut out, false, format!("  model: {}", r.model));
     line(
         &mut out,
@@ -280,11 +431,30 @@ pub fn render(r: &Report) -> (String, usize) {
     line(
         &mut out,
         false,
-        format!(
-            "instance running: {}",
-            if r.instance_running { "yes" } else { "no" }
-        ),
+        format!("  voice hold: {}", if r.voice_hold { "on" } else { "off" }),
     );
+    // After a package update the instance from before keeps running until
+    // it is started again: this command and it then disagree about what the
+    // graph looks like, so what follows is not checked against it.
+    let other_version = r.other_version();
+    match other_version {
+        Some(v) => warn(
+            &mut out,
+            format!(
+                "instance running: yes, version {v} (this command is {}; quit HushMic and \
+                 start it again to finish the update)",
+                r.version
+            ),
+        ),
+        None => line(
+            &mut out,
+            false,
+            format!(
+                "instance running: {}",
+                if r.instance_running { "yes" } else { "no" }
+            ),
+        ),
+    }
     {
         use crate::controller::LATENCY_SAMPLES;
         line(
@@ -315,6 +485,20 @@ pub fn render(r: &Report) -> (String, usize) {
                     true,
                     format!("  reported to PipeWire: mismatch ({n}, declared {LATENCY_SAMPLES})"),
                 ),
+                // The chain declares its latency once audio flows: while
+                // no app records, PipeWire suspends it and nothing is
+                // reported yet. That is a fact; missing on a RUNNING chain
+                // is the bug this line exists to catch.
+                None if r
+                    .chain_node_state
+                    .as_deref()
+                    .is_some_and(crate::pipewire::state_is_idle) =>
+                {
+                    (
+                        false,
+                        "  reported to PipeWire: once an app records (the chain is idle)".into(),
+                    )
+                }
                 None => (
                     true,
                     "  reported to PipeWire: missing (declaration not in effect)".into(),
@@ -329,9 +513,19 @@ pub fn render(r: &Report) -> (String, usize) {
     {
         use crate::controller::PINNED_QUANTUM;
         let (bad, s) = match (r.hushmic_present == Some(true), r.chain_quantum_pin) {
-            (true, Some(q)) if q == PINNED_QUANTUM => {
-                (false, format!("quantum pin: yes ({PINNED_QUANTUM})"))
-            }
+            (true, Some(q)) if q == PINNED_QUANTUM => (
+                false,
+                format!(
+                    "quantum pin: {PINNED_QUANTUM} (the whole graph runs at {PINNED_QUANTUM} \
+                     while an app records from HushMic{})",
+                    match r.min_quantum {
+                        Some(m) if m > PINNED_QUANTUM => {
+                            format!("; your clock.min-quantum {m} is overridden then")
+                        }
+                        _ => String::new(),
+                    }
+                ),
+            ),
             (true, Some(0)) => (
                 true,
                 "quantum pin: missing (chain from an older hushmic — restart HushMic)".to_string(),
@@ -373,7 +567,10 @@ pub fn render(r: &Report) -> (String, usize) {
         // is what the chain follows. No expectation = plain fact.
         let expected = crate::pipewire::repin_want(
             r.active_mic.as_deref(),
-            r.default_source.clone(),
+            // the one WirePlumber links to, as the healer reads it
+            r.effective_default
+                .clone()
+                .or_else(|| r.default_source.clone()),
             r.prior_default.as_deref(),
         );
         let (bad, s) = if feeders.is_empty() {
@@ -402,6 +599,34 @@ pub fn render(r: &Report) -> (String, usize) {
         };
         line(&mut out, bad, s);
     }
+    // The engine worker below the data loop: without realtime priority a
+    // busy machine can make it late, and the audio drops out.
+    match &r.worker_rt {
+        Some(Ok(how)) => line(
+            &mut out,
+            false,
+            format!("engine worker: realtime priority {how}"),
+        ),
+        Some(Err(why)) => warn(
+            &mut out,
+            format!(
+                "engine worker: not realtime ({why}); under load the audio can drop out \
+                 (rtkit or a realtime limit for your user gives it realtime)"
+            ),
+        ),
+        None => {}
+    }
+    if let Some((tier, cost)) = &r.engine_cost {
+        line(
+            &mut out,
+            false,
+            format!(
+                "engine: {tier} (cost {cost:.2}: a hop of audio takes {:.0} % of its own \
+                 length, about that share of one CPU core while audio runs)",
+                cost * 100.0
+            ),
+        );
+    }
     // Which engine the last chain ran each model on (issue #18). A fact,
     // never a problem: ONNX is a supported engine, and the reason says
     // what would change it.
@@ -427,13 +652,22 @@ pub fn render(r: &Report) -> (String, usize) {
         ),
         None => line(&mut out, false, "sources: unavailable".into()),
     }
+    // What WirePlumber uses, and what is configured (often unset: it then
+    // picks one itself)
     line(
         &mut out,
         false,
-        format!(
-            "default source: {}",
-            r.default_source.as_deref().unwrap_or("(none set)")
-        ),
+        match (&r.effective_default, &r.default_source) {
+            (Some(e), Some(c)) if e == c => format!("default source: {e}"),
+            (Some(e), c) => format!(
+                "default source: {e} (configured: {})",
+                c.as_deref().unwrap_or("none set")
+            ),
+            (None, c) => format!(
+                "default source: (unknown) (configured: {})",
+                c.as_deref().unwrap_or("none set")
+            ),
+        },
     );
     // Some(false) is a problem only while an enabled instance is running:
     // that is precisely "the chain should be up but the node is gone".
@@ -450,6 +684,51 @@ pub fn render(r: &Report) -> (String, usize) {
             false,
             "hushmic_source present: unavailable".into(),
         ),
+    }
+    // The chain reaches hushmic_source only through the daemon's link.
+    if let (Some(true), Some(linked)) = (r.hushmic_present, r.chain_linked) {
+        line(
+            &mut out,
+            !linked && r.enabled && r.instance_running && other_version.is_none(),
+            format!(
+                "  chain linked into it: {}",
+                if linked { "yes" } else { "no" }
+            ),
+        );
+    }
+    // A stream where none belongs: an app's sound going into the call.
+    if !r.stray_streams.is_empty() {
+        line(
+            &mut out,
+            true,
+            format!(
+                "  linked into HushMic's microphone input: {} \
+                 (its sound would go into the call; HushMic cuts the link and moves it \
+                 to the default output)",
+                r.stray_streams.join(", ")
+            ),
+        );
+    }
+    // A mixer (pavucontrol, the desktop's sound settings) can mute or turn
+    // down the streams, and the session manager restores that. The
+    // internal ones muted or down silence HushMic; the capture's volume is
+    // the user's own knob for a hot mic (a fact), muted it silences too.
+    for c in &r.stream_controls {
+        let internal = c.name != crate::pipewire::CHAIN_INPUT;
+        let pct = (c.volume * 100.0).round();
+        if c.muted {
+            line(
+                &mut out,
+                true,
+                format!("  {} is muted in a mixer: HushMic is silent", c.name),
+            );
+        } else if pct < 100.0 {
+            line(
+                &mut out,
+                internal,
+                format!("  {} volume in a mixer: {pct} %", c.name),
+            );
+        }
     }
     // A fact, never a problem: idle is PipeWire not scheduling the chain,
     // normally because no stream reads from it (the capture side is passive).
@@ -469,18 +748,47 @@ pub fn render(r: &Report) -> (String, usize) {
             if r.can_set_default { "yes" } else { "no" }
         ),
     );
+    // The backend that really works: the portal is asked, not assumed.
     line(
         &mut out,
         false,
         format!(
             "global shortcuts: {}",
-            match r.shortcuts_backend {
-                crate::shortcuts::Backend::Portal => "desktop portal",
-                crate::shortcuts::Backend::KGlobalAccel => "KDE kglobalaccel (Plasma before 6.4)",
-                crate::shortcuts::Backend::Unsupported => "unavailable (sandbox on Plasma 5)",
+            match (r.shortcuts_backend, &r.shortcuts_portal) {
+                (crate::shortcuts::Backend::Portal, Some(PortalAnswer::Version(v))) =>
+                    format!("desktop portal (v{v})"),
+                // slow is not missing: a portal started on demand can take longer
+                (crate::shortcuts::Backend::Portal, Some(PortalAnswer::NoAnswer(d))) => format!(
+                    "unknown (the portal didn't answer within {} s)",
+                    d.as_secs()
+                ),
+                (crate::shortcuts::Backend::Portal, Some(PortalAnswer::Missing(e))) => format!(
+                    "none: no GlobalShortcuts portal ({e}); bind hushmic toggle mute|bypass \
+                     in your desktop's keyboard settings"
+                ),
+                (crate::shortcuts::Backend::Portal, None) => "desktop portal".to_string(),
+                (crate::shortcuts::Backend::KGlobalAccel, _) => {
+                    "KDE kglobalaccel (Plasma before 6.4)".to_string()
+                }
+                (crate::shortcuts::Backend::Unsupported, _) => {
+                    "unavailable (sandbox on Plasma 5)".to_string()
+                }
             }
         ),
     );
+    #[cfg(feature = "speakers")]
+    for (kind, s) in crate::speakers::doctor::render(&r.speakers, r.instance_running) {
+        use crate::speakers::doctor::Kind;
+        match kind {
+            Kind::Fact => line(&mut out, false, s),
+            Kind::Problem => line(&mut out, true, s),
+            Kind::Warning => warn(&mut out, s),
+            Kind::Text => {
+                out.push_str(&s);
+                out.push('\n');
+            }
+        }
+    }
     out.push_str("assets:\n");
     for a in &r.assets {
         line(
@@ -516,12 +824,69 @@ pub fn render(r: &Report) -> (String, usize) {
         }
         None => out.push_str("filter-chain log: no log file yet\n"),
     }
+    match warnings {
+        0 => {}
+        1 => out.push_str("1 warning (marked !)\n"),
+        n => out.push_str(&format!("{n} warnings (marked !)\n")),
+    }
     if problems == 0 {
         out.push_str("no problems found\n");
     } else {
         out.push_str(&format!("{problems} problem(s) found\n"));
     }
     (out, problems)
+}
+
+/// A microphone's display name: as PipeWire lists it, else as the running
+/// instance names it (`names`: node name and display name, from its
+/// `status --json`), else its node name. Pure.
+pub fn mic_display_name(
+    sources: Option<&[crate::pipewire::Source]>,
+    names: &[(String, String)],
+    node: &str,
+) -> String {
+    sources
+        .and_then(|v| crate::pipewire::description_of(v, node))
+        .or_else(|| {
+            names
+                .iter()
+                .find(|(n, _)| n == node)
+                .map(|(_, d)| d.as_str())
+        })
+        .unwrap_or(node)
+        .to_string()
+}
+
+/// The running instance's names for its chosen and active microphones
+/// (node name, display name), from its `status --json`. Pure.
+pub fn parse_mic_names(json: &str) -> Vec<(String, String)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let mic = &v["mic"];
+    [("configured", "configured_name"), ("active", "active_name")]
+        .iter()
+        .filter_map(|(n, d)| {
+            Some((
+                mic[n].as_str()?.to_string(),
+                mic[d].as_str().filter(|d| !d.is_empty())?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// The `active mic:` words: the mic in use and why when it is not the
+/// one chosen, by display name, in `status`'s words ("USB Mic (fallback;
+/// Headset is unplugged)", UX panel round 2, A9). Pure.
+pub fn active_words(
+    preferred: Option<&str>,
+    in_use: Option<&str>,
+    missing: bool,
+    name: &dyn Fn(&str) -> String,
+) -> String {
+    let p = preferred.map(name);
+    let a = in_use.map(name);
+    crate::control::mic_words(p.as_deref(), a.as_deref(), missing)
 }
 
 /// The last `n` lines of `text` (all of it when shorter).
@@ -537,14 +902,33 @@ pub fn tail(text: &str, n: usize) -> String {
 pub const LOG_CAP_BYTES: u64 = 256 * 1024;
 
 /// Where the filter-chain child's stderr is persisted so `--doctor` and
-/// the About window (separate processes — and post-mortem runs after a
+/// the window's Copy diagnostics (separate processes — and post-mortem runs after a
 /// crash) can include its tail.
 pub fn log_path() -> std::path::PathBuf {
+    log_path_of(Chain::Mic)
+}
+
+/// [`log_path`] for either chain: each has its own log, so a speakers
+/// chain's output never truncates the microphone's.
+pub fn log_path_of(chain: Chain) -> std::path::PathBuf {
     let dirs = directories::ProjectDirs::from("io", "hushmic", "hushmic").expect("home");
     dirs.state_dir()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| dirs.data_local_dir().to_path_buf())
-        .join("filter-chain.log")
+        .join(match chain {
+            Chain::Mic => "filter-chain.log",
+            Chain::Speakers => "filter-chain-speakers.log",
+        })
+}
+
+/// Which of HushMic's two filter-chain processes something belongs to:
+/// the microphone's, or the speakers cleaner's. Each reports its engine
+/// tier, inference lines and generations on its own, so one chain's tee
+/// can never change what the other shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Chain {
+    Mic,
+    Speakers,
 }
 
 /// Tee the filter-chain child's stderr: every line goes to our own stderr
@@ -554,16 +938,19 @@ pub fn log_path() -> std::path::PathBuf {
 pub fn spawn_stderr_tee(
     reader: impl std::io::Read + Send + 'static,
     log: std::path::PathBuf,
+    chain: Chain,
     generation: u64,
 ) -> std::thread::JoinHandle<()> {
-    tee_with_cap(reader, log, LOG_CAP_BYTES, generation)
+    tee_of(reader, log, LOG_CAP_BYTES, chain, generation)
 }
 
 /// The engine tier the running chain reports (issue #14). The plugin writes
 /// one contract line per transition to stderr (`[dpdfnet-ladspa] engine:
 /// <word> ...`); the tee below is the only reader, and this atomic is the
-/// only channel from a `module-filter-chain` plugin to the app.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// only channel from a `module-filter-chain` plugin to the app. Serialized
+/// as its word (the window's `AppState`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EngineTier {
     Quality,
     Light,
@@ -588,6 +975,15 @@ impl EngineTier {
 /// is best effort (`Controller::disable` waits a couple of seconds), so
 /// this cannot rest on the join.
 static ENGINE_TIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same word for the speakers chain.
+static SPEAKERS_TIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tier_slot(chain: Chain) -> &'static std::sync::atomic::AtomicU64 {
+    match chain {
+        Chain::Mic => &ENGINE_TIER,
+        Chain::Speakers => &SPEAKERS_TIER,
+    }
+}
 
 fn tier_code(t: EngineTier) -> u64 {
     match t {
@@ -597,8 +993,13 @@ fn tier_code(t: EngineTier) -> u64 {
     }
 }
 
+/// The microphone chain's tier.
 pub fn engine_tier() -> Option<EngineTier> {
-    match ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire) & 0xff {
+    engine_tier_of(Chain::Mic)
+}
+
+pub fn engine_tier_of(chain: Chain) -> Option<EngineTier> {
+    match tier_slot(chain).load(std::sync::atomic::Ordering::Acquire) & 0xff {
         1 => Some(EngineTier::Quality),
         2 => Some(EngineTier::Light),
         3 => Some(EngineTier::Passthrough),
@@ -612,10 +1013,16 @@ pub fn engine_tier() -> Option<EngineTier> {
 /// reports under) and on disable (where the token is dropped). Only the
 /// main thread calls this, in step with enable/disable.
 pub fn new_engine_generation() -> u64 {
-    let mut cur = ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire);
+    new_engine_generation_of(Chain::Mic)
+}
+
+/// [`new_engine_generation`] for either chain: the two count apart.
+pub fn new_engine_generation_of(chain: Chain) -> u64 {
+    let slot = tier_slot(chain);
+    let mut cur = slot.load(std::sync::atomic::Ordering::Acquire);
     loop {
         let next = ((cur >> 8) + 1) << 8;
-        match ENGINE_TIER.compare_exchange_weak(
+        match slot.compare_exchange_weak(
             cur,
             next,
             std::sync::atomic::Ordering::AcqRel,
@@ -627,19 +1034,51 @@ pub fn new_engine_generation() -> u64 {
     }
 }
 
+/// The current chain's generation: it changes on every chain spawn and
+/// every stop, so anything measured on an older chain can tell it is stale.
+pub fn engine_generation() -> u64 {
+    engine_generation_of(Chain::Mic)
+}
+
+pub fn engine_generation_of(chain: Chain) -> u64 {
+    tier_slot(chain).load(std::sync::atomic::Ordering::Acquire) >> 8
+}
+
+/// Called (from the tee thread) whenever the reported tier changes: the
+/// daemon wakes its main loop with it so the window hears within moments,
+/// not at the next tick. Set once.
+static ENGINE_WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+pub fn on_engine_change(wake: impl Fn() + Send + Sync + 'static) {
+    let _ = ENGINE_WAKE.set(Box::new(wake));
+}
+
 /// Record a tier on behalf of `generation`. A retired tee's line is
 /// dropped: the value it carries describes a chain that is already gone.
+#[cfg(test)]
 fn store_engine_tier(generation: u64, t: EngineTier) {
+    store_engine_tier_of(Chain::Mic, generation, t)
+}
+
+fn store_engine_tier_of(chain: Chain, generation: u64, t: EngineTier) {
+    let slot = tier_slot(chain);
     let want = (generation << 8) | tier_code(t);
-    let mut cur = ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire);
+    let mut cur = slot.load(std::sync::atomic::Ordering::Acquire);
     while cur >> 8 == generation {
-        match ENGINE_TIER.compare_exchange_weak(
+        match slot.compare_exchange_weak(
             cur,
             want,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         ) {
-            Ok(_) => return,
+            Ok(_) => {
+                if cur != want {
+                    if let Some(wake) = ENGINE_WAKE.get() {
+                        wake();
+                    }
+                }
+                return;
+            }
             Err(c) => cur = c,
         }
     }
@@ -742,14 +1181,26 @@ pub fn parse_inference_line(line: &[u8]) -> Option<Inference> {
 /// generation that reported them (the same generations as the tier: a
 /// retired chain's entries are simply never read again).
 static INFERENCE: std::sync::Mutex<(u64, Vec<Inference>)> = std::sync::Mutex::new((0, Vec::new()));
+static SPEAKERS_INFERENCE: std::sync::Mutex<(u64, Vec<Inference>)> =
+    std::sync::Mutex::new((0, Vec::new()));
 
-fn current_generation() -> u64 {
-    ENGINE_TIER.load(std::sync::atomic::Ordering::Acquire) >> 8
+fn inference_slot(chain: Chain) -> &'static std::sync::Mutex<(u64, Vec<Inference>)> {
+    match chain {
+        Chain::Mic => &INFERENCE,
+        Chain::Speakers => &SPEAKERS_INFERENCE,
+    }
 }
 
+#[cfg(test)]
 fn store_inference(generation: u64, i: Inference) {
-    let mut g = INFERENCE.lock().unwrap_or_else(|e| e.into_inner());
-    if generation != current_generation() {
+    store_inference_of(Chain::Mic, generation, i)
+}
+
+fn store_inference_of(chain: Chain, generation: u64, i: Inference) {
+    let mut g = inference_slot(chain)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if generation != engine_generation_of(chain) {
         return;
     }
     if g.0 != generation {
@@ -762,11 +1213,46 @@ fn store_inference(generation: u64, i: Inference) {
 /// What the running chain reports running `model` on; None before the
 /// plugin said so (or with a plugin that predates the line).
 pub fn inference_for(model: &str) -> Option<Inference> {
-    let g = INFERENCE.lock().unwrap_or_else(|e| e.into_inner());
-    if g.0 != current_generation() {
+    inference_for_of(Chain::Mic, model)
+}
+
+pub fn inference_for_of(chain: Chain, model: &str) -> Option<Inference> {
+    let g = inference_slot(chain)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if g.0 != engine_generation_of(chain) {
         return None;
     }
     g.1.iter().find(|i| i.model == model).cloned()
+}
+
+/// The engine worker's last scheduling line in a log: Ok("10 (rtkit)"),
+/// Err("EPERM") for "not available (EPERM)".
+pub fn worker_rt_from_log(text: &str) -> Option<Result<String, String>> {
+    const HEAD: &str = "[dpdfnet-ladspa] worker: realtime priority ";
+    let rest = text
+        .lines()
+        .rev()
+        .find_map(|l| Some(&l[l.rfind(HEAD)? + HEAD.len()..]))?;
+    Some(match rest.strip_prefix("not available") {
+        Some(why) => Err(why
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .to_string()),
+        None => Ok(rest.trim().to_string()),
+    })
+}
+
+/// The last `engine: TIER (cost N)` line in a log.
+pub fn engine_cost_from_log(text: &str) -> Option<(String, f32)> {
+    const HEAD: &str = "[dpdfnet-ladspa] engine: ";
+    text.lines().rev().find_map(|l| {
+        let rest = &l[l.rfind(HEAD)? + HEAD.len()..];
+        let (tier, cost) = rest.split_once(" (cost ")?;
+        let cost: f32 = cost.strip_suffix(')')?.parse().ok()?;
+        Some((tier.to_string(), cost))
+    })
 }
 
 /// Every model's last inference line in a log, in first-seen order.
@@ -783,10 +1269,21 @@ pub fn inference_from_log(text: &str) -> Vec<Inference> {
     out
 }
 
+#[cfg(test)]
 fn tee_with_cap(
     reader: impl std::io::Read + Send + 'static,
     log: std::path::PathBuf,
     cap: u64,
+    generation: u64,
+) -> std::thread::JoinHandle<()> {
+    tee_of(reader, log, cap, Chain::Mic, generation)
+}
+
+fn tee_of(
+    reader: impl std::io::Read + Send + 'static,
+    log: std::path::PathBuf,
+    cap: u64,
+    chain: Chain,
     generation: u64,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -808,19 +1305,25 @@ fn tee_with_cap(
         let mut capped = false;
         let mut reader = BufReader::new(reader);
         let mut line = Vec::new();
+        let mut said = Vec::new();
         // read_until, not lines(): the child's output is not guaranteed
         // UTF-8, and raw bytes must pass through unmangled.
         while {
             line.clear();
             matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0)
         } {
-            let _ = std::io::stderr().write_all(&line);
             if let Some(t) = parse_engine_line(&line) {
-                store_engine_tier(generation, t);
+                store_engine_tier_of(chain, generation, t);
             }
             if let Some(i) = parse_inference_line(&line) {
-                store_inference(generation, i);
+                store_inference_of(chain, generation, i);
+                // the plugin says it again each time PipeWire sets it up
+                // anew (a consumer after idle): once is the news
+                if said_before(&mut said, &line) {
+                    continue;
+                }
             }
+            let _ = std::io::stderr().write_all(&line);
             if let Some(f) = file.as_mut() {
                 if written + line.len() as u64 <= cap {
                     if f.write_all(&line).is_ok() {
@@ -833,6 +1336,17 @@ fn tee_with_cap(
             }
         }
     })
+}
+
+/// `line` (an inference line) was already said by this chain: the same
+/// bytes, line end aside. Remembers it otherwise.
+fn said_before(said: &mut Vec<Vec<u8>>, line: &[u8]) -> bool {
+    let body = line.strip_suffix(b"\n").unwrap_or(line).to_vec();
+    if said.contains(&body) {
+        return true;
+    }
+    said.push(body);
+    false
 }
 
 /// Classify the install from environment facts. Pure; the caller feeds
@@ -855,6 +1369,40 @@ pub fn install_type(appimage: bool, flatpak: bool, prefix: Option<&str>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shortcuts::PortalAnswer;
+
+    #[test]
+    fn an_inference_line_is_said_once_per_chain() {
+        let mut said = Vec::new();
+        let q = b"[dpdfnet-ladspa] inference: native w7a8 avx2 for q\n";
+        let l = b"[dpdfnet-ladspa] inference: native w7a8 avx2 for l\n";
+        assert!(!said_before(&mut said, q));
+        assert!(!said_before(&mut said, l), "another model is news");
+        assert!(said_before(&mut said, q));
+        assert!(said_before(&mut said, &q[..q.len() - 1]), "line end aside");
+
+        // the tee drops the repeat (log and stderr alike), and only that
+        let dir = std::env::temp_dir().join(format!("hushmic-said-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("tee-said.log");
+        let qz = "[dpdfnet-ladspa] inference: native fp32 for zq\n";
+        let lz = "[dpdfnet-ladspa] inference: native fp32 for zl\n";
+        let other = "[dpdfnet-ladspa] something else\n";
+        let input = format!("{qz}{other}{qz}{lz}{other}{qz}");
+        tee_with_cap(
+            std::io::Cursor::new(input.into_bytes()),
+            log.clone(),
+            LOG_CAP_BYTES,
+            0,
+        )
+        .join()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("{qz}{other}{lz}{other}")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn healthy() -> Report {
         Report {
@@ -866,6 +1414,9 @@ mod tests {
             enabled: true,
             preferred_mic: None,
             active_mic: None,
+            preferred_present: None,
+            active_words: "RODE NT-USB (system default)".into(),
+            in_use: Some("RODE NT-USB".into()),
             model: "dpdfnet8_48khz_hr".into(),
             attn_limit: 100.0,
             profile: Some("RODE NT-USB".into()),
@@ -873,10 +1424,13 @@ mod tests {
             mic_profiles: 1,
             sources: Some(vec!["RODE NT-USB".into(), "Webcam C920".into()]),
             default_source: Some("hushmic_source".into()),
+            effective_default: Some("hushmic_source".into()),
             hushmic_present: Some(true),
             can_set_default: true,
             shortcuts_backend: crate::shortcuts::Backend::Portal,
+            shortcuts_portal: None,
             instance_running: true,
+            instance_version: None,
             assets: vec![AssetFact {
                 what: "LADSPA plugin",
                 path: "/usr/lib/ladspa/libdpdfnet_ladspa.so".into(),
@@ -891,7 +1445,16 @@ mod tests {
             chain_quantum_pin: Some(crate::controller::PINNED_QUANTUM),
             chain_node_state: Some("running".into()),
             forced_quantum: None,
+            min_quantum: None,
+            worker_rt: None,
+            engine_cost: None,
+            chain_linked: Some(true),
+            stray_streams: Vec::new(),
+            stream_controls: vec![],
+            #[cfg(feature = "speakers")]
+            speakers: Default::default(),
             inference_setting: "auto".into(),
+            voice_hold: false,
             inference: Some(vec![]),
         }
     }
@@ -1020,6 +1583,89 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_from_before_the_update_is_named_and_not_judged() {
+        assert_eq!(
+            instance_version_of(r#"{"mode":"suppress","version":"0.11.0"}"#).as_deref(),
+            Some("0.11.0")
+        );
+        assert_eq!(instance_version_of("not json"), None);
+        let mut r = healthy();
+        r.instance_version = Some(r.version.clone());
+        let (text, _) = render(&r);
+        assert!(text.contains("\ninstance running: yes\n"), "{text}");
+        // The older instance links its chain another way: not a problem.
+        r.instance_version = Some("0.1.0".into());
+        r.chain_linked = Some(false);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(
+            text.contains("! instance running: yes, version 0.1.0 (this command is "),
+            "{text}"
+        );
+        assert!(
+            text.contains("start it again to finish the update)\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n  chain linked into it: no\n"), "{text}");
+        // Nothing running: a version it left behind says nothing.
+        r.instance_running = false;
+        let (text, _) = render(&r);
+        assert!(text.contains("\ninstance running: no\n"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_link_and_a_mixer_s_mute_on_the_internal_streams_are_problems() {
+        use crate::pipewire::StreamControls;
+        let c = |name: &str, muted: bool, volume: f32| StreamControls {
+            name: name.into(),
+            muted,
+            volume,
+        };
+        let mut r = healthy();
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(text.contains("  chain linked into it: yes\n"), "{text}");
+        r.chain_linked = Some(false);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(text.contains("!!   chain linked into it: no\n"), "{text}");
+        r.chain_linked = Some(true);
+        r.stray_streams = vec!["Firefox".into()];
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 1, "{text}");
+        assert!(
+            text.contains("!!   linked into HushMic's microphone input: Firefox ("),
+            "{text}"
+        );
+        r.stray_streams.clear();
+        // the capture turned down is the user's knob; muted it is silence
+        r.stream_controls = vec![c("hushmic_input", false, 0.4)];
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(
+            text.contains("  hushmic_input volume in a mixer: 40 %"),
+            "{text}"
+        );
+        r.stream_controls = vec![
+            c("hushmic_input", true, 1.0),
+            c("hushmic_dsp_out", false, 0.3),
+            c("hushmic_feed", true, 1.0),
+        ];
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 3, "{text}");
+        assert!(
+            text.contains("!!   hushmic_dsp_out volume in a mixer: 30 %"),
+            "{text}"
+        );
+        assert!(
+            text.contains("!!   hushmic_feed is muted in a mixer"),
+            "{text}"
+        );
+        r.stream_controls = vec![c("hushmic_dsp_out", false, 1.0)];
+        assert_eq!(render(&r).1, 0);
+    }
+
+    #[test]
     fn capture_feeder_matching_the_target_is_a_plain_fact() {
         // Follow-default mode: the expected feeder is the default source.
         let mut r = healthy();
@@ -1056,6 +1702,176 @@ mod tests {
         r.hushmic_present = Some(true);
         r.chain_node_state = None;
         assert!(!render(&r).0.contains("  state: "));
+    }
+
+    /// UX panel round 2, A9: the doctor names the mic in use as `status`
+    /// does, and warns while the preferred one is unplugged.
+    #[test]
+    fn the_doctor_names_the_mic_in_use_and_warns_when_the_chosen_is_gone() {
+        let name = |d: &str| match d {
+            "alsa_usb" => "USB Mic".to_string(),
+            "alsa_headset" => "Headset".to_string(),
+            d => d.to_string(),
+        };
+        assert_eq!(
+            active_words(Some("alsa_headset"), Some("alsa_usb"), true, &name),
+            "USB Mic (fallback; Headset is unplugged)"
+        );
+        assert_eq!(
+            active_words(Some("alsa_headset"), Some("alsa_headset"), false, &name),
+            "Headset"
+        );
+        assert_eq!(
+            active_words(None, Some("alsa_usb"), false, &name),
+            "USB Mic (system default)"
+        );
+        let r = healthy();
+        let (text, _) = render(&r);
+        assert!(
+            text.contains("  active mic: RODE NT-USB (system default)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("not plugged in"), "{text}");
+        // A115 N-D1: unplugged, it is not in PipeWire's list; the running
+        // instance's name for it stands in for its node name
+        let plugged = [crate::pipewire::Source {
+            name: "alsa_usb".into(),
+            description: "USB Mic".into(),
+        }];
+        let running = parse_mic_names(
+            r#"{"mic":{"configured":"alsa_headset","active":"alsa_usb",
+                "configured_name":"Headset","active_name":"USB Mic"}}"#,
+        );
+        let name = |d: &str| mic_display_name(Some(&plugged), &running, d);
+        assert_eq!(name("alsa_headset"), "Headset");
+        assert_eq!(name("alsa_usb"), "USB Mic");
+        assert_eq!(
+            mic_display_name(Some(&plugged), &[], "alsa_headset"),
+            "alsa_headset"
+        );
+        let mut r = healthy();
+        r.preferred_mic = Some(name("alsa_headset"));
+        r.preferred_present = Some(false);
+        r.active_words = active_words(Some("alsa_headset"), Some("alsa_usb"), true, &name);
+        r.in_use = Some(name("alsa_usb"));
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "a warning, not a problem: {text}");
+        assert!(text.contains("  preferred mic: Headset\n"), "{text}");
+        assert!(
+            text.contains("  active mic: USB Mic (fallback; Headset is unplugged)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "! the preferred mic Headset is not plugged in; HushMic uses USB Mic until it is back\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("1 warning (marked !)"), "{text}");
+    }
+
+    #[test]
+    fn the_quantum_pin_says_what_it_does_to_the_graph() {
+        let mut r = healthy();
+        r.chain_quantum_pin = Some(480);
+        let (text, problems) = render(&r);
+        assert_eq!(problems, 0, "{text}");
+        assert!(
+            text.contains(
+                "quantum pin: 480 (the whole graph runs at 480 while an app records from HushMic)\n"
+            ),
+            "{text}"
+        );
+        r.min_quantum = Some(1024);
+        let (text, _) = render(&r);
+        assert!(
+            text.contains("; your clock.min-quantum 1024 is overridden then)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_doctor_says_both_defaults_the_real_backend_and_the_worker() {
+        let mut r = healthy();
+        r.effective_default = Some("usb_mic".into());
+        r.default_source = None;
+        r.chain_quantum_pin = Some(480);
+        r.shortcuts_portal = Some(PortalAnswer::Missing(
+            "org.freedesktop.DBus.Error.ServiceUnknown".into(),
+        ));
+        r.worker_rt = Some(Err("EPERM".into()));
+        r.engine_cost = Some(("quality".into(), 0.52));
+        r.capture_feeders = None;
+        let (text, problems) = render(&r);
+        assert!(
+            text.contains("default source: usb_mic (configured: none set)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("global shortcuts: none: no GlobalShortcuts portal"),
+            "{text}"
+        );
+        assert!(
+            text.contains("! engine worker: not realtime (EPERM); under load"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "engine: quality (cost 0.52: a hop of audio takes 52 % of its own length"
+            ),
+            "{text}"
+        );
+        // a warning is not a problem: the exit code stays 0
+        assert_eq!(problems, 0, "{text}");
+        assert!(
+            text.ends_with("1 warning (marked !)\nno problems found\n"),
+            "{text}"
+        );
+        r.shortcuts_portal = Some(PortalAnswer::NoAnswer(std::time::Duration::from_secs(2)));
+        let (text, _) = render(&r);
+        assert!(
+            text.contains("global shortcuts: unknown (the portal didn't answer within 2 s)\n"),
+            "slow is not missing: {text}"
+        );
+        r.shortcuts_portal = Some(PortalAnswer::Version(1));
+        r.worker_rt = Some(Ok("10 (rtkit)".into()));
+        r.default_source = Some("usb_mic".into());
+        let (text, _) = render(&r);
+        assert!(
+            text.contains("global shortcuts: desktop portal (v1)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("engine worker: realtime priority 10 (rtkit)\n"),
+            "{text}"
+        );
+        assert!(text.contains("default source: usb_mic\n"), "{text}");
+        assert!(
+            text.ends_with("\nno problems found\n") && !text.contains("warning"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_worker_and_cost_lines_are_read_from_the_log() {
+        let log = "[dpdfnet-ladspa] worker: realtime priority not available (EPERM)\n\
+                   [dpdfnet-ladspa] engine: quality (cost 0.30)\n\
+                   [dpdfnet-ladspa] engine: passthrough (cpu overloaded, lag 4 hops)\n\
+                   [dpdfnet-ladspa] engine: light (cost 0.21)\n\
+                   [pw] x[dpdfnet-ladspa] worker: realtime priority 10 (rtkit)\n";
+        assert_eq!(worker_rt_from_log(log), Some(Ok("10 (rtkit)".into())));
+        assert_eq!(engine_cost_from_log(log), Some(("light".into(), 0.21)));
+        assert_eq!(
+            worker_rt_from_log(
+                "[dpdfnet-ladspa] worker: realtime priority not available (EPERM)\n"
+            ),
+            Some(Err("EPERM".into()))
+        );
+        assert_eq!(worker_rt_from_log("nothing\n"), None);
+        assert_eq!(
+            engine_cost_from_log("[dpdfnet-ladspa] engine: passthrough (x)\n"),
+            None
+        );
     }
 
     #[test]
@@ -1218,6 +2034,54 @@ mod tests {
             text.contains("480"),
             "mismatch shows the wrong value: {text}"
         );
+    }
+
+    #[test]
+    fn latency_not_yet_declared_on_an_idle_chain_is_a_fact_not_a_problem() {
+        // The workstation report: a healthy chain nobody records from is
+        // suspended, and the chain declares its latency only once audio
+        // flows. Same report, same exit code as a healthy recording one.
+        for st in ["idle", "suspended"] {
+            let mut r = healthy();
+            r.chain_node_state = Some(st.into());
+            r.latency_reported = None;
+            let (text, problems) = render(&r);
+            assert_eq!(problems, 0, "{text}");
+            assert_eq!(exit_code(problems), 0);
+            assert!(
+                text.contains(
+                    "\n  reported to PipeWire: once an app records (the chain is idle)\n"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("!!"), "{text}");
+            assert!(text.ends_with("no problems found\n"), "{text}");
+        }
+        // As soon as an app records: running and declared.
+        let (text, problems) = render(&healthy());
+        assert_eq!((problems, exit_code(problems)), (0, 0), "{text}");
+        assert!(
+            text.contains("  reported to PipeWire: yes (3840)\n"),
+            "{text}"
+        );
+        // Running with nothing declared is the real fault: one problem, exit 1.
+        let mut r = healthy();
+        assert_eq!(r.chain_node_state.as_deref(), Some("running"));
+        r.latency_reported = None;
+        let (text, problems) = render(&r);
+        assert_eq!((problems, exit_code(problems)), (1, 1), "{text}");
+        assert!(
+            text.contains("\n!!   reported to PipeWire: missing (declaration not in effect)\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("1 problem(s) found\n"), "{text}");
+        // An idle chain still reporting a WRONG value stays a problem.
+        let mut r = healthy();
+        r.chain_node_state = Some("suspended".into());
+        r.latency_reported = Some(480);
+        let (text, problems) = render(&r);
+        assert_eq!((problems, exit_code(problems)), (1, 1), "{text}");
+        assert!(text.contains("mismatch (480, declared 3840)"), "{text}");
     }
 
     #[test]
@@ -1477,8 +2341,13 @@ mod tests {
         assert_eq!(parse_engine_line(b""), None);
     }
 
+    /// The tier slots are process-global: the tests that move them run
+    /// one at a time.
+    static TIER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_retired_tee_cannot_overwrite_the_next_chain() {
+        let _g = TIER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         // Sequential, so it asserts the rule rather than racing on it:
         // the generation a tee reports under is the only thing that
         // decides, no matter when its line arrives.
@@ -1540,5 +2409,42 @@ mod tests {
         );
         handle.join().unwrap();
         assert_eq!(inference_for("q"), Some(line("native fp32")));
+    }
+
+    #[test]
+    fn the_speakers_chain_reports_apart_from_the_mic() {
+        let _g = TIER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mic = engine_generation();
+        let mic_tier = engine_tier();
+        let dir = std::env::temp_dir().join(format!("hushmic-diag-spk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spk = new_engine_generation_of(Chain::Speakers);
+        let handle = tee_of(
+            std::io::Cursor::new(
+                b"[dpdfnet-ladspa] engine: passthrough (cost 1.20)\n\
+                  [dpdfnet-ladspa] inference: native w7a8 avx2 for spk-model\n"
+                    .to_vec(),
+            ),
+            dir.join("tee-speakers.log"),
+            LOG_CAP_BYTES,
+            Chain::Speakers,
+            spk,
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            engine_tier_of(Chain::Speakers),
+            Some(EngineTier::Passthrough)
+        );
+        assert!(inference_for_of(Chain::Speakers, "spk-model").is_some());
+        // the microphone's tier, generation and engine lines are untouched
+        assert_eq!(engine_generation(), mic);
+        assert_eq!(engine_tier(), mic_tier);
+        assert_eq!(inference_for("spk-model"), None);
+        // a new speakers chain retires only the speakers report
+        new_engine_generation_of(Chain::Speakers);
+        assert_eq!(engine_tier_of(Chain::Speakers), None);
+        assert_eq!(engine_generation(), mic);
+        assert_ne!(log_path_of(Chain::Speakers), log_path());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

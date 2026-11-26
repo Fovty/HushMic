@@ -1,14 +1,17 @@
 //! hushmic DPDFNet LADSPA plugin: a thin PipeWire-facing wrapper around the
 //! `hushmic-denoiser` engine crate. Everything here is host plumbing —
-//! control-port mapping, the inference worker + alignment ledger that
-//! decouple the DSP from the host's cycle (issue #10), the inference
-//! engine choice (issue #18), and the bundled ONNX Runtime's baked default
-//! paths.
+//! control-port mapping (or, in HushMic's own chain, the control file that
+//! stands in for the Mode and Attenuation Limit ports), the inference
+//! worker + alignment ledger that decouple the DSP from the host's cycle
+//! (issue #10), the inference engine choice (issue #18), and the bundled
+//! ONNX Runtime's baked default paths.
 pub mod adaptive;
 pub mod align;
+pub mod gate;
 pub mod ladder;
 pub mod log;
 pub mod rt;
+pub mod view;
 pub mod worker;
 
 pub use adaptive::{AdaptiveEngine, RawDelay};
@@ -18,11 +21,14 @@ pub use align::{
 };
 pub use ladder::{Event, Ladder, Pinned, Policy, ShadowKind, Step, Tier};
 pub use rt::{RtOutcome, RT_PRIORITY};
+pub use view::{EngineView, TapSlot};
 pub use worker::{HopEngine, WorkerHandle, RING_CAPACITY, RUN_GUARD_AFTER, RUN_GUARD_MIN_PARK};
 
 use hushmic_denoiser::{Denoiser, Mode, RuntimeInit};
+use hushmic_shm::control::{ControlReader, LastValid, ATTN_MAX, ATTN_MIN};
 use ladspa::{DefaultValue, Plugin, PluginDescriptor, Port, PortConnection, PortDescriptor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const LABEL: &str = "dpdfnet_mono";
@@ -56,6 +62,55 @@ fn mode_from_control(v: f32) -> Mode {
     }
 }
 
+/// HushMic's own chain: the control file named in `HUSHMIC_CONTROL`, mapped
+/// at the first instantiate in this process and shared by every instance
+/// (see `hushmic_shm::control`). `None`: no file named (any other host),
+/// or one this plugin cannot honour (one log line): the ports, as ever.
+fn control() -> Option<&'static ControlReader> {
+    static CONTROL: OnceLock<Option<ControlReader>> = OnceLock::new();
+    CONTROL
+        .get_or_init(|| {
+            let path = std::env::var_os(hushmic_shm::CONTROL_ENV).filter(|p| !p.is_empty())?;
+            let path = Path::new(&path);
+            let reader = ControlReader::open(path)
+                .map_err(|e| {
+                    crate::log::contract_line(&format!(
+                        "control: not available ({}: {e}); following the ports",
+                        path.display()
+                    ))
+                })
+                .ok()?;
+            if !reader.locked() {
+                // Still followed: a swapped-out page costs one fault on
+                // the audio thread, the ports cost a silent WirePlumber.
+                crate::log::contract_line(&format!(
+                    "control: {} is not locked in RAM (memlock limit); a swapped-out page \
+                     would stall the audio thread once",
+                    path.display()
+                ));
+            }
+            Some(reader)
+        })
+        .as_ref()
+}
+
+/// This cycle's (Attenuation Limit, Mode) control values: the control
+/// file's newest valid words, else its last valid ones (`last`), else the
+/// ports'. An invalid word reads as none, so it never turns a mute into
+/// processing. RT-safe.
+fn file_controls(
+    last: &mut LastValid,
+    file_db: Option<f32>,
+    file_mode: Option<u32>,
+    port_db: f32,
+    port_mode: f32,
+) -> (f32, f32) {
+    (
+        last.attn_db(file_db).unwrap_or(port_db),
+        last.mode(file_mode).map_or(port_mode, |m| m as f32),
+    )
+}
+
 /// Which tiers a main model file and an optional light engine yield, and
 /// which slot the main model occupies. The file name decides: a main model
 /// named `dpdfnet2*` IS the light tier, so the ladder is `[Light, Raw]`.
@@ -81,6 +136,9 @@ const LIGHT_MODEL: &str = "dpdfnet2_48khz_hr";
 enum LightModel {
     /// The main model already is the light one: no fallback model.
     None,
+    /// `HUSHMIC_DSP_TIER=quality` pins the engine to the main model: the
+    /// light one would never run, so it is not loaded (issue #36).
+    Unused,
     /// Named by `HUSHMIC_FALLBACK_MODEL_PATH` (the HushMic app sets it).
     Named(PathBuf),
     /// No host named one: the light model's file next to the main model,
@@ -91,10 +149,17 @@ enum LightModel {
 
 /// `named` is `HUSHMIC_FALLBACK_MODEL_PATH`; unset or empty means "find
 /// it", as for `ORT_DYLIB_PATH`. A named path always wins, so a host can
-/// still point the plugin at another file.
-fn light_model(named: Option<&std::ffi::OsStr>, main: &std::path::Path) -> LightModel {
+/// still point the plugin at another file. `pin` is `HUSHMIC_DSP_TIER`.
+fn light_model(
+    named: Option<&std::ffi::OsStr>,
+    main: &std::path::Path,
+    pin: Option<&str>,
+) -> LightModel {
     if plan_tiers(main, false).1 == Tier::Light {
         return LightModel::None;
+    }
+    if pin == Some("quality") {
+        return LightModel::Unused;
     }
     if let Some(p) = named.filter(|p| !p.is_empty()) {
         return LightModel::Named(PathBuf::from(p));
@@ -212,6 +277,14 @@ pub fn load_denoiser(path: &std::path::Path) -> Result<Denoiser, hushmic_denoise
     Ok(d)
 }
 
+/// `HUSHMIC_VOICE_HOLD`: `1`, `true` or `on` turns the voice hold on in
+/// every model of this instance (see `Denoiser::set_voice_hold`); anything
+/// else, and no variable at all, leaves it off. The HushMic app sets it for
+/// its setting; another host (EasyEffects) can set it in its environment.
+fn voice_hold_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "on"))
+}
+
 fn build_policy(tiers: &[Tier]) -> Box<dyn Policy> {
     let pin = std::env::var("HUSHMIC_DSP_TIER").ok();
     if let Some(t) = pinned_tier(pin.as_deref(), tiers) {
@@ -257,7 +330,9 @@ fn runtime_note(ours: Option<&str>, requested: &str) -> Option<String> {
 /// The light model (see `light_model`) is the adaptive engine's fallback
 /// under CPU pressure (issue #14); without it overload goes straight to
 /// unfiltered audio. Loading it costs memory and init time in every
-/// instance, not CPU: it only runs while the ladder trials or uses it. Both
+/// instance, not CPU: it only runs while the ladder trials or uses it. A
+/// chain pinned to the main model (`HUSHMIC_DSP_TIER=quality`) does not
+/// load it. Both
 /// loads happen here, on the instantiate thread, before the worker exists,
 /// and both go through `load_denoiser`, so both tiers run on the selected
 /// engine. The runtime is committed even when both models end up native:
@@ -285,8 +360,15 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
         Ok(_) => {}
     }
     let main_path = model_path();
+    let hold = voice_hold_from(std::env::var("HUSHMIC_VOICE_HOLD").ok().as_deref());
+    if hold {
+        eprintln!("[dpdfnet-ladspa] voice hold: on");
+    }
     let main = match load_denoiser(&main_path) {
-        Ok(d) => d,
+        Ok(mut d) => {
+            d.set_voice_hold(hold);
+            d
+        }
         Err(e) => {
             eprintln!("[dpdfnet-ladspa] engine init failed: {e}");
             return None;
@@ -302,8 +384,13 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
     let light_path = match light_model(
         std::env::var_os("HUSHMIC_FALLBACK_MODEL_PATH").as_deref(),
         &main_path,
+        std::env::var("HUSHMIC_DSP_TIER").ok().as_deref(),
     ) {
         LightModel::None => None,
+        LightModel::Unused => {
+            eprintln!("[dpdfnet-ladspa] HUSHMIC_DSP_TIER=quality: the light model is not loaded");
+            None
+        }
         LightModel::Named(p) => Some(p),
         LightModel::Sibling(p) if same_file(&p) => {
             eprintln!(
@@ -332,7 +419,10 @@ fn init_engine() -> Option<AdaptiveEngine<Denoiser, Box<dyn Policy>>> {
     let light = light_path
         .filter(|p| !same_file(p))
         .and_then(|p| match load_denoiser(&p) {
-            Ok(d) => Some(d),
+            Ok(mut d) => {
+                d.set_voice_hold(hold);
+                Some(d)
+            }
             Err(e) => {
                 eprintln!("[dpdfnet-ladspa] light model unavailable: {e}");
                 None
@@ -362,6 +452,15 @@ struct DpdfnetPlugin {
     // Control-port caches as bit patterns (NaN-proof compares).
     last_db_bits: u32,
     last_mode_bits: u32,
+    /// The control file, read every cycle in place of the Mode and
+    /// Attenuation Limit ports when HushMic's chain named one.
+    control: Option<&'static ControlReader>,
+    last: LastValid,
+    /// Mute on this thread: cut within the cycle, reopen only on audio
+    /// captured after an unmute (see gate.rs).
+    gate: gate::MuteGate,
+    /// Output samples of this activation so far (the gate's clock).
+    frames: u64,
 }
 
 impl DpdfnetPlugin {
@@ -380,12 +479,19 @@ impl DpdfnetPlugin {
             init_engine()
         };
         DpdfnetPlugin {
-            worker: engine.and_then(WorkerHandle::spawn),
+            // The engine view (meter + Mic check tap) only for HushMic's
+            // own chain, which names a meter file in the environment.
+            worker: engine.and_then(|e| WorkerHandle::spawn_with_view(e, EngineView::from_env())),
             aligner: Aligner::new(),
             active: false,
             restarting: false,
             last_db_bits: f32::NAN.to_bits(),
             last_mode_bits: f32::NAN.to_bits(),
+            // Mapped here, at instantiate, never in run().
+            control: control(),
+            last: LastValid::default(),
+            gate: gate::MuteGate::new(),
+            frames: 0,
         }
     }
 }
@@ -407,6 +513,8 @@ impl Plugin for DpdfnetPlugin {
         self.restarting = false;
         self.last_db_bits = f32::NAN.to_bits();
         self.last_mode_bits = f32::NAN.to_bits(); // force a set on first run()
+        self.gate = gate::MuteGate::new();
+        self.frames = 0;
         self.active = match self.worker.as_mut() {
             Some(w) => {
                 let ok = w.request_reset_and_wait(Duration::from_secs(2));
@@ -424,8 +532,18 @@ impl Plugin for DpdfnetPlugin {
     fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {
         let input = ports[0].unwrap_audio();
         let mut output = ports[1].unwrap_audio_mut();
-        let db = *ports[2].unwrap_control();
-        let mode_ctl = *ports[3].unwrap_control();
+        let (db, mode_ctl) = {
+            let (db, mode) = (*ports[2].unwrap_control(), *ports[3].unwrap_control());
+            match self.control {
+                // Two relaxed loads from a page faulted in at instantiate.
+                Some(c) => file_controls(&mut self.last, c.attn_db(), c.mode(), db, mode),
+                None => (db, mode),
+            }
+        };
+        let at = self.frames;
+        self.frames = self.frames.wrapping_add(sample_count as u64);
+        self.gate
+            .set_muted(mode_from_control(mode_ctl) == Mode::Mute, at);
 
         // RT contract: nothing below allocates, locks, logs or panics:
         // ring pushes/pops, atomics, and one futex wake at most. The
@@ -500,6 +618,12 @@ impl Plugin for DpdfnetPlugin {
             output[i] = 0.0;
             i += 1;
         }
+        // The latency in force: plan() grows the lead for a longer cycle.
+        self.gate.set_delay(
+            (hushmic_denoiser::LATENCY_SAMPLES + self.aligner.lead_total() + gate::ENGINE_REACH)
+                as u64,
+        );
+        self.gate.apply(&mut output[..sample_count], at);
     }
 }
 
@@ -547,8 +671,8 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 desc: PortDescriptor::ControlInput,
                 hint: None,
                 default: Some(DefaultValue::Maximum),
-                lower_bound: Some(0.0),
-                upper_bound: Some(100.0),
+                lower_bound: Some(ATTN_MIN),
+                upper_bound: Some(ATTN_MAX),
             },
             Port {
                 // 0 = process, 1 = bypass (latency-aligned raw), 2 = mute.
@@ -628,34 +752,61 @@ mod tests {
         let sibling =
             LightModel::Sibling("/usr/share/hushmic/models/dpdfnet2_48khz_hr.onnx".into());
         // Unset and empty both mean "find it" (EasyEffects sets nothing).
-        assert_eq!(light_model(None, q), sibling);
-        assert_eq!(light_model(Some(OsStr::new("")), q), sibling);
+        assert_eq!(light_model(None, q, None), sibling);
+        assert_eq!(light_model(Some(OsStr::new("")), q, None), sibling);
         // A named path wins, existing or not.
         assert_eq!(
-            light_model(Some(OsStr::new("/elsewhere/l.onnx")), q),
+            light_model(Some(OsStr::new("/elsewhere/l.onnx")), q, None),
             LightModel::Named("/elsewhere/l.onnx".into())
         );
         // A light main model has no fallback, named or not.
         let l = Path::new("/m/dpdfnet2_48khz_hr.onnx");
-        assert_eq!(light_model(None, l), LightModel::None);
+        assert_eq!(light_model(None, l, None), LightModel::None);
         assert_eq!(
-            light_model(Some(OsStr::new("/m/dpdfnet2_48khz_hr.onnx")), l),
+            light_model(Some(OsStr::new("/m/dpdfnet2_48khz_hr.onnx")), l, None),
             LightModel::None
         );
         // The sibling keeps the main model's extension, or has none.
         assert_eq!(
-            light_model(None, Path::new("/m/custom.model")),
+            light_model(None, Path::new("/m/custom.model"), None),
             LightModel::Sibling("/m/dpdfnet2_48khz_hr.model".into())
         );
         assert_eq!(
-            light_model(None, Path::new("/m/custom")),
+            light_model(None, Path::new("/m/custom"), None),
             LightModel::Sibling("/m/dpdfnet2_48khz_hr".into())
         );
         // A relative main model gets a relative sibling in the same place.
         assert_eq!(
-            light_model(None, Path::new("dpdfnet8_48khz_hr.onnx")),
+            light_model(None, Path::new("dpdfnet8_48khz_hr.onnx"), None),
             LightModel::Sibling("dpdfnet2_48khz_hr.onnx".into())
         );
+        // Pinned to the main model, the light one is not loaded, named or
+        // not; any other pin keeps it (the ladder decides what it is for).
+        assert_eq!(light_model(None, q, Some("quality")), LightModel::Unused);
+        assert_eq!(
+            light_model(Some(OsStr::new("/elsewhere/l.onnx")), q, Some("quality")),
+            LightModel::Unused
+        );
+        assert_eq!(light_model(None, q, Some("light")), sibling);
+        assert_eq!(light_model(None, q, Some("passthrough")), sibling);
+        assert_eq!(light_model(None, l, Some("quality")), LightModel::None);
+    }
+
+    #[test]
+    fn voice_hold_is_off_unless_the_variable_says_on() {
+        for on in ["1", "true", "on"] {
+            assert!(voice_hold_from(Some(on)), "{on}");
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes please"),
+        ] {
+            assert!(!voice_hold_from(off), "{off:?}");
+        }
     }
 
     #[test]
@@ -736,6 +887,22 @@ mod tests {
         assert_eq!(mode_from_control(-3.0), Mode::Process);
         assert_eq!(mode_from_control(7.0), Mode::Mute);
         assert_eq!(mode_from_control(f32::NAN), Mode::Process);
+    }
+
+    #[test]
+    fn the_control_file_holds_its_last_valid_word() {
+        use hushmic_shm::control::{MODE_BYPASS, MODE_MUTE};
+        let mut last = LastValid::default();
+        let mut c = |db, mode| file_controls(&mut last, db, mode, 40.0, 0.0);
+        // Nothing valid yet: the ports.
+        assert_eq!(c(None, None), (40.0, 0.0));
+        // Valid words replace the ports.
+        assert_eq!(c(Some(24.0), Some(MODE_MUTE)), (24.0, 2.0));
+        // An invalid word (none) keeps the mute, never processing.
+        assert_eq!(c(None, None), (24.0, 2.0));
+        assert_eq!(c(Some(0.0), Some(MODE_BYPASS)), (0.0, 1.0));
+        // The values map as the port's do.
+        assert_eq!(mode_from_control(c(None, None).1), Mode::Bypass);
     }
 
     #[test]

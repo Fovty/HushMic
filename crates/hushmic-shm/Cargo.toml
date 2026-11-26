@@ -1,0 +1,10 @@
+[package]
+name = "hushmic-shm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Shared-memory layouts between the HushMic plugin and app: the engine meter and the Mic check tap"
+
+[dependencies]
+libc = "0.2"

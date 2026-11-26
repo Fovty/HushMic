@@ -8,9 +8,16 @@
 #     extracts it, and installs from there.
 #
 # Usage:
-#   install.sh [--prefix DIR]   install (default prefix /usr; needs root)
+#   install.sh [--prefix DIR] [--no-check]   install (default prefix /usr;
+#                                            sudo where needed)
+#   install.sh --check          only check the sound system (exit 1: missing)
 #   install.sh --uninstall [--prefix DIR]
 #   install.sh -h | --help
+#
+# Before installing, it checks that PipeWire (with its command line tools),
+# WirePlumber and pipewire-pulse are installed and run in your session, and
+# says what to install and enable where they don't. It never installs a
+# package or changes a service itself.
 set -eu
 
 # Pin a known umask: a hardened caller umask (077/027 — common on CIS/STIG
@@ -29,6 +36,7 @@ VERSION=""
 
 PREFIX="/usr"
 ACTION="install"
+NO_CHECK=""
 
 # ---------------------------------------------------------------------------
 # Arg parsing
@@ -38,9 +46,18 @@ usage() {
 hushmic installer
 
 Usage:
-  $0 [--prefix DIR]          Install (default --prefix /usr, requires root)
+  $0 [--prefix DIR]          Install (default --prefix /usr); sudo only where
+                             this user can't write, and said first
+  $0 --check                 Only check the sound system: PipeWire, its tools,
+                             WirePlumber and pipewire-pulse, installed and
+                             running (exit 1 when something is missing)
   $0 --uninstall [--prefix DIR]
   $0 -h | --help
+
+Before installing, the same check runs; where something is missing it
+prints the commands that fix it and asks whether to go on. It installs no
+packages and changes no services. --no-check skips it (non-interactive use;
+without a terminal to ask, it says what is missing and goes on).
 
 Examples:
   sudo $0                     # system install under /usr
@@ -53,6 +70,8 @@ while [ $# -gt 0 ]; do
     --prefix) PREFIX="${2:?--prefix needs an argument}"; shift 2 ;;
     --prefix=*) PREFIX="${1#*=}"; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
+    --check) ACTION="check"; shift ;;
+    --no-check) NO_CHECK="yes"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -67,22 +86,52 @@ esac
 # ---------------------------------------------------------------------------
 # Privilege handling
 # ---------------------------------------------------------------------------
+# Shared with the generated hushmic-uninstall (printed into it verbatim).
+PREFIX_DIRS=$(cat <<'PREFIX_DIRS_EOF'
+# The first folder under $PREFIX that an install writes into (or makes
+# under) and this user cannot write, else nothing. Every one counts, not
+# only the prefix: a user-owned /usr can still hold root-owned share/ or
+# lib/ladspa, which would leave a half-written install.
+first_unwritable() {
+  for _d in "$PREFIX" "$PREFIX/bin" "$PREFIX/lib" "$PREFIX/lib/ladspa" \
+            "$PREFIX/lib/hushmic" "$PREFIX/lib/systemd/user" "$PREFIX/share" \
+            "$PREFIX/share/hushmic" "$PREFIX/share/hushmic/models" \
+            "$PREFIX/share/applications" "$PREFIX/share/licenses" \
+            "$PREFIX/share/icons/hicolor" "$PREFIX/share/icons/hicolor"/*/apps \
+            "$PREFIX/share/icons/hicolor"/*/status; do
+    _e="$_d"
+    while [ ! -e "$_e" ] && [ "$_e" != / ]; do _e="$(dirname "$_e")"; done
+    if [ ! -d "$_e" ] || [ ! -w "$_e" ]; then
+      printf '%s\n' "$_e"
+      return 0
+    fi
+  done
+  return 1
+}
+# The layout's folders an uninstall left empty, deepest first; never under
+# /usr or /usr/local, whose folders belong to the system.
+drop_empty_dirs() {
+  case "$PREFIX" in /usr|/usr/|/usr/local|/usr/local/) return 0 ;; esac
+  for _d in "$PREFIX/lib/ladspa" "$PREFIX/lib/systemd/user" "$PREFIX/lib/systemd" \
+            "$PREFIX/share/applications" "$PREFIX/share/licenses" "$PREFIX/share/icons" \
+            "$PREFIX/bin" "$PREFIX/lib" "$PREFIX/share" "$PREFIX"; do
+    if [ -d "$_d" ]; then $1 rmdir "$_d" 2>/dev/null || true; fi
+  done
+}
+PREFIX_DIRS_EOF
+)
+eval "$PREFIX_DIRS"
+
+# Root only where this user can't write (a prefix of one's own, even outside
+# $HOME, needs none), and said before it is used.
 NEED_SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-  # A system prefix (anything outside $HOME) needs root even when the prefix
-  # dir itself looks writable: some systems have an oddly user-owned /usr while
-  # its standard subdirs (lib/ladspa, share/...) stay root-owned, which would
-  # otherwise leave a half-written install. Prefixes under $HOME only need sudo
-  # if they are not actually writable.
-  case "$PREFIX/" in
-    "$HOME"/*) _system_prefix=0 ;;
-    *)         _system_prefix=1 ;;
-  esac
-  if [ "$_system_prefix" = 1 ] || ! mkdir -p "$PREFIX" 2>/dev/null || [ ! -w "$PREFIX" ]; then
+if [ "$(id -u)" -ne 0 ] && [ "$ACTION" != check ]; then
+  if _locked="$(first_unwritable)"; then
     if command -v sudo >/dev/null 2>&1; then
       NEED_SUDO="yes"
+      echo "using sudo for $PREFIX ($_locked is not writable)"
     else
-      echo "error: installing to '$PREFIX' requires root, and sudo was not found." >&2
+      echo "error: $_locked is not writable, and sudo was not found." >&2
       echo "       Re-run as root (e.g. 'curl ... | sudo sh') or use --prefix \"\$HOME/.local\"." >&2
       exit 1
     fi
@@ -106,10 +155,12 @@ DEST_LIB="$PREFIX/lib/hushmic"
 DEST_MODELS="$PREFIX/share/hushmic/models"
 DEST_APPS="$PREFIX/share/applications"
 DEST_UNITS="$PREFIX/lib/systemd/user"
-DEST_ICONS="$PREFIX/share/icons/hicolor/256x256/apps"
 DEST_HICOLOR="$PREFIX/share/icons/hicolor"
 DEST_LICENSES="$PREFIX/share/licenses/hushmic"
 
+# The app icon in the payload: every hicolor size plus scalable/apps/hushmic.svg;
+# must stay in lockstep with packaging/tray/hicolor/.
+APP_ICON_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512"
 # Tray status-icon ladder shipped in the payload (five SNI names x eight
 # sizes, status/ context); must stay in lockstep with packaging/tray/hicolor/.
 TRAY_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256"
@@ -118,6 +169,15 @@ TRAY_NAMES="hushmic-tray hushmic-tray-off hushmic-tray-bypass hushmic-tray-mute 
 # stems plus a -symbolic suffix, in GNOME's and Plasma's panel sizes (with their
 # @2 twins) plus scalable/ for everything else.
 TRAY_SYMBOLIC_DIRS="16x16 16x16@2 22x22 22x22@2 24x24 24x24@2 scalable"
+
+prune_icon_dirs() {
+  # Drop the icon directories the removal left empty (rmdir only takes empty
+  # ones). Never under /usr, where hicolor-icon-theme owns them.
+  case "$PREFIX" in /usr|/usr/) return 0 ;; esac
+  for _d in "$DEST_HICOLOR"/*/apps "$DEST_HICOLOR"/*/status "$DEST_HICOLOR"/* "$DEST_HICOLOR"; do
+    if [ -d "$_d" ]; then as_root rmdir "$_d" 2>/dev/null || true; fi
+  done
+}
 
 refresh_icon_cache() {
   # Refresh the hicolor cache so SNI hosts pick icon changes up without a
@@ -131,7 +191,361 @@ refresh_icon_cache() {
 # ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
-# The tray's "Start on login" toggle writes a per-user autostart entry; left
+# The invoking user's side of an uninstall, shared with the generated
+# hushmic-uninstall (printed into it verbatim): stop a running HushMic, put
+# back a default microphone a crashed run left on hushmic_source (gone with
+# the install), and remove HushMic's state and cache. The settings stay.
+USER_CLEANUP=$(cat <<'USER_CLEANUP_EOF'
+# Run a command as the invoking user, in their session (not root's).
+user_run() {
+  if [ -n "${SUDO_USER:-}" ]; then
+    _uid="$(id -u "$SUDO_USER" 2>/dev/null)" || return 1
+    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$_uid" "$@"
+  else
+    "$@"
+  fi
+}
+user_dirs() {
+  if [ -n "${SUDO_USER:-}" ]; then
+    _home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    _state="${_home:+$_home/.local/state}"
+    _cache="${_home:+$_home/.cache}"
+  else
+    _state="${XDG_STATE_HOME:-${HOME:-}/.local/state}"
+    _cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
+    _home="${HOME:-}"
+  fi
+}
+# The unit `hushmic service install` generated ($1): removed when it runs
+# this install's binary, else only named (it runs another HushMic).
+remove_generated_unit() {
+  [ -f "$1" ] || return 0
+  # ours: ExecStart is exactly this install's binary (bare, or quoted as
+  # `hushmic service install` writes it), not hushmic.AppImage beside it
+  _bin="$PREFIX/bin/hushmic"
+  _ours=""
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    case "$_l" in
+      "ExecStart=$_bin"|"ExecStart=$_bin "*|"ExecStart=\"$_bin\""|"ExecStart=\"$_bin\" "*) _ours=yes ;;
+    esac
+  done < "$1"
+  if [ -n "$_ours" ]; then
+    rm -f "$1"
+    user_run systemctl --user daemon-reload >/dev/null 2>&1 || true
+    echo "Removed the systemd user unit $1."
+  else
+    echo "A systemd user unit for another HushMic stays: $1"
+  fi
+}
+# $1: the hushmic binary about to be removed.
+user_cleanup() {
+  user_dirs
+  # A running HushMic gives the default microphone back as it stops.
+  if [ -x "$1" ]; then user_run "$1" quit >/dev/null 2>&1 || true; fi
+  if command -v pw-metadata >/dev/null 2>&1 &&
+     user_run pw-metadata -n default 0 default.configured.audio.source 2>/dev/null |
+       grep -q '"hushmic_source"'; then
+    _prior=""
+    for _f in "$_state/hushmic/prior-default" "$_home/.config/hushmic/prior-default"; do
+      if [ -s "$_f" ]; then _prior="$(cat "$_f")"; break; fi
+    done
+    if [ -n "$_prior" ] && [ "$_prior" != hushmic_source ]; then
+      # JSON: the name's backslashes and quotes escaped, one argument
+      _json="$(printf '%s' "$_prior" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      if user_run pw-metadata -n default 0 default.configured.audio.source \
+           "{ \"name\": \"$_json\" }" Spa:String:JSON >/dev/null 2>&1; then
+        echo "The default microphone was left on HushMic's; it is $_prior again."
+      else
+        echo "The default microphone is still set to HushMic's, which is gone; pick yours in your sound settings."
+      fi
+    else
+      if user_run pw-metadata -n default -d 0 default.configured.audio.source >/dev/null 2>&1; then
+        echo "The default microphone was left on HushMic's; your desktop picks one again."
+      else
+        echo "The default microphone is still set to HushMic's, which is gone; pick yours in your sound settings."
+      fi
+    fi
+  fi
+  if [ -n "$_state" ] && [ -d "$_state/hushmic" ]; then rm -rf "$_state/hushmic"; fi
+  if [ -n "$_cache" ] && [ -d "$_cache/hushmic" ]; then rm -rf "$_cache/hushmic"; fi
+  echo "Removed HushMic's state ($_state/hushmic) and cache ($_cache/hushmic)."
+  echo "Your settings in ~/.config/hushmic stay; remove that folder to forget them."
+}
+USER_CLEANUP_EOF
+)
+eval "$USER_CLEANUP"
+
+# ---------------------------------------------------------------------------
+# Sound system check (issue #30)
+# ---------------------------------------------------------------------------
+# What HushMic needs from the system: PipeWire with its command line tools,
+# WirePlumber and pipewire-pulse, running in the user's session (with sudo:
+# the invoking user's). Read only: it says what is missing and the commands
+# that fix it, and never installs a package or touches a service.
+
+# Whose session the check reads: SUDO_USER's; as root without it (su -,
+# sudo su -, pkexec) the user PKEXEC_UID or logname names; else this one's.
+# CHECK_BLIND: root and no user found, so whether things run is unknown.
+check_user() {
+  CHECK_USER=""
+  CHECK_BLIND=""
+  CHECK_UID="$(id -u)"
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    CHECK_USER="$SUDO_USER"
+  elif [ "$CHECK_UID" -eq 0 ]; then
+    if [ -n "${PKEXEC_UID:-}" ]; then
+      CHECK_USER="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1)"
+      [ -n "$CHECK_USER" ] || CHECK_USER="$(id -nu "$PKEXEC_UID" 2>/dev/null)" || CHECK_USER=""
+    fi
+    if { [ -z "$CHECK_USER" ] || [ "$CHECK_USER" = root ]; } &&
+       command -v logname >/dev/null 2>&1; then
+      CHECK_USER="$(logname 2>/dev/null)" || CHECK_USER=""
+    fi
+    [ "$CHECK_USER" != root ] || CHECK_USER=""
+  fi
+  if [ -n "$CHECK_USER" ]; then
+    CHECK_UID="$(id -u "$CHECK_USER" 2>/dev/null)" || { CHECK_USER=""; CHECK_UID="$(id -u)"; }
+  fi
+  if [ -z "$CHECK_USER" ] && [ "$CHECK_UID" -eq 0 ]; then CHECK_BLIND="yes"; fi
+}
+
+# Run a command in that user's session (sudo, else runuser without sudo).
+check_run() {
+  if [ -z "$CHECK_USER" ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u "$CHECK_USER" XDG_RUNTIME_DIR="/run/user/$CHECK_UID" "$@"
+  else
+    runuser -u "$CHECK_USER" -- env XDG_RUNTIME_DIR="/run/user/$CHECK_UID" "$@"
+  fi
+}
+
+# The distro family by os-release (ID first, then ID_LIKE): debian, fedora,
+# arch, suse, or nothing. HUSHMIC_OS_RELEASE: another file (tests).
+os_field() {
+  sed -n "s/^$1=//p" "${HUSHMIC_OS_RELEASE:-/etc/os-release}" 2>/dev/null |
+    head -1 | tr -d "\"'"
+}
+distro_family() {
+  for _w in $(os_field ID) $(os_field ID_LIKE); do
+    case "$_w" in
+      debian|ubuntu|linuxmint|pop|elementary|zorin|neon|kali|raspbian|devuan)
+        echo debian; return 0 ;;
+      fedora|rhel|centos|rocky|almalinux|nobara|ultramarine)
+        echo fedora; return 0 ;;
+      arch|manjaro|endeavouros|cachyos|garuda|artix)
+        echo arch; return 0 ;;
+      opensuse*|suse|sles|sled)
+        echo suse; return 0 ;;
+    esac
+  done
+  # an unknown distro: by its package manager
+  if command -v apt-get >/dev/null 2>&1; then echo debian
+  elif command -v dnf >/dev/null 2>&1 || command -v rpm-ostree >/dev/null 2>&1; then echo fedora
+  elif command -v pacman >/dev/null 2>&1; then echo arch
+  elif command -v zypper >/dev/null 2>&1; then echo suse
+  fi
+}
+
+# The package that brings a part, by family (nothing for an unknown one).
+# Parts: daemon (pipewire), tools (pw-cli, pw-dump, pw-metadata, pw-link),
+# play (pw-record, pw-play; Arch packs them apart), session (wireplumber),
+# pulse (pipewire-pulse).
+part_package() {
+  case "$1:$2" in
+    :*) ;;
+    *:daemon) echo pipewire ;;
+    *:session) echo wireplumber ;;
+    debian:tools|debian:play) echo pipewire-bin ;;
+    fedora:tools|fedora:play) echo pipewire-utils ;;
+    suse:tools|suse:play) echo pipewire-tools ;;
+    arch:tools) echo pipewire ;;
+    arch:play) echo pipewire-audio ;;
+    debian:pulse|arch:pulse) echo pipewire-pulse ;;
+    fedora:pulse|suse:pulse) echo pipewire-pulseaudio ;;
+  esac
+}
+
+# Whether every command named is on PATH.
+have_all() {
+  for _c in "$@"; do command -v "$_c" >/dev/null 2>&1 || return 1; done
+}
+
+# yes, no or unknown: whether a user service runs ($1: its unit without
+# .service, $2: its process name), in the invoking user's session. An
+# active socket counts: pipewire-pulse may start only when an app connects.
+runs() {
+  if check_run systemctl --user is-active --quiet "$1.service" "$1.socket" 2>/dev/null; then
+    echo yes; return 0
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -u "$CHECK_UID" -x "$2" >/dev/null 2>&1; then echo yes; else echo no; fi
+    return 0
+  fi
+  if check_run systemctl --user show-environment >/dev/null 2>&1; then echo no; else echo unknown; fi
+}
+
+# The running PulseAudio server's name as pactl says it ("PulseAudio (on
+# PipeWire 1.0.5)" is pipewire-pulse), else nothing.
+pulse_server() {
+  if command -v pactl >/dev/null 2>&1; then
+    check_run env LC_ALL=C pactl info 2>/dev/null | sed -n 's/^Server Name: //p' | head -1
+  elif command -v pgrep >/dev/null 2>&1 && pgrep -u "$CHECK_UID" -x pulseaudio >/dev/null 2>&1; then
+    echo pulseaudio
+  fi
+}
+
+# Print the state and, where something is missing, how to fix it. Returns 1
+# when something is missing or not running.
+sound_check() {
+  check_user
+  _family="$(distro_family)"
+  _missing=""
+  _absent=""
+  _stopped=""
+  _unknown=""
+  _add() {
+    [ -n "$1" ] || return 0
+    case " $_missing " in *" $1 "*) ;; *) _missing="${_missing:+$_missing }$1" ;; esac
+  }
+  echo "Checking the sound system (--no-check skips this):"
+  if [ -n "$CHECK_BLIND" ]; then
+    echo "  As root, your session can't be checked: only what is installed is."
+  fi
+  # label, part, commands, unit, process
+  for _row in "PipeWire|daemon|pipewire|pipewire|pipewire" \
+              "PipeWire tools|tools|pw-cli pw-dump pw-metadata pw-link pw-record pw-play||" \
+              "WirePlumber|session|wireplumber|wireplumber|wireplumber" \
+              "pipewire-pulse|pulse|pipewire-pulse|pipewire-pulse|pipewire-pulse"; do
+    _label="${_row%%|*}"; _rest="${_row#*|}"
+    _part="${_rest%%|*}"; _rest="${_rest#*|}"
+    _cmds="${_rest%%|*}"; _rest="${_rest#*|}"
+    _unit="${_rest%%|*}"; _proc="${_rest#*|}"
+    # shellcheck disable=SC2086 # one word per command
+    if ! have_all $_cmds; then
+      _state="not installed"
+      _absent="${_absent:+$_absent, }$_label"
+      if [ "$_part" = tools ]; then
+        have_all pw-cli pw-dump pw-metadata pw-link || _add "$(part_package "$_family" tools)"
+        have_all pw-record pw-play || _add "$(part_package "$_family" play)"
+      else
+        _add "$(part_package "$_family" "$_part")"
+      fi
+      _stopped="yes"
+    elif [ -z "$_unit" ]; then
+      _state="installed"
+    elif [ -n "$CHECK_BLIND" ]; then
+      _state="installed (whether it runs is unknown: running as root)"; _unknown="yes"
+    else
+      case "$(runs "$_unit" "$_proc")" in
+        yes) _state="installed, running" ;;
+        no) _state="installed, not running"; _stopped="yes" ;;
+        *) _state="installed (whether it runs is unknown: no user session here)"; _unknown="yes" ;;
+      esac
+    fi
+    printf '  %-16s %s\n' "$_label" "$_state"
+  done
+  _server=""
+  [ -n "$CHECK_BLIND" ] || _server="$(pulse_server)"
+  _pulse=""
+  case "$_server" in
+    *PipeWire*|*pipewire*|"") ;;
+    *) _pulse="yes"
+       printf '  %-16s %s\n' "PulseAudio" "running: apps talk to PulseAudio, not PipeWire" ;;
+  esac
+  if [ -z "$_absent" ] && [ -z "$_stopped" ] && [ -z "$_pulse" ]; then
+    if [ -n "$_unknown" ]; then
+      echo "  PipeWire, WirePlumber and pipewire-pulse are installed."
+    else
+      echo "  PipeWire, WirePlumber and pipewire-pulse are installed and running."
+    fi
+    return 0
+  fi
+  echo
+  echo "PipeWire is the sound system HushMic works with. HushMic needs PipeWire and"
+  echo "WirePlumber running, and PipeWire's command line tools."
+  echo "PulseAudio-only apps (TeamSpeak, some Electron apps) also need pipewire-pulse."
+  _name="$(os_field PRETTY_NAME)"
+  if [ -n "$_absent" ]; then
+    echo
+    case "$_family" in
+      debian)
+        # Ubuntu 22.04 and Mint 21 run pipewire-media-session, which
+        # WirePlumber replaces; apt refuses the one beside the other.
+        _ms=""
+        case " $_missing " in
+          *" wireplumber "*)
+            if command -v dpkg-query >/dev/null 2>&1 &&
+               dpkg-query -W -f='${Status}' pipewire-media-session 2>/dev/null |
+                 grep -q 'install ok installed'; then
+              _ms=" pipewire-media-session-"
+            fi ;;
+        esac
+        echo "To install what is missing (${_name:-Debian/Ubuntu}, apt):"
+        echo "  sudo apt install $_missing$_ms"
+        if [ -n "$_ms" ]; then
+          echo "  (the trailing minus removes pipewire-media-session, which WirePlumber replaces)"
+        fi ;;
+      fedora)
+        if command -v dnf >/dev/null 2>&1 || ! command -v rpm-ostree >/dev/null 2>&1; then
+          echo "To install what is missing (${_name:-Fedora}, dnf):"
+          echo "  sudo dnf install $_missing"
+        else
+          echo "To install what is missing (${_name:-Fedora}, rpm-ostree; restart afterwards):"
+          echo "  sudo rpm-ostree install $_missing"
+        fi ;;
+      arch)
+        echo "To install what is missing (${_name:-Arch Linux}, pacman):"
+        echo "  sudo pacman -S --needed $_missing" ;;
+      suse)
+        echo "To install what is missing (${_name:-openSUSE}, zypper):"
+        echo "  sudo zypper install $_missing" ;;
+      *)
+        echo "Install these with your distribution's package manager: $_absent." ;;
+    esac
+  fi
+  if [ -n "$_stopped" ] || [ -n "$_pulse" ]; then
+    echo
+    echo "To run them in your session (as yourself, not with sudo):"
+    if [ -n "$_pulse" ]; then
+      echo "  systemctl --user disable --now pulseaudio.service pulseaudio.socket"
+    fi
+    echo "  systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service"
+    echo "Then log out and back in."
+  fi
+  return 1
+}
+
+# After a check that found something missing: go on only when the user says
+# so. Without a terminal to ask (a script, CI), or as root where the session
+# can't be checked, say so and go on. HUSHMIC_TTY: where the answer is read
+# from (tests).
+ask_continue() {
+  _tty="${HUSHMIC_TTY:-/dev/tty}"
+  echo
+  if [ -n "$CHECK_BLIND" ]; then
+    echo "Installing HushMic anyway: as root, the check can't tell what your session runs."
+    return 0
+  fi
+  if ( : <"$_tty" ) 2>/dev/null; then
+    printf 'This script installs no packages and changes no services. Install HushMic anyway? [y/N] '
+    _ans=""
+    read -r _ans <"$_tty" || _ans=""
+    case "$_ans" in
+      [yY]|[yY][eE][sS]) return 0 ;;
+    esac
+    echo "Nothing was installed."
+    exit 1
+  fi
+  echo "No terminal to ask; installing HushMic anyway (--no-check skips the check)."
+}
+
+if [ "$ACTION" = "check" ]; then
+  sound_check && exit 0
+  exit 1
+fi
+
+# "Start HushMic when you log in" writes a per-user autostart entry; left
 # behind, every login would relaunch a binary that no longer exists. Under
 # sudo, resolve the INVOKING user's home (root's $HOME is not theirs).
 remove_autostart_entry() {
@@ -155,18 +569,23 @@ remove_autostart_entry() {
     systemctl --user disable --now hushmic.service >/dev/null 2>&1
   fi
   [ -n "$_as_conf" ] && rm -f "$_as_conf/systemd/user/default.target.wants/hushmic.service" 2>/dev/null
+  [ -n "$_as_conf" ] && remove_generated_unit "$_as_conf/systemd/user/hushmic.service"
   return 0
 }
 
 do_uninstall() {
   echo "Removing hushmic from prefix: $PREFIX"
+  user_cleanup "$DEST_BIN/hushmic"
   as_root rm -f "$DEST_BIN/hushmic" "$DEST_BIN/hushmic-uninstall"
   as_root rm -f "$DEST_LADSPA/libdpdfnet_ladspa.so"
   as_root rm -rf "$DEST_LIB"
   as_root rm -rf "$PREFIX/share/hushmic"
-  as_root rm -f "$DEST_APPS/hushmic.desktop"
+  as_root rm -f "$DEST_APPS/hushmic.desktop" "$DEST_APPS/hushmic-clean.desktop"
   as_root rm -f "$DEST_UNITS/hushmic.service"
-  as_root rm -f "$DEST_ICONS/hushmic.png"
+  for _s in $APP_ICON_SIZES; do
+    as_root rm -f "$DEST_HICOLOR/$_s/apps/hushmic.png"
+  done
+  as_root rm -f "$DEST_HICOLOR/scalable/apps/hushmic.svg"
   for _s in $TRAY_SIZES; do
     for _n in $TRAY_NAMES; do
       as_root rm -f "$DEST_HICOLOR/$_s/status/$_n.png"
@@ -177,10 +596,12 @@ do_uninstall() {
       as_root rm -f "$DEST_HICOLOR/$_s/status/hushmic-mono${_n#hushmic-tray}-symbolic.svg"
     done
   done
+  prune_icon_dirs
   refresh_icon_cache
   as_root rm -rf "$DEST_LICENSES"
   remove_autostart_entry
-  echo "Done. (Per-user config under ~/.config/hushmic was left untouched.)"
+  if [ -n "$NEED_SUDO" ]; then drop_empty_dirs sudo; else drop_empty_dirs ""; fi
+  echo "Done."
 }
 
 if [ "$ACTION" = "uninstall" ]; then
@@ -237,6 +658,12 @@ SteamOS, ...), where even root cannot write to /usr. Options that work:
       curl -fsSL https://raw.githubusercontent.com/Fovty/hushmic/main/scripts/install.sh | sudo sh -s -- --prefix /usr/local
 EOF
   exit 1
+fi
+
+# The sound system, before anything is downloaded or installed.
+if [ -z "$NO_CHECK" ]; then
+  sound_check || ask_continue
+  echo
 fi
 
 # ---------------------------------------------------------------------------
@@ -375,6 +802,7 @@ for d in "$DEST_LADSPA" "$DEST_LIB" "$PREFIX/share/hushmic" "$DEST_MODELS" "$DES
 done
 
 install_file "$PAYLOAD/share/applications/hushmic.desktop" "$DEST_APPS" 644
+install_file "$PAYLOAD/share/applications/hushmic-clean.desktop" "$DEST_APPS" 644
 # systemd only reads user units from /usr/lib and /usr/local/lib (plus
 # ~/.config); other prefixes generate one with `hushmic service install`.
 case "$PREFIX" in
@@ -388,7 +816,17 @@ case "$PREFIX" in
       rm -rf "$(dirname "$_unit_tmp")"
     fi ;;
 esac
-[ -f "$PAYLOAD/share/icons/hicolor/256x256/apps/hushmic.png" ] && install_file "$PAYLOAD/share/icons/hicolor/256x256/apps/hushmic.png" "$DEST_ICONS" 644
+# App icon (guarded per file: payloads before v1.0 carry only the 256 px one).
+for _s in $APP_ICON_SIZES; do
+  _icon="$PAYLOAD/share/icons/hicolor/$_s/apps/hushmic.png"
+  if [ -f "$_icon" ]; then
+    install_file "$_icon" "$DEST_HICOLOR/$_s/apps" 644
+  fi
+done
+_icon="$PAYLOAD/share/icons/hicolor/scalable/apps/hushmic.svg"
+if [ -f "$_icon" ]; then
+  install_file "$_icon" "$DEST_HICOLOR/scalable/apps" 644
+fi
 
 # Tray status icons (guarded per file: pre-tray payloads simply lack them).
 for _s in $TRAY_SIZES; do
@@ -432,24 +870,31 @@ prefix_sq="$(printf %s "$PREFIX" | sed "s/'/'\\\\''/g")"
     '# Auto-generated by hushmic install.sh — removes the install at the prefix below.' \
     'set -eu' \
     "PREFIX='${prefix_sq}'" \
+    "APP_ICON_SIZES='${APP_ICON_SIZES}'" \
     "TRAY_SIZES='${TRAY_SIZES}'" \
     "TRAY_NAMES='${TRAY_NAMES}'" \
     "TRAY_SYMBOLIC_DIRS='${TRAY_SYMBOLIC_DIRS}'"
+  printf '%s\n' "$USER_CLEANUP"
+  printf '%s\n' "$PREFIX_DIRS"
   cat <<'UNINSTALL_EOF'
+user_cleanup "$PREFIX/bin/hushmic"
 SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-  case "$PREFIX/" in
-    "$HOME"/*) [ -w "$PREFIX" ] || { command -v sudo >/dev/null 2>&1 && SUDO="sudo"; } ;;
-    *)          command -v sudo >/dev/null 2>&1 && SUDO="sudo" ;;
-  esac
+if [ "$(id -u)" -ne 0 ] && _locked="$(first_unwritable)"; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+    echo "using sudo for $PREFIX ($_locked is not writable)"
+  fi
 fi
 $SUDO rm -f "$PREFIX/bin/hushmic" "$PREFIX/bin/hushmic-uninstall"
 $SUDO rm -f "$PREFIX/lib/ladspa/libdpdfnet_ladspa.so"
 $SUDO rm -rf "$PREFIX/lib/hushmic"
 $SUDO rm -rf "$PREFIX/share/hushmic"
-$SUDO rm -f "$PREFIX/share/applications/hushmic.desktop"
+$SUDO rm -f "$PREFIX/share/applications/hushmic.desktop" "$PREFIX/share/applications/hushmic-clean.desktop"
 $SUDO rm -f "$PREFIX/lib/systemd/user/hushmic.service"
-$SUDO rm -f "$PREFIX/share/icons/hicolor/256x256/apps/hushmic.png"
+for _s in $APP_ICON_SIZES; do
+  $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/apps/hushmic.png"
+done
+$SUDO rm -f "$PREFIX/share/icons/hicolor/scalable/apps/hushmic.svg"
 for _s in $TRAY_SIZES; do
   for _n in $TRAY_NAMES; do
     $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/status/$_n.png"
@@ -460,6 +905,16 @@ for _s in $TRAY_SYMBOLIC_DIRS; do
     $SUDO rm -f "$PREFIX/share/icons/hicolor/$_s/status/hushmic-mono${_n#hushmic-tray}-symbolic.svg"
   done
 done
+# Drop the icon directories that are now empty; never under /usr, where
+# hicolor-icon-theme owns them.
+case "$PREFIX" in
+  /usr|/usr/) ;;
+  *)
+    for _d in "$PREFIX/share/icons/hicolor"/*/apps "$PREFIX/share/icons/hicolor"/*/status \
+              "$PREFIX/share/icons/hicolor"/* "$PREFIX/share/icons/hicolor"; do
+      if [ -d "$_d" ]; then $SUDO rmdir "$_d" 2>/dev/null || true; fi
+    done ;;
+esac
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   $SUDO gtk-update-icon-cache -f "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
 fi
@@ -480,7 +935,9 @@ else
   systemctl --user disable --now hushmic.service >/dev/null 2>&1 || true
 fi
 [ -n "$_c" ] && rm -f "$_c/systemd/user/default.target.wants/hushmic.service" 2>/dev/null || true
-echo "hushmic uninstalled from $PREFIX (config in ~/.config/hushmic left intact)."
+[ -n "$_c" ] && remove_generated_unit "$_c/systemd/user/hushmic.service"
+drop_empty_dirs "$SUDO"
+echo "hushmic uninstalled from $PREFIX."
 UNINSTALL_EOF
 } > "$uninstaller"
 chmod +x "$uninstaller"
@@ -492,26 +949,49 @@ install_file "$uninstaller" "$DEST_BIN" 755
 echo
 echo "hushmic ${VERSION} installed."
 echo
-echo "Start it:                hushmic          (tray + A/B window; --tray = tray only)"
+echo "Start it:                hushmic          (tray + window; --tray = tray only)"
 if [ -f "$0" ]; then
   echo "Uninstall:               hushmic-uninstall   (or: $0 --uninstall --prefix \"$PREFIX\")"
 else
   # piped via `curl | sh`: $0 is just "sh", useless as a re-run hint
   echo "Uninstall:               hushmic-uninstall"
 fi
-# The binary's compiled-in default paths are exactly /usr — every OTHER prefix
-# (including /usr/local) needs the env exports below or the virtual mic will
-# silently fail to find the plugin/models.
-case "$PREFIX" in
-  /usr) : ;;
+# Not a package, so nothing pulls it in: ffmpeg is what Save writes most
+# formats with (libopus is linked into the binary).
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo
+  echo "NOTE: without ffmpeg, cleaned recordings save as FLAC (WAV stays WAV) and"
+  echo "      videos as their sound alone; install ffmpeg to keep the original format."
+fi
+# The binary finds its plugin and models from its own location (any
+# prefix); --version prints where it looks. Only when that is not where
+# they were put (an unusual layout) do the variables help.
+_found=yes
+_paths="$("$DEST_BIN/hushmic" --version 2>/dev/null)" || _found=no
+for _what in plugin models; do
+  _p="$(printf '%s\n' "$_paths" | sed -n "s/^$_what: //p")"
+  if [ -z "$_p" ] || [ ! -e "$_p" ]; then _found=no; fi
+done
+if [ "$_found" = no ]; then
+  echo
+  echo "NOTE: hushmic does not find the files it was installed with; export these:"
+  echo "  export ORT_DYLIB_PATH=\"$DEST_LIB/libonnxruntime.so\""
+  echo "  export HUSHMIC_MODEL_DIR=\"$DEST_MODELS\""
+  echo "  export HUSHMIC_PLUGIN_SO=\"$DEST_LADSPA/libdpdfnet_ladspa.so\""
+fi
+case ":${PATH:-}:" in
+  *":$DEST_BIN:"*) : ;;
   *)
     echo
-    echo "NOTE: you installed under a non-standard prefix. The binary's compiled-in"
-    echo "default paths point at /usr; export these so it finds the bundled assets:"
-    echo "  export ORT_DYLIB_PATH=\"$DEST_LIB/libonnxruntime.so\""
-    echo "  export HUSHMIC_MODEL_DIR=\"$DEST_MODELS\""
-    echo "  export HUSHMIC_PLUGIN_SO=\"$DEST_LADSPA/libdpdfnet_ladspa.so\""
-    echo "  export HUSHMIC_TRAY_THEME_DIR=\"$PREFIX/share/icons\""
+    echo "NOTE: $DEST_BIN is not on your PATH; add it to run hushmic by name:"
     echo "  export PATH=\"$DEST_BIN:\$PATH\""
+    ;;
+esac
+# Where systemd reads no user units, the unit is generated for this path.
+case "$PREFIX" in
+  /usr|/usr/local) : ;;
+  *)
+    echo
+    echo "To run it without a window at login (systemd user unit): hushmic service install"
     ;;
 esac

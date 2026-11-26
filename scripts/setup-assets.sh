@@ -21,6 +21,12 @@ ORT_TGZ="onnxruntime-linux-x64-${ORT_VERSION}.tgz"
 ORT_URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TGZ}"
 ORT_TGZ_SHA256="547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f"
 ORT_SO_SHA256="4061866361d9a8d2872f5f419c5515ce35a830a0c5c77ce1723320ac0dbabfc7"
+# The same library, from a HushMic release: where it comes from when ONNX
+# Runtime's own release page does not answer (its repository was not
+# reachable from November 2026 on).
+ORT_OWN_TGZ="hushmic-0.11.0-x86_64.tar.gz"
+ORT_OWN_URL="https://github.com/Fovty/HushMic/releases/download/v0.11.0/${ORT_OWN_TGZ}"
+ORT_OWN_TGZ_SHA256="9a8c91551c32584536d277b23ba91d8f03b55f41c93957e03248716a989fda53"
 
 DPDFNET_VERSION="0.5.1"
 MODELS=(dpdfnet8_48khz_hr dpdfnet2_48khz_hr)
@@ -175,15 +181,26 @@ if ! file_ok "$REPO_ROOT/assets/lib/$ORT_REAL" "$ORT_SO_SHA256"; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "Downloading ONNX Runtime ${ORT_VERSION}..."
-  curl -fsSL "$ORT_URL" -o "$tmp/$ORT_TGZ"
-  if ! file_ok "$tmp/$ORT_TGZ" "$ORT_TGZ_SHA256"; then
-    echo "ERROR: $ORT_TGZ does not match its pinned sha256; aborting." >&2
-    exit 1
+  if curl -fsSL "$ORT_URL" -o "$tmp/$ORT_TGZ"; then
+    if ! file_ok "$tmp/$ORT_TGZ" "$ORT_TGZ_SHA256"; then
+      echo "ERROR: $ORT_TGZ does not match its pinned sha256; aborting." >&2
+      exit 1
+    fi
+    tar -xzf "$tmp/$ORT_TGZ" -C "$tmp"
+    # The tarball ships libonnxruntime.so.<ver> (and sometimes symlinks); copy the
+    # real versioned object only.
+    src="$(find "$tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib" -maxdepth 1 -type f -name "libonnxruntime.so.*" | head -1)"
+  else
+    echo "  not there; taking it from HushMic's own 0.11.0 release..."
+    curl -fsSL "$ORT_OWN_URL" -o "$tmp/$ORT_OWN_TGZ"
+    if ! file_ok "$tmp/$ORT_OWN_TGZ" "$ORT_OWN_TGZ_SHA256"; then
+      echo "ERROR: $ORT_OWN_TGZ does not match its pinned sha256; aborting." >&2
+      exit 1
+    fi
+    tar -xzf "$tmp/$ORT_OWN_TGZ" -C "$tmp" "${ORT_OWN_TGZ%.tar.gz}/lib/hushmic/$ORT_REAL"
+    src="$tmp/${ORT_OWN_TGZ%.tar.gz}/lib/hushmic/$ORT_REAL"
+    [ -f "$src" ] || src=""
   fi
-  tar -xzf "$tmp/$ORT_TGZ" -C "$tmp"
-  # The tarball ships libonnxruntime.so.<ver> (and sometimes symlinks); copy the
-  # real versioned object only.
-  src="$(find "$tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib" -maxdepth 1 -type f -name "libonnxruntime.so.*" | head -1)"
   if [ -z "$src" ]; then
     echo "ERROR: libonnxruntime.so.<version> not found in the downloaded archive." >&2
     exit 1

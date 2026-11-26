@@ -11,14 +11,16 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+use crate::appstate::Keys;
 use crate::controller::RunMode;
 
 mod kglobalaccel;
 
 /// The four bindable actions. Registering all of them is free — anything
 /// the user leaves unbound in the compositor dialog is inert. No mode-off
-/// hotkey by design (a mic-kill surprise).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// hotkey by design (a mic-kill surprise). Serialized as its portal id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Action {
     ToggleMute,
     ToggleBypass,
@@ -73,6 +75,46 @@ pub fn bind_payload() -> Vec<(String, HashMap<String, Value<'static>>)> {
             (a.id().to_string(), props)
         })
         .collect()
+}
+
+/// What a portal says about each shortcut (`a(sa{sv})`): the id and its
+/// properties, `trigger_description` among them.
+pub type PortalShortcuts = Vec<(String, HashMap<String, OwnedValue>)>;
+
+/// The keys of the actions in a portal's list, as the desktop wrote them
+/// ("Ctrl+Alt+M", one piece). An empty description is no key; a shortcut
+/// without one is not reported. `complete` lists (a bind's or a listing's)
+/// cover every action, one the list lacks has no key; a change signal
+/// covers only the shortcuts that changed.
+pub fn reported_keys(
+    list: &[(String, HashMap<String, OwnedValue>)],
+    complete: bool,
+) -> Vec<(Action, Keys)> {
+    Action::ALL
+        .iter()
+        .filter_map(|a| {
+            let keys = match list.iter().find(|(id, _)| id == a.id()) {
+                None if complete => Keys::NotSet,
+                None => return None,
+                Some((_, props)) => match props
+                    .get("trigger_description")
+                    .and_then(|v| <&str>::try_from(v).ok())
+                    .map(str::trim)
+                {
+                    None => Keys::NotReported,
+                    Some("") => Keys::NotSet,
+                    Some(text) => Keys::Text(text.to_string()),
+                },
+            };
+            Some((*a, keys))
+        })
+        .collect()
+}
+
+/// The keys in a request's results (`shortcuts`), when it carries them.
+fn keys_in(results: &HashMap<String, OwnedValue>) -> Option<Vec<(Action, Keys)>> {
+    let list = PortalShortcuts::try_from(results.get("shortcuts")?.try_clone().ok()?).ok()?;
+    Some(reported_keys(&list, true))
 }
 
 /// Map an `Activated`/`Deactivated` signal to one of our actions. The
@@ -130,6 +172,13 @@ impl Holds {
     fn repeat(&mut self, a: Action, activated: bool) -> bool {
         std::mem::replace(&mut self.down[slot(a)], activated) && activated
     }
+}
+
+/// The event is push-to-mute's press: the mute it starts is a hold, whose
+/// release returns to the mode before it whatever `unmute-to` stored
+/// ([`crate::control::after_transition`], A115 SF-U1).
+pub fn holds_mute(action: Action, activated: bool) -> bool {
+    action == Action::PushToMute && activated
 }
 
 /// The press/release state machine: what mode (if any) a shortcut event
@@ -208,8 +257,8 @@ pub fn shortcut_transition(
 // Portal client: one worker thread owning the session and the signal stream
 // ---------------------------------------------------------------------------
 
-const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+pub(crate) const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
+pub(crate) const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SHORTCUTS_IFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
 
 /// Non-interactive round-trips (CreateSession, silent re-bind) — backends
@@ -241,6 +290,12 @@ pub enum PortalEvent {
     /// errored) — the main loop points the user at the system's own
     /// keyboard-shortcut settings instead.
     ConfigureUnavailable,
+    /// Which client serves the shortcuts in this session (sent once, before
+    /// anything else): the window words its page by it.
+    Backend(Backend),
+    /// The keys the desktop reports for these actions (after Available;
+    /// again whenever they change). Actions not in the list keep theirs.
+    Keys(Vec<(Action, Keys)>),
 }
 
 /// Main-loop -> worker commands.
@@ -377,6 +432,58 @@ pub fn detect_backend(wait: Duration) -> Backend {
     choose_backend(flatpak, desktop.as_deref(), session.as_deref(), plasma)
 }
 
+/// What the desktop portal said when asked for GlobalShortcuts.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PortalAnswer {
+    /// There, at this version.
+    Version(u32),
+    /// Not there: no portal service, or one without the interface (why).
+    Missing(String),
+    /// No answer within the budget (a portal being started on demand can
+    /// take longer): unknown, not missing.
+    NoAnswer(Duration),
+}
+
+/// The GlobalShortcuts portal, asked within `budget` (for `--doctor`,
+/// which reports the backend that really works).
+pub fn portal_within(budget: Duration) -> PortalAnswer {
+    answer_of(portal_version_within(budget), budget)
+}
+
+/// Sorts the probe's result: a D-Bus "no reply" or "timeout" error is as
+/// unknown as no answer at all; any other error means there is none.
+fn answer_of(asked: Result<u32, Option<String>>, budget: Duration) -> PortalAnswer {
+    match asked {
+        Ok(v) => PortalAnswer::Version(v),
+        Err(None) => PortalAnswer::NoAnswer(budget),
+        Err(Some(e)) if e.contains("Error.NoReply") || e.contains("Error.Timeout") => {
+            PortalAnswer::NoAnswer(budget)
+        }
+        Err(Some(e)) => PortalAnswer::Missing(e),
+    }
+}
+
+/// The portal's version, or why not (None: no answer in time).
+fn portal_version_within(budget: Duration) -> Result<u32, Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let asked = (|| -> Result<u32, String> {
+            let conn = zbus::blocking::Connection::session().map_err(|e| e.to_string())?;
+            let portal =
+                zbus::blocking::Proxy::new(&conn, PORTAL_NAME, PORTAL_PATH, SHORTCUTS_IFACE)
+                    .map_err(|e| e.to_string())?;
+            portal
+                .get_property::<u32>("version")
+                .map_err(|e| e.to_string())
+        })();
+        let _ = tx.send(asked);
+    });
+    match rx.recv_timeout(budget) {
+        Ok(asked) => asked.map_err(Some),
+        Err(_) => Err(None),
+    }
+}
+
 const SYSTEMD_NAME: &str = "org.freedesktop.systemd1";
 const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER: &str = "org.freedesktop.systemd1.Manager";
@@ -476,7 +583,7 @@ fn manager_environment() -> Option<Vec<String>> {
 }
 
 /// [`manager_environment`] for the worker's runtime (zbus's blocking API
-/// starts its own runtime, which panics inside another).
+/// would block the runtime's only thread while it waits).
 async fn manager_environment_async(conn: &zbus::Connection) -> ManagerEnv {
     let proxy = match zbus::proxy::Builder::<zbus::Proxy>::new(conn)
         .destination(SYSTEMD_NAME)
@@ -510,7 +617,9 @@ async fn wait_for_session(
     let own_display = ["WAYLAND_DISPLAY", "DISPLAY"]
         .iter()
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
-    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    // One rule with "already running": a tray typed in a terminal that
+    // runs as a systemd service inherits INVOCATION_ID, and is no unit.
+    let under_systemd = crate::lock::Invocation::here().by_systemd();
     if own_display && !under_systemd {
         return true;
     }
@@ -583,8 +692,8 @@ pub fn spawn(
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let mut cmd_rx = cmd_rx;
-        // Current-thread runtime: zbus is pinned tokio-mode workspace-wide,
-        // and only async zbus can bound signal waits (see portal.rs).
+        // Current-thread runtime for the timers and select!: only async zbus
+        // can bound signal waits (see portal.rs).
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -595,7 +704,11 @@ pub fn spawn(
                 if !rt.block_on(wait_for_session(&events, &mut cmd_rx, true)) {
                     return;
                 }
-                match detect_backend(Duration::from_secs(20)) {
+                let backend = detect_backend(Duration::from_secs(20));
+                if events.send(PortalEvent::Backend(backend)).is_err() {
+                    return;
+                }
+                match backend {
                     Backend::Portal => rt.block_on(worker(events, rebind_on_start, cmd_rx)),
                     Backend::KGlobalAccel => rt.block_on(kglobalaccel::worker(events, cmd_rx)),
                     Backend::Unsupported => rt.block_on(unsupported(events, cmd_rx)),
@@ -629,6 +742,51 @@ async fn unsupported(
     }
 }
 
+/// The start of the error for a desktop without the GlobalShortcuts portal.
+const NO_PORTAL: &str = "no GlobalShortcuts portal";
+
+/// A D-Bus answer that says the interface (or the whole service) is not
+/// there.
+fn no_such_interface(e: &str) -> bool {
+    [
+        "UnknownInterface",
+        "UnknownMethod",
+        "ServiceUnknown",
+        "No such interface",
+    ]
+    .iter()
+    .any(|w| e.contains(w))
+}
+
+static SAID_NO_PORTAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The portal session went down (or never came up). A desktop without
+/// the portal is said once, calmly, with what to use instead; the
+/// backoff's retries find the same and say nothing.
+fn say_down(e: &str) {
+    if let Some(line) = down_line(e, &SAID_NO_PORTAL) {
+        eprintln!("{line}");
+    }
+}
+
+/// The line `say_down` prints for `e`, if any: the calm no-portal line
+/// only the first time (`said` remembers), any other error every time.
+fn down_line(e: &str, said: &std::sync::atomic::AtomicBool) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    match calm_down_line(e) {
+        Some(line) => (!said.swap(true, Ordering::Relaxed)).then(|| line.to_string()),
+        None => Some(format!("[hushmic] global-shortcuts portal: {e}")),
+    }
+}
+
+/// The one line for a desktop without the portal; None for another error.
+fn calm_down_line(e: &str) -> Option<&'static str> {
+    (e.starts_with(NO_PORTAL) && no_such_interface(e)).then_some(
+        "[hushmic] global shortcuts: unavailable (no portal); use the CLI \
+         (hushmic toggle mute, hushmic mode suppress) in your desktop's keyboard settings",
+    )
+}
+
 async fn worker(
     events: std::sync::mpsc::Sender<PortalEvent>,
     mut rebind: bool,
@@ -637,7 +795,7 @@ async fn worker(
     loop {
         match serve_session(&events, &mut rebind, &mut cmds).await {
             Ok(()) => return, // main loop gone: exit quietly
-            Err(e) => eprintln!("[hushmic] global-shortcuts portal: {e}"),
+            Err(e) => say_down(&e),
         }
         if events.send(PortalEvent::Unavailable).is_err() {
             return;
@@ -714,10 +872,11 @@ async fn serve_session(
         .receive_name_owner_changed()
         .await
         .map_err(|e| e.to_string())?;
+    let mut keys = None;
     if *rebind {
         // Silent re-registration so events flow; failure is a session
         // failure (retried gently) — Available without events would lie.
-        bind(&conn, &portal, &session).await?;
+        keys = bind(&conn, &portal, &session).await?;
     }
     // The ONE positive line of a healthy worker: success must not be
     // silent, or external health checks have nothing to grep for.
@@ -725,8 +884,36 @@ async fn serve_session(
     if events.send(PortalEvent::Available).is_err() {
         return Ok(());
     }
+    // The keys for the Shortcuts page: the re-bind's answer, else ask
+    // beside the loop below, so a slow portal never holds a key press back.
+    // Not knowing them is no session failure (the page says so).
+    let mut listing = None;
+    match keys {
+        Some(k) => {
+            if events.send(PortalEvent::Keys(k)).is_err() {
+                return Ok(());
+            }
+        }
+        None => listing = Some(Listing::start(&conn, &portal, &session)),
+    }
     loop {
         let sent = tokio::select! {
+            r = async {
+                match listing.as_mut() {
+                    Some(l) => l.answer().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                listing = None;
+                match r {
+                    Ok(Some(k)) => events.send(PortalEvent::Keys(k)),
+                    Ok(None) => Ok(()),
+                    Err(e) => {
+                        eprintln!("[hushmic] global-shortcuts: the keys are not reported ({e})");
+                        Ok(())
+                    }
+                }
+            },
             m = signals.next() => {
                 let msg = m.ok_or("the portal signal stream ended")?;
                 let member = msg.header().member().map(|n| n.as_str().to_owned());
@@ -739,7 +926,15 @@ async fn serve_session(
                             None => Ok(()),
                         }
                     }
-                    // ShortcutsChanged etc.: nothing we act on.
+                    // The user changed keys (the editor, System Settings).
+                    Some("ShortcutsChanged") => {
+                        match msg.body().deserialize::<(OwnedObjectPath, PortalShortcuts)>() {
+                            Ok((path, list)) if path.as_str() == session => {
+                                events.send(PortalEvent::Keys(reported_keys(&list, false)))
+                            }
+                            _ => Ok(()),
+                        }
+                    }
                     _ => Ok(()),
                 }
             },
@@ -774,9 +969,23 @@ async fn serve_session(
                 }
                 Some(Cmd::Retry) => Ok(()), // already up
                 Some(Cmd::Bind) => match bind(&conn, &portal, &session).await {
-                    Ok(()) => {
+                    Ok(keys) => {
                         *rebind = true;
-                        events.send(PortalEvent::BindDone)
+                        match keys {
+                            // Newer than any listing asked before the bind:
+                            // that one's answer must not follow it.
+                            Some(k) => {
+                                listing = None;
+                                events
+                                    .send(PortalEvent::Keys(k))
+                                    .and_then(|()| events.send(PortalEvent::BindDone))
+                            }
+                            // The bind did not say: ask again.
+                            None => {
+                                listing = Some(Listing::start(&conn, &portal, &session));
+                                events.send(PortalEvent::BindDone)
+                            }
+                        }
                     }
                     // A failed or CANCELLED dialog burns this session's
                     // single BindShortcuts attempt (the portal spec allows
@@ -842,7 +1051,11 @@ async fn setup_session() -> Result<(zbus::Connection, zbus::Proxy<'static>, Stri
             )
             .await
         {
-            eprintln!("[hushmic] portal app-id registration unavailable: {e}");
+            // an older portal, or none at all (which the next call says
+            // in its own words): not worth a line
+            if !no_such_interface(&e.to_string()) {
+                eprintln!("[hushmic] portal app-id registration unavailable: {e}");
+            }
         }
     }
     let portal = zbus::Proxy::new(&conn, PORTAL_NAME, PORTAL_PATH, SHORTCUTS_IFACE)
@@ -851,7 +1064,7 @@ async fn setup_session() -> Result<(zbus::Connection, zbus::Proxy<'static>, Stri
     let version: u32 = portal
         .get_property("version")
         .await
-        .map_err(|e| format!("no GlobalShortcuts portal: {e}"))?;
+        .map_err(|e| format!("{NO_PORTAL}: {e}"))?;
     let session = create_session(&conn, &portal).await?;
     Ok((conn, portal, session, version))
 }
@@ -890,15 +1103,16 @@ async fn create_session(
 /// BindShortcuts: registers all four actions on the session. Interactive
 /// use may show the compositor's dialog; an already-configured app id is
 /// answered silently. A non-zero response (incl. the user cancelling) is
-/// an Err for the caller to log.
+/// an Err for the caller to log. Ok carries the keys when the answer
+/// reports them.
 async fn bind(
     conn: &zbus::Connection,
     portal: &zbus::Proxy<'static>,
     session: &str,
-) -> Result<(), String> {
+) -> Result<Option<Vec<(Action, Keys)>>, String> {
     let session_path =
         ObjectPath::try_from(session.to_string()).map_err(|e| format!("bad session path: {e}"))?;
-    let (code, _results) = portal_request(conn, portal, "BindShortcuts", DIALOG_TIMEOUT, |t| {
+    let (code, results) = portal_request(conn, portal, "BindShortcuts", DIALOG_TIMEOUT, |t| {
         let mut options: HashMap<String, Value> = HashMap::new();
         options.insert("handle_token".into(), t.to_string().into());
         (session_path.clone(), bind_payload(), String::new(), options)
@@ -907,7 +1121,57 @@ async fn bind(
     if code != 0 {
         return Err(format!("the binding request was not granted (code {code})"));
     }
-    Ok(())
+    Ok(keys_in(&results))
+}
+
+/// ListShortcuts: the session's shortcuts and their keys, without a
+/// dialog (an app that never bound gets an empty list: no keys).
+/// A ListShortcuts in flight, as a task of its own on the worker's runtime.
+/// Not a future kept beside the session's select! loop: such a future is
+/// only polled by that loop, and suspended inside its Response subscription
+/// it holds the connection's match-rule lock, which a bind awaited in a
+/// handler then waits for forever. Dropping it aborts the task.
+struct Listing(tokio::task::JoinHandle<Listed>);
+
+/// A listing's answer: the keys, None when the portal sent none, Err when
+/// it did not answer.
+type Listed = Result<Option<Vec<(Action, Keys)>>, String>;
+
+impl Listing {
+    fn start(conn: &zbus::Connection, portal: &zbus::Proxy<'static>, session: &str) -> Self {
+        let (conn, portal, session) = (conn.clone(), portal.clone(), session.to_string());
+        Listing(tokio::spawn(
+            async move { list(&conn, &portal, &session).await },
+        ))
+    }
+
+    /// The listing's answer; poll only until it is there.
+    async fn answer(&mut self) -> Listed {
+        (&mut self.0)
+            .await
+            .map_err(|e| format!("the listing task ended: {e}"))?
+    }
+}
+
+impl Drop for Listing {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn list(conn: &zbus::Connection, portal: &zbus::Proxy<'static>, session: &str) -> Listed {
+    let session_path =
+        ObjectPath::try_from(session.to_string()).map_err(|e| format!("bad session path: {e}"))?;
+    let (code, results) = portal_request(conn, portal, "ListShortcuts", RESPONSE_TIMEOUT, |t| {
+        let mut options: HashMap<String, Value> = HashMap::new();
+        options.insert("handle_token".into(), t.to_string().into());
+        (session_path.clone(), options)
+    })
+    .await?;
+    if code != 0 {
+        return Err(format!("the listing was not granted (code {code})"));
+    }
+    Ok(keys_in(&results))
 }
 
 /// ConfigureShortcuts (portal v2): opens the compositor's shortcut editor
@@ -937,7 +1201,7 @@ async fn configure(portal: &zbus::Proxy<'static>, session: &str) -> Result<(), S
 /// subscribe on the predictable request path BEFORE calling — the response
 /// can fire before the method reply is processed on our side. `build`
 /// receives the handle_token and returns the method's full argument tuple.
-async fn portal_request<B>(
+pub(crate) async fn portal_request<B>(
     conn: &zbus::Connection,
     portal: &zbus::Proxy<'static>,
     method: &str,
@@ -1011,7 +1275,7 @@ fn sender_id(conn: &zbus::Connection) -> Result<String, String> {
         .replace('.', "_"))
 }
 
-fn fresh_token(prefix: &str) -> String {
+pub(crate) fn fresh_token(prefix: &str) -> String {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     format!(
         "{prefix}_{}_{}",
@@ -1022,6 +1286,94 @@ fn fresh_token(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_desktop_without_the_portal_gets_one_calm_line() {
+        // GDBus's answer, and a session without any portal service
+        for e in [
+            "no GlobalShortcuts portal: org.freedesktop.DBus.Error.InvalidArgs: No such \
+             interface \u{201c}org.freedesktop.portal.GlobalShortcuts\u{201d}",
+            "no GlobalShortcuts portal: org.freedesktop.DBus.Error.ServiceUnknown: The name \
+             org.freedesktop.portal.Desktop was not provided by any .service files",
+        ] {
+            let line = calm_down_line(e).expect(e);
+            assert!(
+                line.contains("unavailable (no portal); use the CLI"),
+                "{line}"
+            );
+        }
+        // anything else is said as it is
+        assert_eq!(calm_down_line("no GlobalShortcuts portal: timed out"), None);
+        assert_eq!(calm_down_line("CreateSession failed: denied"), None);
+        assert!(no_such_interface(
+            "org.freedesktop.DBus.Error.UnknownMethod: No such method \u{201c}Register\u{201d}"
+        ));
+
+        // once: the backoff's retries find the same and say nothing,
+        // while another error is said every time
+        let said = std::sync::atomic::AtomicBool::new(false);
+        let none = "no GlobalShortcuts portal: org.freedesktop.DBus.Error.ServiceUnknown: gone";
+        let other = "CreateSession failed: denied";
+        assert!(down_line(none, &said)
+            .unwrap()
+            .contains("unavailable (no portal)"));
+        assert_eq!(down_line(none, &said), None, "said once");
+        let again = down_line(other, &said);
+        assert_eq!(
+            again.as_deref(),
+            Some("[hushmic] global-shortcuts portal: CreateSession failed: denied")
+        );
+        assert_eq!(down_line(other, &said), again);
+        assert_eq!(down_line(none, &said), None);
+    }
+
+    #[test]
+    fn a_tray_typed_in_a_systemd_run_terminal_does_not_wait_for_the_session() {
+        let unit = crate::lock::Invocation {
+            invocation_id: true,
+            exec_pid: Some(4242),
+            own_pid: 4242,
+            parent_is_manager: true,
+            flatpak: false,
+            tty: false,
+        };
+        // gnome-terminal-server.service's shell: inherited, not ours
+        let typed = crate::lock::Invocation {
+            exec_pid: Some(1717),
+            parent_is_manager: false,
+            tty: true,
+            ..unit
+        };
+        // the manager's environment has no display yet
+        let early: &[String] = &[];
+        let ready = |own, who: &crate::lock::Invocation| {
+            session_ready(own, who.by_systemd(), Some(early), |_| false)
+        };
+        assert!(ready(true, &typed));
+        assert!(!ready(true, &unit), "a unit waits for the desktop");
+        assert!(!ready(false, &typed), "no display of its own: wait");
+    }
+
+    #[test]
+    fn a_slow_portal_is_unknown_not_missing() {
+        let d = Duration::from_secs(2);
+        assert_eq!(answer_of(Ok(1), d), PortalAnswer::Version(1));
+        assert_eq!(answer_of(Err(None), d), PortalAnswer::NoAnswer(d));
+        assert_eq!(
+            answer_of(
+                Err(Some(
+                    "org.freedesktop.DBus.Error.NoReply: Did not receive a reply".into()
+                )),
+                d
+            ),
+            PortalAnswer::NoAnswer(d)
+        );
+        let gone = "org.freedesktop.DBus.Error.ServiceUnknown: The name is not provided";
+        assert_eq!(
+            answer_of(Err(Some(gone.into())), d),
+            PortalAnswer::Missing(gone.into())
+        );
+    }
+
     use super::*;
     use RunMode::*;
 
@@ -1257,6 +1609,60 @@ mod tests {
         assert_eq!(parse_plasma_version(""), None);
         assert_eq!(parse_plasma_version("6"), None);
         assert_eq!(parse_plasma_version("six.one"), None);
+    }
+
+    #[test]
+    fn reported_keys_keep_the_desktops_text_and_say_what_is_unknown() {
+        let entry = |id: &str, trigger: Option<&str>| {
+            let mut props: HashMap<String, OwnedValue> = HashMap::new();
+            props.insert(
+                "description".into(),
+                OwnedValue::try_from(Value::from("x")).unwrap(),
+            );
+            if let Some(t) = trigger {
+                props.insert(
+                    "trigger_description".into(),
+                    OwnedValue::try_from(Value::from(t)).unwrap(),
+                );
+            }
+            (id.to_string(), props)
+        };
+        let list = vec![
+            entry("toggle-mute", Some("Ctrl+Alt+M")),
+            entry("toggle-bypass", Some("")),
+            entry("push-to-talk", None),
+            entry("frobnicate", Some("F1")),
+        ];
+        // A bind's or a listing's answer covers every action.
+        assert_eq!(
+            reported_keys(&list, true),
+            vec![
+                (Action::ToggleMute, Keys::Text("Ctrl+Alt+M".into())),
+                (Action::ToggleBypass, Keys::NotSet),
+                (Action::PushToTalk, Keys::NotReported),
+                (Action::PushToMute, Keys::NotSet),
+            ]
+        );
+        // A change covers only what it lists.
+        assert_eq!(
+            reported_keys(&list[..1], false),
+            vec![(Action::ToggleMute, Keys::Text("Ctrl+Alt+M".into()))]
+        );
+        // The results map of a request carries them as a variant.
+        let mut results: HashMap<String, OwnedValue> = HashMap::new();
+        let wire: Vec<(String, HashMap<String, Value>)> = vec![(
+            "push-to-mute".into(),
+            HashMap::from([("trigger_description".to_string(), Value::from("Meta+F10"))]),
+        )];
+        results.insert(
+            "shortcuts".into(),
+            OwnedValue::try_from(Value::from(wire)).unwrap(),
+        );
+        assert_eq!(
+            keys_in(&results).unwrap()[3],
+            (Action::PushToMute, Keys::Text("Meta+F10".into()))
+        );
+        assert_eq!(keys_in(&HashMap::new()), None);
     }
 
     #[test]

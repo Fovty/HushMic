@@ -42,9 +42,14 @@ pub fn unit_contents(spec: &LaunchSpec) -> String {
     // KillMode=mixed: the `pipewire -c` child is in the unit's cgroup, and
     // the default kill would SIGTERM it at the same instant as the daemon,
     // racing the orderly teardown that restores the previous default mic.
-    // Restart=on-failure, not always: "already running" exits 0 and
-    // `always` would loop. default.target, not graphical-session.target:
+    // Restart=on-failure, not always: "already running" exits 0 under
+    // systemd (lock::Invocation), which on-failure leaves alone, also in
+    // units earlier versions generated; RestartPreventExitStatus=3 is a
+    // second guard, for the 3 it exits with elsewhere. default.target, not graphical-session.target:
     // that one stops at logout, and this daemon has no display to lose.
+    // TimeoutStopSec: a stop hands the default microphone back before the
+    // nodes go, and tries that again while PipeWire does not answer; 25 s
+    // is the longest that and the rest of an orderly stop can take.
     format!(
         "[Unit]
 Description=HushMic noise-suppression virtual microphone
@@ -55,9 +60,10 @@ Wants=pipewire.service
 [Service]
 ExecStart={exec} --headless
 {env}Restart=on-failure
+RestartPreventExitStatus=3
 RestartSec=3
 KillMode=mixed
-TimeoutStopSec=10
+TimeoutStopSec=25
 Slice=session.slice
 
 [Install]
@@ -175,6 +181,30 @@ mod tests {
         };
         let packaged = include_str!("../../../packaging/systemd/hushmic.service");
         assert_eq!(unit_contents(&spec), packaged);
+    }
+
+    /// "Already running" exits 0 under systemd (and 3 elsewhere): that is
+    /// safe only while every unit HushMic writes or documents restarts on
+    /// a failure alone, as every generated unit since 0.8 does. A clean
+    /// exit must never restart one.
+    #[test]
+    fn no_unit_restarts_on_a_clean_exit() {
+        let generated = unit_contents(&LaunchSpec {
+            program: "/opt/hm/bin/hushmic".into(),
+            env: vec![],
+        });
+        let packaged = include_str!("../../../packaging/systemd/hushmic.service");
+        let docs = include_str!("../../../docs/headless.md");
+        let flatpak = &docs[docs.find("```ini").expect("the Flatpak unit")..];
+        for (what, unit) in [
+            ("generated", &generated[..]),
+            ("packaged", packaged),
+            ("docs", flatpak),
+        ] {
+            let restarts: Vec<&str> = unit.lines().filter(|l| l.starts_with("Restart=")).collect();
+            assert_eq!(restarts, ["Restart=on-failure"], "{what}");
+            assert!(unit.contains("RestartPreventExitStatus=3\n"), "{what}");
+        }
     }
 
     #[test]

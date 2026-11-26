@@ -37,6 +37,8 @@ struct Call {
 #[derive(Clone, Default)]
 struct MockNotifications {
     calls: Arc<Mutex<Vec<Call>>>,
+    /// The ids `CloseNotification` was called with.
+    closed: Arc<Mutex<Vec<u32>>>,
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -66,6 +68,17 @@ impl MockNotifications {
         });
         // Server-assigned ids, distinct per call.
         100 + calls.len() as u32
+    }
+
+    fn close_notification(&self, id: u32) {
+        self.closed.lock().unwrap().push(id);
+    }
+
+    /// Like GNOME Shell, Plasma, dunst and mako: bodies are markup.
+    fn get_capabilities(&self) -> Vec<String> {
+        ["actions", "body", "body-markup"]
+            .map(String::from)
+            .to_vec()
     }
 }
 
@@ -107,6 +120,8 @@ fn notify_round_trip_on_a_private_bus() {
 
     let mock = MockNotifications::default();
     let calls = mock.calls.clone();
+    let calls_after = mock.calls.clone();
+    let closed = mock.closed.clone();
     let _server = zbus::blocking::connection::Builder::session()
         .expect("mock: session builder")
         .name("org.freedesktop.Notifications")
@@ -182,25 +197,183 @@ fn notify_round_trip_on_a_private_bus() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 6, "queued sends must all be delivered");
+        assert_eq!(
+            (
+                calls[3].summary.as_str(),
+                calls[4].summary.as_str(),
+                calls[5].summary.as_str()
+            ),
+            ("q1", "q2", "q3"),
+            "queue must preserve send order"
+        );
+        assert_eq!(
+            calls[3].replaces_id, id2,
+            "queued status send continues the status replace-chain"
+        );
+        assert!(!calls[3].has_transient);
+        assert!(calls[4].has_transient, "send_transient sets the hint");
+        assert_eq!(
+            calls[4].replaces_id, id3,
+            "queued mic-test send continues the mic-test replace-chain"
+        );
+    }
+
+    // --- a problem the window shows (its page shows it, with focus):
+    // held, and sent once the window no longer shows it if still so; a
+    // notice about the app has a chain of its own ---
+
+    use hushmic::appstate::Page;
+    use notify::Problem;
+    notify::set_window_shows(notify::shown_on(Page::Live, notify::LiveShows::Untold));
+    notify::send_problem(Problem::Failure, "dialog-error", "held", "");
+    notify::send_problem_transient(Problem::MicBack, "audio-input-microphone", "moment", "");
+    // to first run: the failure is still shown there, the moment is over
+    notify::set_window_shows(notify::shown_on(Page::FirstRun, notify::LiveShows::Untold));
+    let dropped = notify::release_held(|p| p == Problem::Failure);
+    assert_eq!(dropped, [Problem::MicBack]);
+    // first run does not show a re-route: out at once
+    notify::send_problem(Problem::Rerouted, "dialog-error", "p1", "");
+    // focus goes: the failure, still so, goes out once
+    notify::set_window_shows(0);
+    assert!(notify::release_held(|_| true).is_empty());
+    assert!(notify::release_held(|_| true).is_empty());
+    notify::send_transient(
+        Slot::Notice,
+        "audio-input-microphone",
+        "n1",
+        "still running",
+    );
+    notify::send_and_wait(Slot::MicTest, "x", "flush", "", Duration::from_secs(10));
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 6, "queued sends must all be delivered");
+    let sent: Vec<&str> = calls[6..].iter().map(|c| c.summary.as_str()).collect();
     assert_eq!(
-        (
-            calls[3].summary.as_str(),
-            calls[4].summary.as_str(),
-            calls[5].summary.as_str()
+        sent,
+        ["p1", "held", "n1", "flush"],
+        "held only what the window shows, sent once when it no longer does"
+    );
+    // a re-route has a chain of its own: it replaces no status bubble
+    // (UX panel round 2, A5: one chain per topic)
+    assert_eq!(calls[6].replaces_id, 0);
+    assert_eq!(
+        calls[7].replaces_id, 0,
+        "a failure has a chain of its own: no microphone notice replaces it"
+    );
+    assert_eq!(calls[8].replaces_id, 0, "the notice chain starts fresh");
+    assert!(calls[8].has_transient);
+    drop(calls);
+
+    // --- a healthy Live in front (its card told "none"): a problem the
+    // card could show waits for the card's word; with none that shows it,
+    // it goes out when the grace ends, and a timer wakes the loop for it ---
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    let wake_tx = Mutex::new(wake_tx);
+    notify::set_wake(move || {
+        let _ = wake_tx.lock().unwrap().send(Instant::now());
+    });
+    notify::set_window_shows(notify::shown_on(Page::Live, notify::LiveShows::Nothing));
+    notify::set_window_on_live(true);
+    let arrived = Instant::now();
+    notify::send_problem(Problem::MicFallback, "audio-input-microphone", "grace", "");
+    assert!(notify::release_held(|_| true).is_empty());
+    notify::send_and_wait(Slot::MicTest, "x", "flush2", "", Duration::from_secs(10));
+    assert!(
+        !calls_after
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.summary == "grace"),
+        "held for Live's card, not sent on arrival"
+    );
+    let woke = wake_rx
+        .recv_timeout(notify::CARD_GRACE + Duration::from_secs(5))
+        .expect("the grace's timer wakes the loop");
+    assert!(woke - arrived >= notify::CARD_GRACE);
+    assert!(notify::release_held(|_| true).is_empty());
+    notify::send_and_wait(Slot::MicTest, "x", "flush3", "", Duration::from_secs(10));
+    {
+        let calls = calls_after.lock().unwrap();
+        let tail: Vec<&str> = calls[calls.len() - 3..]
+            .iter()
+            .map(|c| c.summary.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            ["flush2", "grace", "flush3"],
+            "out once the grace ends"
+        );
+    }
+    notify::set_window_on_live(false);
+    notify::set_window_shows(0);
+
+    // --- every body that carries a name (a folder, a microphone) reads as
+    // plain text to a server that parses markup: the cleaned-files note
+    // straight, the default-released notice through the queue ---
+    let esc = |b: &str| {
+        b.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let dir = std::path::Path::new("/home/you/A & <B>");
+    let n = hushmic::files::note::note(&hushmic::files::jobs::Cleaned {
+        count: 2,
+        saved: Some(
+            ["a", "b"]
+                .map(|f| {
+                    (
+                        std::path::PathBuf::from(format!("/rec/{f}.wav")),
+                        dir.join(format!("{f} (cleaned).wav")),
+                    )
+                })
+                .to_vec(),
         ),
-        ("q1", "q2", "q3"),
-        "queue must preserve send order"
+        failed: 0,
+    });
+    assert!(n.body.contains("A & <B>"), "{}", n.body);
+    notify::send_blocking(Slot::Files, "x", &n.summary, &n.body, false)
+        .expect("Notify with a folder's name");
+    let device = hushmic::tr!("notify-default-released-open", device = "A & <B>");
+    notify::send_and_wait(
+        Slot::Notice,
+        "x",
+        "released",
+        &device,
+        Duration::from_secs(10),
     );
+    let calls = calls_after.lock().unwrap();
+    let bodies: Vec<&str> = calls[calls.len() - 2..]
+        .iter()
+        .map(|c| c.body.as_str())
+        .collect();
+    assert_eq!(bodies, [esc(&n.body), esc(&device)]);
+    assert!(bodies[0].contains("A &amp; &lt;B&gt;"), "{}", bodies[0]);
+    drop(calls);
+
+    // --- "No sound…" goes when sound is back, and the next one is a new
+    // bubble; the off notice keeps its own (UX panel round 2, A5) ---
+    notify::send_problem(Problem::MicSilent, "x", "silent", "");
+    notify::send_and_wait(Slot::Power, "x", "off", "", Duration::from_secs(10));
+    let (silent_id, off_id) = {
+        let calls = calls_after.lock().unwrap();
+        let n = calls.len() as u32;
+        (100 + n - 1, 100 + n)
+    };
+    notify::close(Slot::Silence);
+    notify::send_and_wait(Slot::MicTest, "x", "flush4", "", Duration::from_secs(10));
+    assert_eq!(*closed.lock().unwrap(), [silent_id]);
+    assert_eq!(notify::last_id(Slot::Silence), 0);
+    assert_eq!(notify::last_id(Slot::Power), off_id);
+    notify::close(Slot::Silence);
+    notify::send_problem(Problem::MicSilent, "x", "silent again", "");
+    notify::send_and_wait(Slot::MicTest, "x", "flush5", "", Duration::from_secs(10));
     assert_eq!(
-        calls[3].replaces_id, id2,
-        "queued status send continues the status replace-chain"
+        closed.lock().unwrap().len(),
+        1,
+        "nothing out: nothing to close"
     );
-    assert!(!calls[3].has_transient);
-    assert!(calls[4].has_transient, "send_transient sets the hint");
-    assert_eq!(
-        calls[4].replaces_id, id3,
-        "queued mic-test send continues the mic-test replace-chain"
-    );
+    let calls = calls_after.lock().unwrap();
+    let again = calls.iter().find(|c| c.summary == "silent again").unwrap();
+    assert_eq!(again.replaces_id, 0, "a new bubble");
 }

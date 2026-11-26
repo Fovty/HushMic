@@ -8,6 +8,7 @@
 //! [`Aligner`](crate::Aligner) turns into substituted silence instead of
 //! host-inserted dropouts.
 
+use crate::view::EngineView;
 use hushmic_denoiser::{Denoiser, Mode, HOP};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -147,6 +148,12 @@ pub trait HopEngine: Send + 'static {
     /// last hop: time the live path spent not producing, which the engine's
     /// cost model would otherwise not see. Default: ignored.
     fn note_pause(&mut self, _pause: Duration) {}
+    /// The last hop passed the raw microphone through instead of filtering
+    /// it (the adaptive engine's passthrough tier), so the meter shows it
+    /// as unfiltered. Default: never.
+    fn unfiltered(&self) -> bool {
+        false
+    }
 }
 
 impl HopEngine for Denoiser {
@@ -219,6 +226,9 @@ pub struct WorkerHandle {
     /// The realtime helper. Drop waits briefly, then detaches with the
     /// plugin mapping retained for any unfinished thread.
     rt_helper: Option<JoinHandle<()>>,
+    /// Serves Mic check tap requests (only with an engine view); same
+    /// Drop rules as the realtime helper.
+    tap_helper: Option<JoinHandle<()>>,
     /// The epoch of the most recent reset request (RT-side only).
     requested_epoch: u32,
 }
@@ -227,7 +237,16 @@ impl WorkerHandle {
     /// Spawn the worker and move `engine` into it. `None` if the OS
     /// refuses a thread (the caller degrades to the silent node).
     pub fn spawn(engine: impl HopEngine) -> Option<WorkerHandle> {
-        Self::spawn_with(engine, true)
+        Self::spawn_with(engine, true, None)
+    }
+
+    /// [`WorkerHandle::spawn`] with the engine view (meter and Mic check
+    /// tap) the worker feeds once per hop.
+    pub fn spawn_with_view(
+        engine: impl HopEngine,
+        view: Option<EngineView>,
+    ) -> Option<WorkerHandle> {
+        Self::spawn_with(engine, true, view)
     }
 
     /// Test seam: a worker that never asks for realtime. Paced tests drive
@@ -235,15 +254,30 @@ impl WorkerHandle {
     /// realtime worker would starve that thread, the exact case the data
     /// loop rule in rt.rs keeps out of production.
     pub fn spawn_timeshare(engine: impl HopEngine) -> Option<WorkerHandle> {
-        Self::spawn_with(engine, false)
+        Self::spawn_with(engine, false, None)
     }
 
-    fn spawn_with(engine: impl HopEngine, request_rt: bool) -> Option<WorkerHandle> {
+    /// Test seam: [`WorkerHandle::spawn_timeshare`] with an engine view.
+    pub fn spawn_timeshare_with_view(
+        engine: impl HopEngine,
+        view: EngineView,
+    ) -> Option<WorkerHandle> {
+        Self::spawn_with(engine, false, Some(view))
+    }
+
+    fn spawn_with(
+        engine: impl HopEngine,
+        request_rt: bool,
+        view: Option<EngineView>,
+    ) -> Option<WorkerHandle> {
         let can_detach = request_rt && crate::rt::keep_plugin_loaded();
         let (in_prod, in_cons) = rtrb::RingBuffer::new(RING_CAPACITY);
         let (out_prod, out_cons) = rtrb::RingBuffer::new(RING_CAPACITY);
         let shared = Arc::new(Shared::new());
         let worker_shared = Arc::clone(&shared);
+        let tap_helper = view
+            .as_ref()
+            .and_then(|v| v.spawn_tap_helper(Arc::clone(&shared.shutdown)));
         // The worker reports its kernel tid so a helper can ask for
         // realtime scheduling on its behalf (rt.rs) without the worker ever
         // blocking on D-Bus.
@@ -266,7 +300,7 @@ impl WorkerHandle {
                 // timeout on every future activation.
                 let loop_shared = Arc::clone(&worker_shared);
                 if catch_unwind(AssertUnwindSafe(move || {
-                    worker_loop(engine, in_cons, out_prod, loop_shared)
+                    worker_loop(engine, in_cons, out_prod, loop_shared, view)
                 }))
                 .is_err()
                 {
@@ -290,10 +324,16 @@ impl WorkerHandle {
                 },
                 shared,
                 thread: Some(t),
+                tap_helper,
                 requested_epoch: 0,
             }),
             Err(e) => {
                 eprintln!("[dpdfnet-ladspa] cannot spawn the inference worker: {e}");
+                // The tap helper exits on the shutdown flag.
+                shared.shutdown.store(true, Ordering::Release);
+                if let Some(h) = &tap_helper {
+                    h.thread().unpark();
+                }
                 None
             }
         }
@@ -480,13 +520,17 @@ fn arm_rt_guard(shared: &Shared, deadline: Instant) -> bool {
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        if let Some(t) = &self.thread {
+        for t in [&self.thread, &self.tap_helper].into_iter().flatten() {
             t.thread().unpark();
         }
         let deadline = Instant::now() + Duration::from_millis(50);
-        for handle in [self.thread.take(), self.rt_helper.take()]
-            .into_iter()
-            .flatten()
+        for handle in [
+            self.thread.take(),
+            self.rt_helper.take(),
+            self.tap_helper.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             while !handle.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
@@ -506,6 +550,7 @@ fn worker_loop(
     mut input: rtrb::Consumer<f32>,
     mut output: rtrb::Producer<f32>,
     shared: Arc<Shared>,
+    mut view: Option<EngineView>,
 ) {
     let mut seen_epoch = 0u32;
     // Caches start at the same NAN sentinel the shared atomics are
@@ -513,6 +558,9 @@ fn worker_loop(
     // between spawn and the first loop iteration would be swallowed.
     let mut attn_cache = f32::NAN.to_bits();
     let mut mode_cache = f32::NAN.to_bits();
+    // The meter's code for the mode the engine runs in (process until the
+    // first control arrives, as the engine itself).
+    let mut view_mode = crate::view::mode_code(Mode::Process);
     let mut hop_in = [0f32; HOP];
     let mut hop_out = [0f32; HOP];
     let mut err_logged = false;
@@ -543,6 +591,9 @@ fn worker_loop(
             while input.pop().is_ok() {}
             lag_window.0.clear();
             engine.reset();
+            if let Some(v) = view.as_mut() {
+                v.discontinuity();
+            }
             err_logged = false; // a fresh session logs its own first failure
             seen_epoch = epoch;
             shared.ack_epoch.store(epoch, Ordering::Release);
@@ -555,7 +606,9 @@ fn worker_loop(
         }
         let mode = shared.mode_bits.load(Ordering::Acquire);
         if mode != mode_cache {
-            engine.set_mode(crate::mode_from_control(f32::from_bits(mode)));
+            let m = crate::mode_from_control(f32::from_bits(mode));
+            engine.set_mode(m);
+            view_mode = crate::view::mode_code(m);
             mode_cache = mode;
         }
         if input.slots() < HOP {
@@ -606,6 +659,12 @@ fn worker_loop(
                 shared.engine_dead.store(true, Ordering::Release);
                 return;
             }
+        }
+        // The meter and the tap see exactly this call's input and output
+        // (wait-free; see view.rs).
+        if let Some(v) = view.as_mut() {
+            let code = crate::view::hop_mode(view_mode, engine.unfiltered());
+            v.publish(&hop_in, &hop_out, code);
         }
         let mut pushed = 0;
         while pushed < HOP {
@@ -701,6 +760,27 @@ mod tests {
             guard.parked(Duration::from_millis(50), false);
             assert_eq!(guard.run, RUN_GUARD_AFTER, "preemption is not a wait");
             guard.parked(Duration::from_millis(1), true);
+            assert_eq!(guard.run, Duration::ZERO);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_park_that_waited_clears_the_run() {
+        // In a thread of its own: no token is pending and nothing unparks
+        // it, so a park waits its timeout out (it may also return early,
+        // which is no wait: then the next one).
+        std::thread::spawn(|| {
+            let mut guard = RunGuard::default();
+            guard.set_active(true);
+            guard.account(RUN_GUARD_AFTER);
+            for _ in 0..100 {
+                if guard.run == Duration::ZERO {
+                    break;
+                }
+                park_accounted(&mut guard, Duration::from_millis(5));
+            }
             assert_eq!(guard.run, Duration::ZERO);
         })
         .join()

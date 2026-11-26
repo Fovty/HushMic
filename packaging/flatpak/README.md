@@ -23,16 +23,20 @@ flatpak run io.github.fovty.HushMic
 Bundle for another machine: add `--repo=repo`, then
 `flatpak build-bundle repo hushmic.flatpak io.github.fovty.HushMic`.
 After a `Cargo.lock` change, regenerate `cargo-sources.json` with
-[flatpak-cargo-generator](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo).
+[flatpak-cargo-generator](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo),
+or offline with `python3 scripts/cargo-sources.py Cargo.lock packaging/flatpak/cargo-sources.json`
+(same output while every crate comes from crates.io).
 After manifest/metainfo changes, re-run the linters:
 `flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest|appstream <file>`.
 
 ## How the sandboxed app works
 
-Same architecture as native: the tray spawns a bundled `pipewire -c` child
-hosting `module-filter-chain`, which talks to the **host** daemon over the
-shared `pipewire-0` socket; host WirePlumber links the mic in and exposes
-`hushmic_source` to every app. The manifest builds PipeWire from source
+Same architecture as native: the tray spawns two bundled `pipewire -c`
+children hosting `module-filter-chain` (the DSP chain, and a small host
+that carries `hushmic_source` through chain restarts), which talk to the
+**host** daemon over the shared `pipewire-0` socket; host WirePlumber links
+the mic in and exposes `hushmic_source` to every app, and the daemon links
+the chain into the source host with the bundled `pw-link`. The manifest builds PipeWire from source
 (the runtime ships no daemon or filter-chain module), ONNX Runtime from
 source, and installs a `media.category = Manager` client drop-in so the
 bundled `pw-metadata` may set the default mic (WirePlumber silently drops
@@ -42,6 +46,16 @@ behavior is documented at its call site: SNI naming and exported tray icons
 version probing and default-source read-back (`pipewire.rs`), the
 cross-instance lock/show-socket in `$XDG_RUNTIME_DIR/app/$FLATPAK_ID`
 (`lock.rs`).
+
+"Clean a file" needs nothing beyond the runtime: Opus decodes through its
+libopus, Save writes through its `/usr/bin/ffmpeg` (the codecs-extra
+extension adds AAC and MP3; without an encoder for the original's codec,
+Save writes FLAC), the file workers' `SCHED_IDLE` holds inside the
+sandbox, and the files come and go through the FileChooser portal
+(`files/chooser.rs`). A sandbox sees only the files it was given, so
+cleaned files go into a folder the user chooses once (`files_folder` in
+the config) rather than next to the original. "Show in folder" uses the
+OpenURI portal there (no talk name for the file manager).
 
 ## Host compatibility
 

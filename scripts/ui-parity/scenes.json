@@ -1,0 +1,25 @@
+{
+  "about": "Parity cases: a board state (board-shot.mjs) against an egui scene (ui-shot). board: the .dc.html name; props: the board's tweaks; ticks: live-level frames stepped before the shot (the egui scene prefills the same clip frames, params cols=N); sizes: which window sizes apply. Pages add a case per page state. region (optional): [x, y, w, h] in CSS px, the part of the window compared (the rest is page layout the case does not cover).",
+  "cases": [
+    {"case": "kit-main-on", "board": "App-Main", "props": {"state": "On · in a call"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180", "sizes": ["default"]},
+    {"case": "kit-main-on-compact", "board": "App-Main", "props": {"state": "On · in a call"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180", "sizes": ["minimum"], "region": [0, 0, 720, 296]},
+    {"case": "kit-more-menu", "board": "App-Main", "props": {"state": "On · in a call"}, "ticks": 180, "eval": ["document.querySelector('.hm-app-more').click()"], "scene": "kit/main-replica", "params": "cols=180 more=1", "sizes": ["default"], "region": [0, 480, 240, 160]},
+    {"case": "kit-more-menu-compact", "board": "App-Main", "props": {"state": "On · in a call"}, "ticks": 180, "eval": ["document.querySelector('.hm-app-more').click()"], "scene": "kit/main-replica", "params": "cols=180 more=1", "sizes": ["minimum"], "region": [10, 373, 212, 97]},
+    {"case": "kit-mic-listening", "board": "App-MicCheck", "props": {"state": "Listening"}, "ticks": 60, "scene": "kit/mic-replica", "params": "cols=180", "sizes": ["default"]},
+    {"case": "kit-mic-problem-buttons", "board": "App-MicCheck", "props": {"state": "Mic problem"}, "ticks": 60, "scene": "kit/mic-replica", "params": "cols=60 disabled=1", "sizes": ["default"], "region": [216, 401, 465, 40]},
+    {"case": "kit-shortcuts", "board": "App-Shortcuts", "props": {}, "scene": "kit/shortcuts-replica", "params": "", "sizes": ["default"]},
+    {"case": "kit-settings", "board": "App-Settings", "props": {}, "scene": "kit/settings-replica", "params": "", "sizes": ["default"]},
+    {"case": "kit-firstrun-1", "board": "App-FirstRun", "props": {}, "ticks": 60, "scene": "kit/firstrun-replica", "params": "", "sizes": ["default"]},
+    {"case": "kit-live-bypass", "board": "App-Main", "props": {"state": "Bypass"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180 live=bypass", "sizes": ["default"], "region": [217, 101, 710, 168]},
+    {"case": "kit-live-muted", "board": "App-Main", "props": {"state": "Muted"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180 live=muted", "sizes": ["default"], "region": [217, 101, 710, 168]},
+    {"case": "kit-live-light", "board": "App-Main", "props": {"state": "Light for now"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180 live=light", "sizes": ["default"], "region": [217, 101, 710, 168]},
+    {"case": "kit-live-unfiltered", "board": "App-Main", "props": {"state": "Unfiltered for now"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180 live=unfiltered", "sizes": ["default"], "region": [217, 101, 710, 168]},
+    {"case": "kit-live-ready", "board": "App-Main", "props": {"state": "On · no app yet"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180 live=ready", "sizes": ["default"], "region": [217, 101, 710, 168]},
+    {"case": "kit-live-off", "board": "App-Main", "props": {"state": "Off"}, "ticks": 180, "scene": "kit/main-replica", "params": "cols=180 live=off", "sizes": ["default"], "region": [217, 101, 710, 168]},
+    {"case": "kit-beam-0.2", "board": "App-Look-Beam", "props": {"review": "Scrub", "progress": 0.2}, "scene": "kit/main-replica", "params": "scrub=0.2 beam=1 head=tight", "sizes": ["default"], "region": [184, 0, 776, 270]},
+    {"case": "kit-beam-0.4", "board": "App-Look-Beam", "props": {"review": "Scrub", "progress": 0.4}, "scene": "kit/main-replica", "params": "scrub=0.4 beam=1 head=tight", "sizes": ["default"], "region": [184, 0, 776, 270]},
+    {"case": "kit-beam-0.6", "board": "App-Look-Beam", "props": {"review": "Scrub", "progress": 0.6}, "scene": "kit/main-replica", "params": "scrub=0.6 beam=1 head=tight", "sizes": ["default"], "region": [184, 0, 776, 270]},
+    {"case": "kit-beam-0.9", "board": "App-Look-Beam", "props": {"review": "Scrub", "progress": 0.9}, "scene": "kit/main-replica", "params": "scrub=0.9 beam=1 head=tight", "sizes": ["default"], "region": [184, 0, 776, 270]},
+    {"case": "files-settings", "board": "App-Files", "props": {"state": "Paused", "around": "Settings › Files"}, "scene": "page/settings", "params": "view=files files=next"}
+  ]
+}

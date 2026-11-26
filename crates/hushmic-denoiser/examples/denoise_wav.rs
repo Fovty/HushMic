@@ -1,5 +1,8 @@
 //! Denoise a WAV file: `cargo run --release --example denoise_wav -- \
-//! dpdfnet8_48khz_hr.onnx noisy.wav cleaned.wav`
+//! dpdfnet8_48khz_hr.onnx noisy.wav cleaned.wav [--voice-hold]`
+//!
+//! `--voice-hold` turns on [`Denoiser::set_voice_hold`]: voices farther
+//! from the microphone than the talker stay out, also after a pause.
 //!
 //! Input must be 48 kHz mono (the only format the models run at). The cleaned
 //! file is written as 16-bit PCM, sample-aligned with the input: the stream's
@@ -10,9 +13,13 @@ use hushmic_denoiser::{Denoiser, StreamDenoiser, SAMPLE_RATE};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let [_, model, input, output] = &args[..] else {
-        eprintln!("usage: denoise_wav <model.onnx> <in.wav> <out.wav>");
-        std::process::exit(2);
+    let (model, input, output, hold) = match &args[..] {
+        [_, model, input, output] => (model, input, output, false),
+        [_, model, input, output, flag] if flag == "--voice-hold" => (model, input, output, true),
+        _ => {
+            eprintln!("usage: denoise_wav <model.onnx> <in.wav> <out.wav> [--voice-hold]");
+            std::process::exit(2);
+        }
     };
 
     let mut reader = hound::WavReader::open(input)?;
@@ -35,7 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut stream = StreamDenoiser::new(Denoiser::from_file(model)?);
+    let mut denoiser = Denoiser::from_file(model)?;
+    denoiser.set_voice_hold(hold);
+    let mut stream = StreamDenoiser::new(denoiser);
     let mut cleaned = Vec::with_capacity(samples.len());
     for chunk in samples.chunks(4096) {
         cleaned.extend_from_slice(stream.process(chunk));

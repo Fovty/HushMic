@@ -78,80 +78,98 @@ pub enum Switch {
     Return,
 }
 
-/// Mic-recovery decision state machine — pure, fed once per watchdog tick.
-/// `config.mic` is never touched; this only decides when to restart the
-/// (healthy) chain because the *preferred* mic went away or came back.
+/// How long a chosen microphone must stay gone (or back) before the chain
+/// switches: two looks at least this far apart. USB re-enumeration flaps
+/// for a moment; an unplug is told within a few seconds (UX panel round
+/// 2, A5).
+pub const MIC_SETTLE: Duration = Duration::from_millis(1500);
+/// The least time between two automatic mic switches: a flapping device
+/// degenerates to slow toggling, never a restart storm.
+pub const MIC_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Mic-recovery decision state machine — pure, fed on every graph read
+/// with its time. `config.mic` is never touched; this only decides when
+/// to restart the (healthy) chain because the *preferred* mic went away
+/// or came back. Time, not ticks: the reads come at the 5 s tick and in
+/// between (a device added or removed), and neither may hurry the
+/// debounce or the cooldown.
 pub struct Recovery {
-    absent_ticks: u32,
-    present_ticks: u32,
-    cooldown: u32,
+    /// Since when the mic is seen gone (the chain on it) or back (the
+    /// chain on the fallback), and which way.
+    pending: Option<(Switch, std::time::Instant)>,
+    /// The last switch, for the cooldown.
+    last_switch: Option<std::time::Instant>,
 }
 
 impl Recovery {
     pub fn new() -> Self {
         Recovery {
-            absent_ticks: 0,
-            present_ticks: 0,
-            cooldown: 0,
+            pending: None,
+            last_switch: None,
         }
     }
 
-    /// One tick of facts:
+    /// One read's facts at `now`:
     /// - `preferred_selected`: config names a mic at all
     /// - `active_is_preferred`: the running chain was rendered with it
     /// - `preferred_present`: the mic is in the snapshot; `None` = the
-    ///   probe failed — freezes the counters (unknown is not gone)
+    ///   probe failed — freezes (unknown is not gone)
     /// - `in_grace`: chain freshly spawned; don't judge it yet
     ///
-    /// Returns the switch to execute (internally resets and starts the
-    /// cooldown when it fires).
+    /// Returns the switch to execute: the mic gone (or back) on looks at
+    /// least [`MIC_SETTLE`] apart, and [`MIC_COOLDOWN`] after the last one.
     pub fn observe(
         &mut self,
         preferred_selected: bool,
         active_is_preferred: bool,
         preferred_present: Option<bool>,
         in_grace: bool,
+        now: std::time::Instant,
     ) -> Option<Switch> {
-        // The cooldown is time, not evidence: it advances on every tick,
-        // including frozen and grace ones.
-        if self.cooldown > 0 {
-            self.cooldown -= 1;
-        }
         if !preferred_selected || in_grace {
-            self.absent_ticks = 0;
-            self.present_ticks = 0;
+            self.pending = None;
             return None;
         }
         // Probe failed: unknown is not gone — freeze, never reset.
         let present = preferred_present?;
-        match (active_is_preferred, present) {
-            // Chain on the preferred mic, mic gone: count toward fallback.
-            (true, false) => {
-                self.present_ticks = 0;
-                self.absent_ticks += 1;
-                if self.absent_ticks >= DEBOUNCE_TICKS && self.cooldown == 0 {
-                    self.absent_ticks = 0;
-                    self.cooldown = SWITCH_COOLDOWN_TICKS;
-                    return Some(Switch::Fallback);
-                }
-            }
-            // Chain on the fallback, mic back: count toward return.
-            (false, true) => {
-                self.absent_ticks = 0;
-                self.present_ticks += 1;
-                if self.present_ticks >= DEBOUNCE_TICKS && self.cooldown == 0 {
-                    self.present_ticks = 0;
-                    self.cooldown = SWITCH_COOLDOWN_TICKS;
-                    return Some(Switch::Return);
-                }
-            }
+        let want = match (active_is_preferred, present) {
+            // Chain on the preferred mic, mic gone: toward the fallback.
+            (true, false) => Switch::Fallback,
+            // Chain on the fallback, mic back: toward the return.
+            (false, true) => Switch::Return,
             // Consistent state: nothing brewing in either direction.
             _ => {
-                self.absent_ticks = 0;
-                self.present_ticks = 0;
+                self.pending = None;
+                return None;
             }
+        };
+        let since = match self.pending {
+            Some((w, t)) if w == want => t,
+            _ => {
+                self.pending = Some((want, now));
+                return None;
+            }
+        };
+        let cooled = self
+            .last_switch
+            .is_none_or(|t| now.saturating_duration_since(t) >= MIC_COOLDOWN);
+        if now.saturating_duration_since(since) >= MIC_SETTLE && cooled {
+            self.pending = None;
+            self.last_switch = Some(now);
+            return Some(want);
         }
         None
+    }
+
+    /// When the next look decides a pending switch (the caller reads the
+    /// graph then); None with nothing pending.
+    pub fn decides_at(&self) -> Option<std::time::Instant> {
+        let (_, since) = self.pending?;
+        let settled = since + MIC_SETTLE;
+        Some(match self.last_switch {
+            Some(t) => settled.max(t + MIC_COOLDOWN),
+            None => settled,
+        })
     }
 }
 
@@ -375,108 +393,106 @@ mod tests {
     }
 
     // --- Recovery state machine ---------------------------------------
-    // Shorthand: chain healthy, a mic is selected, no grace.
-    fn absent(r: &mut Recovery) -> Option<Switch> {
-        r.observe(true, true, Some(false), false)
+    // Shorthand: chain healthy, a mic is selected, no grace, at t s.
+    fn at(t: f64) -> std::time::Instant {
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        *T0.get_or_init(std::time::Instant::now) + Duration::from_secs_f64(t)
     }
-    fn back(r: &mut Recovery) -> Option<Switch> {
-        r.observe(true, false, Some(true), false)
+    fn absent(r: &mut Recovery, t: f64) -> Option<Switch> {
+        r.observe(true, true, Some(false), false, at(t))
     }
-
-    #[test]
-    fn fallback_fires_after_two_definitive_absent_ticks() {
-        let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None); // 1st: debounce
-        assert_eq!(absent(&mut r), Some(Switch::Fallback));
+    fn back(r: &mut Recovery, t: f64) -> Option<Switch> {
+        r.observe(true, false, Some(true), false, at(t))
     }
 
     #[test]
-    fn return_fires_after_two_definitive_present_ticks() {
+    fn fallback_fires_once_the_mic_stays_gone() {
         let mut r = Recovery::new();
-        assert_eq!(back(&mut r), None);
-        assert_eq!(back(&mut r), Some(Switch::Return));
+        assert_eq!(absent(&mut r, 0.0), None); // the first look: debounce
+        assert_eq!(r.decides_at(), Some(at(1.5)));
+        assert_eq!(absent(&mut r, 1.0), None, "a moment is a flap");
+        assert_eq!(absent(&mut r, 1.5), Some(Switch::Fallback));
+        assert_eq!(r.decides_at(), None);
+    }
+
+    #[test]
+    fn return_fires_once_the_mic_stays_back() {
+        let mut r = Recovery::new();
+        assert_eq!(back(&mut r, 0.0), None);
+        assert_eq!(back(&mut r, 1.6), Some(Switch::Return));
     }
 
     #[test]
     fn consistent_state_resets_the_count() {
         let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None);
+        assert_eq!(absent(&mut r, 0.0), None);
         // mic observed present again while chain is on it: all is well
-        assert_eq!(r.observe(true, true, Some(true), false), None);
-        assert_eq!(absent(&mut r), None); // count restarted
-        assert_eq!(absent(&mut r), Some(Switch::Fallback));
+        assert_eq!(r.observe(true, true, Some(true), false, at(1.0)), None);
+        assert_eq!(absent(&mut r, 2.0), None); // count restarted
+        assert_eq!(absent(&mut r, 3.0), None);
+        assert_eq!(absent(&mut r, 3.5), Some(Switch::Fallback));
     }
 
     #[test]
     fn probe_failure_freezes_but_does_not_reset() {
         let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None);
-        assert_eq!(r.observe(true, true, None, false), None); // frozen
-        assert_eq!(absent(&mut r), Some(Switch::Fallback)); // 2nd definitive
+        assert_eq!(absent(&mut r, 0.0), None);
+        assert_eq!(r.observe(true, true, None, false, at(1.0)), None); // frozen
+        assert_eq!(absent(&mut r, 2.0), Some(Switch::Fallback));
     }
 
     #[test]
     fn no_decision_without_a_preferred_mic() {
         let mut r = Recovery::new();
-        for _ in 0..10 {
-            assert_eq!(r.observe(false, false, Some(true), false), None);
+        for i in 0..10 {
+            assert_eq!(
+                r.observe(false, false, Some(true), false, at(i as f64)),
+                None
+            );
         }
         // and it also resets accumulated state
-        assert_eq!(absent(&mut r), None);
-        assert_eq!(r.observe(false, true, Some(false), false), None);
-        assert_eq!(absent(&mut r), None);
-        assert_eq!(absent(&mut r), Some(Switch::Fallback));
+        assert_eq!(absent(&mut r, 10.0), None);
+        assert_eq!(r.observe(false, true, Some(false), false, at(11.0)), None);
+        assert_eq!(absent(&mut r, 12.0), None);
+        assert_eq!(absent(&mut r, 14.0), Some(Switch::Fallback));
     }
 
     #[test]
     fn startup_grace_resets_and_blocks() {
         let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None);
-        assert_eq!(r.observe(true, true, Some(false), true), None); // grace
-        assert_eq!(absent(&mut r), None); // count restarted
-        assert_eq!(absent(&mut r), Some(Switch::Fallback));
+        assert_eq!(absent(&mut r, 0.0), None);
+        assert_eq!(r.observe(true, true, Some(false), true, at(2.0)), None); // grace
+        assert_eq!(absent(&mut r, 3.0), None); // count restarted
+        assert_eq!(absent(&mut r, 5.0), Some(Switch::Fallback));
     }
 
     #[test]
     fn direction_flip_resets_the_count() {
         let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None);
+        assert_eq!(absent(&mut r, 0.0), None);
         // chain now on fallback and mic present: opposite direction
-        assert_eq!(back(&mut r), None);
-        assert_eq!(back(&mut r), Some(Switch::Return));
+        assert_eq!(back(&mut r, 2.0), None);
+        assert_eq!(back(&mut r, 4.0), Some(Switch::Return));
     }
 
     #[test]
-    fn cooldown_gates_the_next_switch_to_six_ticks() {
+    fn cooldown_gates_the_next_switch() {
         let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None);
-        assert_eq!(absent(&mut r), Some(Switch::Fallback)); // cooldown starts
-                                                            // The mic comes straight back: debounce is satisfied quickly, but
-                                                            // the switch must wait out the cooldown window.
-        let mut fired_at = None;
-        for i in 1..=SWITCH_COOLDOWN_TICKS + 2 {
-            if back(&mut r) == Some(Switch::Return) {
-                fired_at = Some(i);
-                break;
-            }
+        assert_eq!(absent(&mut r, 0.0), None);
+        assert_eq!(absent(&mut r, 2.0), Some(Switch::Fallback)); // cooldown starts
+                                                                 // The mic comes straight back: the debounce is satisfied quickly,
+                                                                 // but the switch waits out the cooldown, however many looks come.
+        assert_eq!(back(&mut r, 3.0), None);
+        assert_eq!(r.decides_at(), Some(at(32.0)));
+        for i in 0..50 {
+            assert_eq!(back(&mut r, 5.0 + i as f64 * 0.5), None);
         }
-        assert_eq!(fired_at, Some(SWITCH_COOLDOWN_TICKS));
-    }
-
-    #[test]
-    fn each_switch_rearms_the_cooldown() {
-        let mut r = Recovery::new();
-        assert_eq!(absent(&mut r), None);
-        assert_eq!(absent(&mut r), Some(Switch::Fallback));
-        for _ in 0..SWITCH_COOLDOWN_TICKS - 1 {
-            assert_eq!(back(&mut r), None);
-        }
-        assert_eq!(back(&mut r), Some(Switch::Return));
-        // and the third flip is gated again
-        for _ in 0..SWITCH_COOLDOWN_TICKS - 1 {
-            assert_eq!(absent(&mut r), None);
-        }
-        assert_eq!(absent(&mut r), Some(Switch::Fallback));
+        assert_eq!(back(&mut r, 32.0), Some(Switch::Return));
+        // and the next flip is gated again
+        assert_eq!(absent(&mut r, 33.0), None);
+        assert_eq!(absent(&mut r, 61.9), None);
+        assert_eq!(absent(&mut r, 62.0), Some(Switch::Fallback));
     }
 
     // --- ProfileFollow ------------------------------------------------

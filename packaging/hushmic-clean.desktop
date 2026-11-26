@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Clean with HushMic
+Comment=Remove background noise from recordings
+# Only in "Open with": the files go onto the Files page of the running
+# HushMic (started if it is not).
+Exec=hushmic open-files %F
+Icon=hushmic
+Terminal=false
+NoDisplay=true
+MimeType=audio/wav;audio/x-wav;audio/vnd.wave;audio/flac;audio/x-flac;audio/mpeg;audio/mp3;audio/mp4;audio/x-m4a;audio/aac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-opus+ogg;audio/aiff;audio/x-aiff;audio/x-caf;audio/webm;audio/x-matroska;audio/x-ms-wma;video/mp4;video/quicktime;video/x-matroska;video/webm;

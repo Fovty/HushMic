@@ -52,6 +52,8 @@ pub(super) struct Scenario {
     /// the host resets the plugin as the stream pauses (filter-chain's
     /// PAUSED handler deactivates and activates every instance).
     pub idle: Option<(u64, u64)>,
+    /// There is a light model (without it: quality and raw only).
+    pub light: bool,
     pub hops: u64,
 }
 
@@ -75,7 +77,24 @@ impl Scenario {
             freeze: None,
             quantum: HOP as u64,
             idle: None,
+            light: true,
             hops: 1300,
+        }
+    }
+
+    /// A session whose quality model costs `quality` of a hop from the
+    /// first hop to the last (no cold hops), light a tenth, realtime on.
+    pub(super) fn steady(quality: f32) -> Scenario {
+        Scenario {
+            quality_idle: quality,
+            light_load: 0.1,
+            light_idle: 0.1,
+            cold: 1.0,
+            cold_hops: 0,
+            load_from: 0,
+            load_until: 0,
+            hops: 350,
+            ..Scenario::held(quality)
         }
     }
 }
@@ -242,7 +261,8 @@ pub(super) fn replay_with<P: Policy>(sc: Scenario, policy: P) -> Replay {
             sc.quality_load,
             sc,
         )),
-        Some(Model::new(&clock, 3.0, sc.light_idle, sc.light_load, sc)),
+        sc.light
+            .then(|| Model::new(&clock, 3.0, sc.light_idle, sc.light_load, sc)),
         policy,
         Box::new(move || base + Duration::from_micros(c.now_us.load(Ordering::Relaxed))),
         Box::new(move |l: &str| {
@@ -353,6 +373,81 @@ fn a_calm_session_stays_on_quality() {
         r.log.iter().all(|(_, l)| !l.contains("cpu")),
         "{}",
         r.lines()
+    );
+}
+
+/// A cost just inside the budget, with the run guard armed: the worker
+/// still waits for every hop, and a wait ends the guard's run, so the
+/// guard never sleeps and adds nothing to the cost. Without a light model
+/// quality at 0.85 stays (with the guard's eighth on top it would pass
+/// raw's preventive 0.90).
+#[test]
+fn the_guard_at_cost_085_keeps_quality_on_the_two_tier_ladder() {
+    let mut sc = Scenario::steady(0.85);
+    sc.light = false;
+    let r = replay_with(sc, Ladder::new(&[Tier::Quality, Tier::Raw]));
+    let what = r.lines();
+    assert!(!what.contains("passthrough"), "raw fallback: {what}");
+    assert!(!what.contains("engine: light"), "{what}");
+    assert!(
+        r.heard[250..].iter().all(|&h| h == Heard::Quality),
+        "{what}"
+    );
+    assert_eq!(r.zeros(200), 0, "{what}");
+}
+
+/// The same at 0.95 with a light model: the cost warrants the policy's
+/// preventive change to light, and that is all that happens; no backlog,
+/// so no emergency.
+#[test]
+fn the_guard_at_cost_095_only_causes_the_expected_preventive_change() {
+    let r = replay(Scenario::steady(0.95));
+    let what = r.lines();
+    assert!(!what.contains("passthrough"), "raw fallback: {what}");
+    assert!(what.contains("engine: light (cpu tight"), "{what}");
+    assert_eq!(r.zeros(200), 0, "{what}");
+}
+
+/// Quality over budget from the first hop (1.2 of a hop, light 0.3): the
+/// start-up grace lets the cold overload be, then the ladder leaves
+/// quality (emergency, raw, light) and the stream has no hole from the
+/// middle of the run on, also not across the quality trial the 100-hop
+/// dwell starts, and its end; the last second is all light.
+#[test]
+fn an_overload_from_the_start_ends_on_light_without_a_hole() {
+    let mut sc = Scenario::steady(1.2);
+    sc.light_load = 0.3;
+    sc.light_idle = 0.3;
+    sc.realtime = false;
+    sc.hops = 300;
+    let r = replay_with(sc, Ladder::new(&QLR).with_dwell_base(100));
+    let what = r.lines();
+    assert_eq!(r.zeros(150), 0, "{what}");
+    assert!(r.heard[200..].iter().all(|&h| h == Heard::Light), "{what}");
+}
+
+/// The same at 1.1 with a host cycle of 1024 samples, which pushes 2.13
+/// hops at once: the lag reading alternates from hop to hop and the
+/// worker smooths it over a cycle. Quality is still left, light takes
+/// over, and the second half of four seconds has no hole.
+#[test]
+fn an_overload_from_the_start_is_left_when_the_cycle_spans_several_hops() {
+    let mut sc = Scenario::steady(1.1);
+    sc.light_load = 0.3;
+    sc.light_idle = 0.3;
+    sc.realtime = false;
+    sc.quantum = 1024;
+    sc.hops = 400;
+    let r = replay_with(sc, Ladder::new(&QLR).with_dwell_base(100));
+    let what = r.lines();
+    assert!(what.contains("engine: light (recovered)"), "{what}");
+    assert_eq!(r.zeros(200), 0, "{what}");
+    let tail = &r.heard[300..];
+    assert!(tail.iter().all(|&h| h != Heard::Quality), "{what}");
+    let light = tail.iter().filter(|&&h| h == Heard::Light).count();
+    assert!(
+        light >= 98,
+        "light for {light} of the last 100 hops: {what}"
     );
 }
 

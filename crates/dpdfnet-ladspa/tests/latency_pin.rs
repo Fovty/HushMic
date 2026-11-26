@@ -4,9 +4,17 @@
 //! (latency-aligned raw), same as the engine crate's own latency tests.
 //!
 //! Timing note: cycles are paced at real time (10 ms per 480-sample
-//! callback); a CI stall longer than the 20 ms headroom would substitute
-//! zeros and swallow the impulse, so the impulse check retries a few
-//! times before failing.
+//! callback). A worker late by more than the 20 ms headroom gets silence
+//! substituted and its late audio dropped (the latency holds, the sound
+//! goes), which a fresh instance on a CPU-limited box does while it starts.
+//! So the impulse goes in only once the plugin streams (a faint mark comes
+//! through), and again every 30 cycles until one surfaces: each one that
+//! does must sit at exactly the declared latency.
+//!
+//! Realtime suite: the plugin runs at real-time pace here (a worker that
+//! falls behind substitutes silence, as in a call), so it needs the CPU a
+//! live stream needs. The timing sweep proves it at a 25% CPU quota, not
+//! the 6% the other suites get; a failure at 25% is a real finding.
 
 mod common;
 
@@ -69,37 +77,81 @@ fn descriptor() -> PluginDescriptor {
     get_ladspa_descriptor(0).expect("descriptor 0")
 }
 
+/// A faint mark the plugin passes in bypass and passthrough: it says the
+/// worker streams (silence substituted for late audio reads as 0).
+const MARK: f32 = 1e-3;
+
 fn try_impulse() -> Result<(), String> {
     let d = descriptor();
     let mut p = (d.new)(&d, 48_000);
     p.activate();
-    let impulse_at = 5 * Q + 7;
-    let cycles = 2 + (impulse_at + PLUGIN_LATENCY_SAMPLES) / Q;
-    let mut emitted = Vec::new();
-    for c in 0..cycles {
-        let mut input = vec![0f32; Q];
-        if (c * Q..(c + 1) * Q).contains(&impulse_at) {
-            input[impulse_at - c * Q] = 1.0;
-        }
-        emitted.extend(run_cycle(&mut p, &input, 100.0, 1.0)); // bypass
-        std::thread::sleep(Duration::from_millis(10)); // real-time pacing
-    }
+    let result = impulse_pin(&mut p);
     p.deactivate();
-    let pos = emitted
-        .iter()
-        .position(|&v| v.abs() > 0.5)
-        .ok_or("impulse never surfaced")?;
-    if pos != impulse_at + PLUGIN_LATENCY_SAMPLES {
-        return Err(format!(
-            "impulse at {pos}, declared {} (input at {impulse_at})",
-            impulse_at + PLUGIN_LATENCY_SAMPLES
-        ));
+    result
+}
+
+fn impulse_pin(p: &mut Box<dyn Plugin + Send>) -> Result<(), String> {
+    let mut emitted: Vec<f32> = Vec::new();
+    let mut sent: Vec<usize> = Vec::new();
+    let mut streaming = 0;
+    let mut next: Option<usize> = None;
+    let mut streams_at = None;
+    // a minute of cycles: only a plugin that never streams runs out
+    for c in 0..6_000 {
+        let mut input = vec![MARK; Q];
+        if streaming >= 5 && next.is_none_or(|n| c >= n) {
+            input[7] = 1.0;
+            sent.push(c * Q + 7);
+            next = Some(c + 30);
+        }
+        let out = run_cycle(p, &input, 100.0, 1.0); // bypass
+        streaming = if out.iter().all(|&v| v > MARK / 2.0) {
+            streaming + 1
+        } else {
+            0
+        };
+        if streaming == 1 && streams_at.is_none() {
+            streams_at = Some(c);
+        }
+        let from = emitted.len();
+        emitted.extend(out);
+        std::thread::sleep(Duration::from_millis(10)); // real-time pacing
+        let Some(pos) = emitted[from..]
+            .iter()
+            .position(|&v| v > 0.5)
+            .map(|i| from + i)
+        else {
+            continue;
+        };
+        if !sent.iter().any(|&at| at + PLUGIN_LATENCY_SAMPLES == pos) {
+            return Err(format!(
+                "impulse at {pos}, declared {} after one of {sent:?}",
+                PLUGIN_LATENCY_SAMPLES
+            ));
+        }
+        // nothing but the mark (or silence) around it: no stale audio, no
+        // leakage
+        if let Some(bad) = emitted
+            .iter()
+            .enumerate()
+            .find(|&(i, v)| i != pos && v.abs() > 0.01)
+        {
+            return Err(format!("leakage {bad:?}"));
+        }
+        let k = sent
+            .iter()
+            .position(|&at| at + PLUGIN_LATENCY_SAMPLES == pos);
+        eprintln!(
+            "streaming from cycle {streams_at:?}; impulse {} of {} surfaced",
+            k.map_or(0, |k| k + 1),
+            sent.len()
+        );
+        return Ok(());
     }
-    // Nothing but near-silence before it (no stale audio, no leakage).
-    if let Some(bad) = emitted[..pos].iter().find(|v| v.abs() > 0.01) {
-        return Err(format!("pre-impulse leakage {bad}"));
-    }
-    Ok(())
+    Err(format!(
+        "no impulse surfaced (streaming for {streaming} cycles, {} sent)",
+        sent.len()
+    ))
 }
 
 #[test]
@@ -108,17 +160,9 @@ fn bypass_impulse_reappears_at_exactly_the_declared_latency() {
     if !setup_env() {
         return;
     }
-    let mut last = String::new();
-    for attempt in 0..3 {
-        match try_impulse() {
-            Ok(()) => return,
-            Err(e) => {
-                eprintln!("attempt {attempt}: {e} (CI stall?); retrying");
-                last = e;
-            }
-        }
+    if let Err(e) = try_impulse() {
+        panic!("latency pin: {e}");
     }
-    panic!("latency pin failed 3 attempts; last: {last}");
 }
 
 /// The raw tier of the adaptive engine (issue #14) must land on the same
@@ -131,25 +175,11 @@ fn passthrough_tier_keeps_the_declared_latency() {
         return;
     }
     std::env::set_var("HUSHMIC_DSP_TIER", "passthrough");
-    let mut last = String::new();
-    let mut ok = false;
-    for attempt in 0..3 {
-        match try_impulse() {
-            Ok(()) => {
-                ok = true;
-                break;
-            }
-            Err(e) => {
-                eprintln!("attempt {attempt}: {e} (CI stall?); retrying");
-                last = e;
-            }
-        }
-    }
+    let result = try_impulse();
     std::env::remove_var("HUSHMIC_DSP_TIER");
-    assert!(
-        ok,
-        "passthrough latency pin failed 3 attempts; last: {last}"
-    );
+    if let Err(e) = result {
+        panic!("passthrough latency pin: {e}");
+    }
 }
 
 #[test]

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c1c1c"/>
+      <stop offset="1" stop-color="#050505"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.26"/>
+      <stop offset="0.3" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.05"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-300%" width="200%" height="700%">
+      <feGaussianBlur stdDeviation="5.4"/>
+    </filter>
+  </defs>
+  <path fill="url(#tile)" d="M64 8H192A56 56 0 0 1 248 64V192A56 56 0 0 1 192 248H64A56 56 0 0 1 8 192V64A56 56 0 0 1 64 8Z"/>
+  <path fill="none" stroke="url(#edge)" stroke-width="1" d="M64 8.5H192A55.5 55.5 0 0 1 247.5 64V192A55.5 55.5 0 0 1 192 247.5H64A55.5 55.5 0 0 1 8.5 192V64A55.5 55.5 0 0 1 64 8.5Z"/>
+  <path fill="#00f0f8" opacity="0.5" filter="url(#glow)" d="M146 122H182A6 6 0 0 1 188 128A6 6 0 0 1 182 134H146A6 6 0 0 1 140 128A6 6 0 0 1 146 122Z"/>
+  <path fill="#fafafa" opacity="0.4" d="M74 86A6 6 0 0 1 80 92V164A6 6 0 0 1 74 170A6 6 0 0 1 68 164V92A6 6 0 0 1 74 86Z"/>
+  <path fill="#fafafa" opacity="0.55" d="M92 68A6 6 0 0 1 98 74V182A6 6 0 0 1 92 188A6 6 0 0 1 86 182V74A6 6 0 0 1 92 68Z"/>
+  <path fill="#fafafa" opacity="0.72" d="M110 98A6 6 0 0 1 116 104V152A6 6 0 0 1 110 158A6 6 0 0 1 104 152V104A6 6 0 0 1 110 98Z"/>
+  <path fill="#fafafa" opacity="0.9" d="M128 83A6 6 0 0 1 134 89V167A6 6 0 0 1 128 173A6 6 0 0 1 122 167V89A6 6 0 0 1 128 83Z"/>
+  <path fill="#00f0f8" d="M146 122H182A6 6 0 0 1 188 128A6 6 0 0 1 182 134H146A6 6 0 0 1 140 128A6 6 0 0 1 146 122Z"/>
+</svg>

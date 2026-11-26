@@ -3,8 +3,8 @@ name = "hushmic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Real-time microphone noise suppression as a system-wide virtual microphone (DPDFNet via PipeWire)."
-homepage = "https://github.com/Fovty/hushmic"
+description = "Removes background noise from your microphone and your recordings"
+homepage = "https://hushmic.org"
 repository = "https://github.com/Fovty/hushmic"
 
 [[bin]]
@@ -12,46 +12,89 @@ name = "hushmic"
 path = "src/main.rs"
 
 [dependencies]
-ksni = { version = "0.3", features = ["blocking"] }
-# Same backend ksni already pulls in (feature-matched: tokio, no async-io
-# stack), used directly for org.freedesktop.Notifications — desktop
-# notifications without requiring libnotify/notify-send on the host.
-zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
-# Already in the tree via zbus's tokio mode; direct deps only so portal.rs
-# can bound a SIGNAL wait (blocking zbus offers no signal timeout): a
-# current-thread runtime + StreamExt::next around the portal Response.
-tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+# zbus runs in async-io mode across the tree (ksni, our own calls and
+# AccessKit's AT-SPI adapter share one zbus build): accesskit_unix can only
+# be built for async-io next to eframe, and a tokio-mode zbus panics on its
+# thread (no tokio reactor there). Never add a dependency that turns on
+# zbus/tokio (ashpd does by default); tests/zbus_async_io.rs fails if one does.
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+# Same backend ksni pulls in, used directly for org.freedesktop.Notifications
+# — desktop notifications without requiring libnotify/notify-send on the host.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# Direct deps only so portal.rs and the shortcuts worker can bound a SIGNAL
+# wait (blocking zbus offers no signal timeout): a current-thread runtime +
+# StreamExt::next around the portal Response, select! over commands. Async
+# zbus futures need no tokio reactor in async-io mode.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false }
 directories = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 libc = "0.2"
-# default-features off: accesskit's AT-SPI backend uses ASYNC zbus, which
-# panics under the workspace's tokio-mode zbus pin (no ambient reactor);
-# glow is also the leaner renderer. Revisit accessibility with a future
-# DBus control interface.
-eframe = { version = "0.33.3", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+hushmic-shm = { path = "../hushmic-shm" }
+# default-features off: glow is the leaner renderer. accesskit exposes the
+# window to screen readers over AT-SPI (see the zbus note above).
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "glow", "wayland", "x11", "default_fonts"] }
 # default-features=false above drops winit/default: restore wayland dlopen +
 # client-side decorations (GNOME Wayland would otherwise lose the title bar).
 winit = { version = "0.30", default-features = false, features = ["wayland-dlopen", "wayland-csd-adwaita", "x11"] }
+# Drops on Wayland (window/dnd.rs) come through egui's clipboard device:
+# the workspace patches this crate (vendor/smithay-clipboard).
+smithay-clipboard = "0.7.3"
+# The window as a portal dialog's parent (window::parent): its raw handles,
+# and on Wayland an xdg-foreign export on winit's own connection. The same
+# versions winit and smithay-client-toolkit already pull in.
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable"] }
+# The window's X11 instance name (window::wmclass), through the libX11
+# winit already loads; the version winit pulls in.
+x11-dl = "2.21"
 hound = "3.5.1"
 rustfft = "6.4.1"
 png = "0.18.1"
+# Already in the tree under epaint: the window measures text with it (egui
+# reports a line's width with its last glyph snapped to the pixel).
+ab_glyph = "0.2.32"
 i18n-embed = { version = "0.16.0", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10.1"
 rust-embed = "8.12.0"
+# "Clean a file": decoders for every format the page opens (pure Rust,
+# MPL-2.0) and the conversion to the engine's 48 kHz.
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "adpcm", "alac", "flac", "mp1", "mp2", "mp3", "pcm", "vorbis", "aiff", "caf", "isomp4", "mkv", "ogg", "wav"] }
+rubato = "0.16.2"
+# Opus input (Ogg, WebM, MKV) through libopus. Off by default (a plain
+# build needs no libopus; Opus files go through ffmpeg then); every package
+# builds with `--features hushmic/opus`. Release builds link libopus.a
+# (OPUS_LIB_STATIC=true), distro builds the system's libopus.
+symphonia-adapter-libopus = { version = "0.2.9", default-features = false, optional = true }
+# Save without ffmpeg: FLAC in pure Rust, written as it is mixed.
+flacenc = { version = "0.5.1", default-features = false }
+# The engine for the file pass, the same crate and native runtime the
+# plugin runs.
+hushmic-denoiser = { path = "../hushmic-denoiser", version = "0.11.0", features = ["native"] }
+
+[features]
+opus = ["dep:symphonia-adapter-libopus"]
+# HushMic Speakers, the output that cleans what apps play: its page,
+# commands, settings and chain. Off by default: a build without it has
+# none of them, and leaves a `[speakers]` section in the config as it is.
+speakers = []
+# End-to-end test seams, never in a release build: HUSHMIC_FAKE_FILE_WORKER
+# makes the Files page's workers fake their cleaning.
+test-seams = []
 
 [dev-dependencies]
-# UI harness tests for the A/B window (Tier-A: queries + clicks only, no
-# snapshot/wgpu features). kittest queries the accesskit tree, so TEST
-# builds re-enable eframe's accesskit (release builds stay without it —
-# see the eframe dependency note).
+# UI harness tests for the window's pages (Tier-A: queries + clicks only, no
+# snapshot/wgpu features); kittest queries the accesskit tree.
 egui_kittest = "0.33"
-eframe = { version = "0.33.3", default-features = false, features = ["accesskit"] }
 # Direct .ftl parsing for the catalog sanity test (already in the tree via
 # fluent-bundle).
 fluent-syntax = "0.12"
+# The fake portal in tests/shortcuts_portal.rs serves from its own runtime.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 
 # .deb BUILD PROCEDURE (must match the AUR PKGBUILD's path-bake): the packaged
 # plugin .so bakes its compile-time default model/dylib paths from the build env,
@@ -73,10 +116,26 @@ fluent-syntax = "0.12"
 maintainer = "Fovty <38868829+Fovty@users.noreply.github.com>"
 copyright = "2026, hushmic, MIT OR Apache-2.0"
 license-file = ["../../LICENSE-MIT", "0"]
-extended-description = "Real-time microphone noise suppression as a system-wide virtual microphone (DPDFNet via PipeWire)."
+# The synopsis is `description` above; this is the paragraph under it.
+extended-description = """HushMic removes keyboard clatter, fans and background chatter from your voice while you talk. It adds a microphone called HushMic that you pick in Zoom, Google Meet, Teams, Discord, OBS or your browser. It can also clean recordings you already have. The DPDFNet model runs on your processor, and your audio never leaves the computer."""
 section = "sound"
 priority = "optional"
+# libopus is linked in statically (packaging/build-release.sh). Every one of
+# these exists under this name on Ubuntu 22.04 and 24.04, Debian 12 and 13
+# and Mint 21 and 22 (pipewire-bin carries the pw-* tools HushMic runs). On
+# Ubuntu 22.04 and Mint 21, whose desktops run pipewire-media-session, apt
+# needs `wireplumber pipewire-media-session-` on the same command line
+# (docs/install.md); wireplumber stays a hard dependency, as the CI tests it.
 depends = "$auto, hicolor-icon-theme, pipewire, pipewire-bin, pipewire-pulse, wireplumber"
+# ffmpeg: Save writes the original's format and keeps a video's picture;
+# without it Save writes FLAC and a video keeps its sound only.
+# pipewire-audio (Debian 12 and 13, Ubuntu 24.04, Mint 22; none on 22.04,
+# where apt skips it): the distro's whole PipeWire audio stack, which takes
+# PulseAudio's place where PulseAudio still serves the desktop (apt lists
+# its removal and asks); without it apps talking to PulseAudio never see
+# HushMic's microphone. A recommendation, so --no-install-recommends keeps
+# PulseAudio.
+recommends = "ffmpeg, pipewire-audio"
 assets = [
   ["../../target/release/hushmic", "usr/bin/", "755"],
   ["../../target/release/libdpdfnet_ladspa.so", "usr/lib/ladspa/", "644"],
@@ -87,10 +146,22 @@ assets = [
   ["../../assets/models/dpdfnet8_48khz_hr.weights.f32", "usr/share/hushmic/models/", "644"],
   ["../../assets/models/dpdfnet2_48khz_hr.weights.f32", "usr/share/hushmic/models/", "644"],
   ["../../packaging/hushmic.desktop", "usr/share/applications/", "644"],
+  ["../../packaging/hushmic-clean.desktop", "usr/share/applications/", "644"],
   # User unit (not the `systemd-units` key: that generates SYSTEM-unit
   # maintainer scripts). Enabled per user with `systemctl --user enable`.
   ["../../packaging/systemd/hushmic.service", "usr/lib/systemd/user/", "644"],
-  ["../../packaging/hushmic-256.png", "usr/share/icons/hicolor/256x256/apps/hushmic.png", "644"],
+  # App icon at every hicolor size plus scalable/, listed per file like the
+  # tray ladder below.
+  ["../../packaging/tray/hicolor/16x16/apps/hushmic.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+  ["../../packaging/tray/hicolor/22x22/apps/hushmic.png", "usr/share/icons/hicolor/22x22/apps/", "644"],
+  ["../../packaging/tray/hicolor/24x24/apps/hushmic.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+  ["../../packaging/tray/hicolor/32x32/apps/hushmic.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+  ["../../packaging/tray/hicolor/48x48/apps/hushmic.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+  ["../../packaging/tray/hicolor/64x64/apps/hushmic.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+  ["../../packaging/tray/hicolor/128x128/apps/hushmic.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+  ["../../packaging/tray/hicolor/256x256/apps/hushmic.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+  ["../../packaging/tray/hicolor/512x512/apps/hushmic.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+  ["../../packaging/tray/hicolor/scalable/apps/hushmic.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
   # Tray status-icon ladder (five SNI names x eight sizes): explicit per-file
   # entries (no globs) so a missing size or state fails the packaging step
   # instead of silently shipping an incomplete ladder.

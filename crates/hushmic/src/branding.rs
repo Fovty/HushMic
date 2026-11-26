@@ -1,9 +1,9 @@
 //! Shared brand assets: the embedded product logo and its decode into an
-//! egui window icon. Used by every eframe window (A/B test, About) so the
-//! binary stays self-contained — no icon-theme lookup at runtime.
+//! egui window icon. Used by the window so the binary stays
+//! self-contained — no icon-theme lookup at runtime.
 
-// The packaging icon used everywhere else (desktop file, .deb hicolor
-// install), embedded at compile time.
+// The app icon at 256 px (packaging/tray/make-icons.py draws it with the
+// hicolor ladder the packages install), embedded at compile time.
 const ICON_PNG: &[u8] = include_bytes!("../../../packaging/hushmic-256.png");
 
 /// Decode an embedded 8-bit RGBA PNG. Any decode surprise yields None.
@@ -101,9 +101,10 @@ mod tests {
                 assert!(matches!(*w, 22 | 48), "{name}: {w}");
                 assert_eq!(w, h);
                 assert_eq!(rgba.len(), (*w as usize) * (*h as usize) * 4);
-                // A real glyph, not a blank canvas.
+                // A real glyph, not a blank canvas (off, the faintest, draws
+                // the mark at 60 %).
                 assert!(
-                    rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 200),
+                    rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 128),
                     "{name}"
                 );
             }

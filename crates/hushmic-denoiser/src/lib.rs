@@ -30,6 +30,7 @@
 mod attn;
 mod denoiser;
 mod error;
+mod hold;
 mod mode;
 mod model;
 #[cfg(feature = "native")]

@@ -2,12 +2,13 @@
 // is kept intentionally as forward-compat across ksni versions.
 #![allow(clippy::needless_update)]
 
+use crate::appstate::{AppState, JobState, Mode, Phase};
 use crate::config::{ActiveProfile, Config, TrayIcon};
 use crate::controller::RunMode;
 use crate::diagnostics::EngineTier;
 use crate::pipewire::Source;
 use crate::tr;
-use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{MenuItem, Tray};
 use std::sync::mpsc::Sender;
 
@@ -17,15 +18,163 @@ pub enum TrayCmd {
     /// `None` = Off, the existing tear-the-chain-down disable path.
     SetMode(Option<RunMode>),
     SelectMic(Option<String>),
-    SelectModel(String),
     SetAttn(f32),
-    SetDefaultToggle(bool),
-    SetAutostart(bool),
-    TestMic,
-    /// Open the compositor's shortcut-binding dialog (portal BindShortcuts).
-    SetupShortcuts,
-    About,
+    /// "Open HushMic" (and a left click on the icon): the window.
+    Open,
+    /// "Show" on "3 recordings cleaned.": the window, on Files.
+    OpenFiles,
     Quit,
+    /// "Quit HushMic" in the menu: quits, unless files are cleaning or an
+    /// app uses HushMic, when the window asks first (a tray menu has no
+    /// dialogs).
+    AskQuit,
+    /// "Turn off HushMic" in the menu: turns off, unless an app uses
+    /// HushMic, when the window asks first.
+    AskOff,
+}
+
+/// The tray's status line: shown on top of the menu only when something
+/// is unusual (the mode radio says the normal states).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrayNotice {
+    /// Should run and does not (or PipeWire is unreachable).
+    Attention,
+    /// The watchdog is bringing the microphone back.
+    Reconnecting,
+    /// The chosen microphone (its display name) is not plugged in, and
+    /// none stands in: apps hear nothing.
+    Unplugged(String),
+    /// The chosen microphone is not plugged in and another (the second
+    /// name) stands in: apps hear it, cleaned.
+    StandIn(String, String),
+    /// The microphone (its display name) sends no sound to an app.
+    Silent(String),
+    /// The engine fell back to passthrough.
+    Unfiltered,
+    /// The engine fell back to the light model.
+    Light,
+}
+
+/// The status line for a snapshot, if any; the most pressing one wins.
+pub fn notice_for(s: &AppState) -> Option<TrayNotice> {
+    if s.mode == Mode::Off {
+        return None;
+    }
+    if !s.pipewire.reachable || s.engine.phase == Phase::Down {
+        return Some(TrayNotice::Attention);
+    }
+    if s.engine.phase == Phase::Reconnecting {
+        return Some(TrayNotice::Reconnecting);
+    }
+    if let Some(d) = s
+        .mic
+        .devices
+        .iter()
+        .find(|d| !d.present && s.mic.selected.as_deref() == Some(d.name.as_str()))
+    {
+        // a stand-in counts only when it is another microphone that is
+        // there and has a name (as Live's, UX panel round 2, A15)
+        let standin = s
+            .mic
+            .active
+            .as_deref()
+            .filter(|a| s.mic.fallback && *a != d.name)
+            .and_then(|a| s.mic.devices.iter().find(|x| x.name == a && x.present))
+            .map(|x| x.description.clone())
+            .filter(|x| !x.trim().is_empty());
+        return Some(match standin {
+            Some(other) => TrayNotice::StandIn(d.description.clone(), other),
+            None => TrayNotice::Unplugged(d.description.clone()),
+        });
+    }
+    if s.mic.silent {
+        let mic = s
+            .mic
+            .active
+            .as_deref()
+            .and_then(|m| s.description_of(m))
+            .unwrap_or_default()
+            .to_string();
+        return Some(TrayNotice::Silent(mic));
+    }
+    if s.mode != Mode::Suppress || s.engine.phase != Phase::Ready {
+        return None;
+    }
+    match s.engine.tier {
+        Some(EngineTier::Passthrough) => Some(TrayNotice::Unfiltered),
+        Some(EngineTier::Light) if !s.engine.configured_light => Some(TrayNotice::Light),
+        _ => None,
+    }
+}
+
+/// What the tray shows from the window's snapshot: the status line and the
+/// names the Microphone submenu needs beyond the device list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayExtras {
+    pub notice: Option<TrayNotice>,
+    /// What "System default" stands for (display name).
+    pub default_name: Option<String>,
+    /// The chosen microphone's display name while it is not plugged in.
+    pub absent_name: Option<String>,
+    /// Its place among the microphones (where it was last seen).
+    pub absent_slot: Option<usize>,
+    /// The name each microphone is listed by (node name, name): the
+    /// snapshot's, so same-name microphones are numbered as in the window.
+    pub mic_names: Vec<(String, String)>,
+    /// Files cleaning or waiting to, on the Files page.
+    pub cleaning: usize,
+    /// The apps using HushMic, named for a sentence ("Zoom", "Zoom and
+    /// Teams", "3 apps"); None: none.
+    pub apps: Option<String>,
+    /// The microphone HushMic cleans, by its display name.
+    pub mic: Option<String>,
+    /// The desktop's light or dark style as last seen: a switch makes the
+    /// host draw the icon again in the panel's new colours.
+    pub system_theme: Option<crate::appstate::Theme>,
+}
+
+impl TrayExtras {
+    pub fn of(s: &AppState) -> Self {
+        let name_of = |n: &str| {
+            s.mic
+                .devices
+                .iter()
+                .find(|d| d.name == n)
+                .map(|d| d.description.clone())
+        };
+        let absent = s
+            .mic
+            .devices
+            .iter()
+            .position(|d| !d.present && s.mic.selected.as_deref() == Some(d.name.as_str()));
+        TrayExtras {
+            notice: notice_for(s),
+            default_name: s.mic.system_default.as_deref().and_then(name_of),
+            absent_name: absent.map(|i| s.mic.devices[i].description.clone()),
+            absent_slot: absent,
+            mic_names: s
+                .mic
+                .devices
+                .iter()
+                .map(|d| (d.name.clone(), d.description.clone()))
+                .collect(),
+            cleaning: s
+                .files
+                .jobs
+                .iter()
+                .filter(|j| matches!(j.state, JobState::Waiting | JobState::Cleaning))
+                .count(),
+            apps: (!s.apps.using.is_empty()).then(|| crate::notify::name_apps(s.apps.using.iter())),
+            mic: s
+                .mic
+                .active
+                .as_deref()
+                .or(s.mic.selected.as_deref())
+                .and_then(|m| s.description_of(m))
+                .map(str::to_string),
+            system_theme: s.desktop.system_theme,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,27 +292,15 @@ fn sni_icon_name(status: TrayStatus, style: IconStyle, app_id: Option<&str>) -> 
 
 pub struct HushMicTray {
     pub cfg: Config,
-    /// Whose model and strength the Model and Strength radios show and
-    /// edit: the running chain's profile, not the defaults in `cfg`.
+    /// Whose strength the Strength radio shows and edits: the running
+    /// chain's profile, not the defaults in `cfg`.
     pub profile: ActiveProfile,
     pub mics: Vec<Source>,
     pub cmd_tx: Sender<TrayCmd>,
     pub status: TrayStatus,
-    /// A mic test is currently recording/playing (the menu item is disabled
-    /// while it runs; the main loop flips this via handle.update).
-    pub testing: bool,
-    /// The recovery fallback is engaged: the chain runs on the system
-    /// default while the preferred mic is unplugged. Only affects how the
-    /// missing-mic entry is labelled.
-    pub fallback_active: bool,
     /// The chain-alive processing mode (mirrors the Controller's). Only
     /// meaningful while `cfg.enabled`; the mode radio shows Off otherwise.
     pub mode: RunMode,
-    /// The GlobalShortcuts portal answered our probe (session up, events
-    /// flowing). Flipped by the main loop via handle.update; gates the
-    /// "Set up shortcuts…" entry the way can_set_default gates the
-    /// default-mic checkbox — hidden, not explained.
-    pub shortcuts_available: bool,
     /// The engine tier the chain reports (issue #14); shown in the title
     /// while suppressing, where a fallback is audible.
     pub engine: Option<EngineTier>,
@@ -175,56 +312,87 @@ pub struct HushMicTray {
     /// a property call. The main loop refreshes it with the rest of the
     /// state, which is what makes `config set tray_icon` land at once.
     pub icon_style: IconStyle,
+    /// The status line and the device names, from the window's snapshot;
+    /// the main loop pushes them when they change.
+    pub extras: TrayExtras,
 }
 
-// The option tables hold ids/values only; labels come from the catalog via
-// the match functions below (the message lookup needs literal keys).
-const MODELS: &[&str] = &["dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr"];
-const ATTN_PRESETS: &[f32] = &[100.0, 24.0, 12.0, 6.0];
+/// The Strength submenu, weakest first: attenuation limits in dB (100 =
+/// no limit). Labels come from [`strength_label`] (the message lookup
+/// needs literal keys).
+const STRENGTHS: &[f32] = &[6.0, 12.0, 24.0, 100.0];
+
+fn strength_label(idx: usize) -> String {
+    match idx {
+        0 => tr!("tray-strength-gentle"),
+        1 => tr!("tray-strength-medium"),
+        2 => tr!("tray-strength-strong"),
+        _ => tr!("tray-strength-maximum"),
+    }
+}
 
 impl HushMicTray {
-    /// The model radio shows the CONFIGURED model as selected; when the
-    /// chain is running a different tier right now (issue #14), the tier in
-    /// use says so on its own line, and passthrough on the selected one.
-    fn model_item_label(&self, id: &str) -> String {
-        let base = model_label(id);
-        if self.status != TrayStatus::Active {
-            return base;
+    /// The chain runs, suppressing, without its model: the icon says what
+    /// the call hears (raw voice), as bypass does.
+    fn unfiltered(&self) -> bool {
+        self.status == TrayStatus::Active && self.engine == Some(EngineTier::Passthrough)
+    }
+
+    fn shown_status(&self) -> TrayStatus {
+        if self.unfiltered() {
+            return TrayStatus::Bypass;
         }
-        let light_in_use = self.engine == Some(EngineTier::Light) && !self.engine_light_configured;
-        let is_light = id.starts_with("dpdfnet2");
-        // Which entry describes what the chain actually loaded: the
-        // running chain's own model (`engine_light_configured`), which a
-        // fresh profile edit can briefly be ahead of.
-        let running = is_light == self.engine_light_configured;
-        match self.engine {
-            Some(EngineTier::Passthrough) if running => {
-                format!("{base} {}", tr!("tray-model-now-passthrough"))
-            }
-            Some(EngineTier::Light) if light_in_use && is_light => {
-                format!("{base} {}", tr!("tray-model-now-light"))
-            }
-            _ => base,
+        // the attention badge (red) only while apps hear nothing: an
+        // unplugged microphone with none standing in, or a silent one (UX
+        // panel B6). A stand-in keeps the calls clean: no badge, the
+        // status line says it (round 2, A4).
+        let badge = matches!(
+            self.extras.notice,
+            Some(TrayNotice::Unplugged(_) | TrayNotice::Silent(_))
+        );
+        if badge && self.status != TrayStatus::Off {
+            TrayStatus::Error
+        } else {
+            self.status
         }
     }
-}
 
-fn model_label(id: &str) -> String {
-    match id {
-        "dpdfnet2_48khz_hr" => tr!("tray-model-dpdfnet2"),
-        _ => tr!("tray-model-dpdfnet8"),
+    /// The tooltip (UX panel B6): "HushMic: on · Zoom · Jabra headset",
+    /// the state, who uses it, and the microphone.
+    fn tip(&self) -> String {
+        let state = match self.status {
+            TrayStatus::Off => tr!("tray-tip-off"),
+            TrayStatus::Mute => tr!("tray-tip-muted"),
+            TrayStatus::Bypass => tr!("tray-tip-bypass"),
+            TrayStatus::Error => tr!("tray-tip-attention"),
+            TrayStatus::Active if self.unfiltered() => tr!("tray-tip-unfiltered"),
+            TrayStatus::Active => tr!("tray-tip-on"),
+        };
+        let mut parts = vec![tr!("tray-tip", state = state)];
+        if self.status != TrayStatus::Off {
+            parts.extend(self.extras.apps.clone());
+            parts.extend(self.extras.mic.clone());
+        }
+        parts.join(" · ")
     }
-}
 
-fn attn_label(v: f32) -> String {
-    if (v - 24.0).abs() < 0.5 {
-        tr!("tray-attn-strong")
-    } else if (v - 12.0).abs() < 0.5 {
-        tr!("tray-attn-medium")
-    } else if (v - 6.0).abs() < 0.5 {
-        tr!("tray-attn-light")
-    } else {
-        tr!("tray-attn-maximum")
+    fn status_text(&self) -> Option<String> {
+        Some(match self.extras.notice.as_ref()? {
+            TrayNotice::Attention => tr!("tray-status-attention"),
+            TrayNotice::Reconnecting => tr!("tray-status-reconnecting"),
+            TrayNotice::Unplugged(device) => tr!("tray-status-unplugged", device = device.as_str()),
+            TrayNotice::StandIn(device, other) => tr!(
+                "tray-status-standin",
+                device = device.as_str(),
+                standin = other.as_str()
+            ),
+            TrayNotice::Silent(mic) if mic.is_empty() => {
+                tr!("tray-status-silent", mic = tr!("notify-your-mic"))
+            }
+            TrayNotice::Silent(mic) => tr!("tray-status-silent", mic = mic.as_str()),
+            TrayNotice::Unfiltered => tr!("tray-status-unfiltered"),
+            TrayNotice::Light => tr!("tray-status-light"),
+        })
     }
 }
 
@@ -236,9 +404,9 @@ impl Tray for HushMicTray {
         match self.status {
             TrayStatus::Bypass => tr!("tray-title-bypass"),
             TrayStatus::Mute => tr!("tray-title-muted"),
-            TrayStatus::Error => tr!("tray-title-error"),
+            TrayStatus::Error => tr!("tray-title-attention"),
             TrayStatus::Active => match self.engine {
-                Some(EngineTier::Passthrough) => tr!("tray-title-passthrough"),
+                Some(EngineTier::Passthrough) => tr!("tray-title-unfiltered"),
                 Some(EngineTier::Light) if !self.engine_light_configured => {
                     tr!("tray-title-light")
                 }
@@ -247,9 +415,15 @@ impl Tray for HushMicTray {
             TrayStatus::Off => tr!("tray-title"),
         }
     }
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: self.tip(),
+            ..Default::default()
+        }
+    }
     fn icon_name(&self) -> String {
         sni_icon_name(
-            self.status,
+            self.shown_status(),
             self.icon_style,
             crate::sandbox::flatpak_app_id(),
         )
@@ -267,7 +441,7 @@ impl Tray for HushMicTray {
         // whatever `tray_icon` says: a pixmap is pixels, so nothing on the
         // host side could recolor a symbolic one for the panel it lands on.
         // Hosts prefer IconName whenever it resolves.
-        crate::branding::tray_icon_rgba(self.status.icon_name())
+        crate::branding::tray_icon_rgba(self.shown_status().icon_name())
             .into_iter()
             .map(|(w, h, mut data)| {
                 // RGBA -> the SNI spec's network-order ARGB32.
@@ -280,38 +454,71 @@ impl Tray for HushMicTray {
                     data,
                 }
             })
+            // A switch of the desktop's light or dark style changes the
+            // pixmaps by one clear pixel, so the host is told the icon
+            // changed and draws the named one again in the panel's new
+            // colours (Plasma kept the old colour until a restart).
+            .chain(
+                (self.extras.system_theme == Some(crate::appstate::Theme::Light)).then(|| {
+                    ksni::Icon {
+                        width: 1,
+                        height: 1,
+                        data: vec![0; 4],
+                    }
+                }),
+            )
             .collect()
+    }
+
+    /// A left click, where the host sends Activate: the window.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.cmd_tx.send(TrayCmd::Open);
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         // mic radio: index 0 = "System default", then each real source
         let mut mic_opts = vec![RadioItem {
-            label: tr!("tray-system-default"),
+            label: match &self.extras.default_name {
+                Some(device) => tr!("tray-system-default-named", device = device.as_str()),
+                None => tr!("tray-system-default"),
+            },
             ..Default::default()
         }];
-        mic_opts.extend(self.mics.iter().map(|m| RadioItem {
-            label: m.description.clone(),
-            ..Default::default()
+        mic_opts.extend(self.mics.iter().map(|m| {
+            RadioItem {
+                label: self
+                    .extras
+                    .mic_names
+                    .iter()
+                    .find(|(name, _)| *name == m.name)
+                    .map_or_else(|| m.description.clone(), |(_, shown)| shown.clone()),
+                ..Default::default()
+            }
         }));
         // A configured mic that is currently absent (unplugged USB device) must
         // not be displayed as "System default": the rendered conf still pins
-        // target.object to it. Show it truthfully as an extra, selected entry.
+        // target.object to it. Show it truthfully as an extra, selected entry,
+        // where it was last seen (else last).
         let missing_mic = match &self.cfg.mic {
             Some(name) if !self.mics.iter().any(|m| &m.name == name) => Some(name.clone()),
             _ => None,
         };
-        if let Some(name) = &missing_mic {
-            // Once recovery has switched the chain, say what it is actually
-            // doing; before that (or when recovery can't run), plain truth.
-            let suffix = if self.fallback_active {
-                tr!("tray-mic-unplugged")
-            } else {
-                tr!("tray-mic-unavailable")
-            };
-            mic_opts.push(RadioItem {
-                label: format!("{name} {suffix}"),
-                ..Default::default()
-            });
+        // Its radio index ("System default" is 0).
+        let absent_at = missing_mic.as_ref().map(|_| {
+            1 + self
+                .extras
+                .absent_slot
+                .map_or(self.mics.len(), |i| i.min(self.mics.len()))
+        });
+        if let (Some(name), Some(at)) = (&missing_mic, absent_at) {
+            let device = self.extras.absent_name.as_deref().unwrap_or(name);
+            mic_opts.insert(
+                at,
+                RadioItem {
+                    label: tr!("tray-mic-absent", device = device),
+                    ..Default::default()
+                },
+            );
         }
         let mic_selected = match &self.cfg.mic {
             None => 0,
@@ -320,18 +527,17 @@ impl Tray for HushMicTray {
                 .iter()
                 .position(|m| &m.name == name)
                 .map(|i| i + 1)
-                .unwrap_or(self.mics.len() + 1), // the "(unavailable)" entry
+                .or(absent_at)
+                .unwrap_or(0),
         };
         let mics_for_select = self.mics.clone();
 
-        let model_selected = MODELS
-            .iter()
-            .position(|id| *id == self.profile.model)
-            .unwrap_or(0);
-        let attn_selected = ATTN_PRESETS
+        // A strength set elsewhere (18 dB from the CLI) selects nothing:
+        // an index past the end checks no entry.
+        let strength_selected = STRENGTHS
             .iter()
             .position(|v| (*v - self.profile.attn_limit).abs() < 0.5)
-            .unwrap_or(0);
+            .unwrap_or(STRENGTHS.len());
 
         let mode_selected = if !self.cfg.enabled {
             3
@@ -343,58 +549,71 @@ impl Tray for HushMicTray {
             }
         };
 
-        vec![
+        let mut items: Vec<MenuItem<Self>> = Vec::new();
+        // The status line: only while something is unusual (the mode
+        // radio already says the usual states).
+        let cleaning = (self.extras.cleaning > 0)
+            .then(|| tr!("tray-status-cleaning", count = self.extras.cleaning));
+        let lines: Vec<String> = self.status_text().into_iter().chain(cleaning).collect();
+        for text in &lines {
+            items.push(
+                StandardItem {
+                    label: text.clone(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if !lines.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        items.extend([
             StandardItem {
-                label: if self.testing {
-                    tr!("tray-test-running")
-                } else {
-                    tr!("tray-test-mic")
-                },
-                icon_name: "audio-input-microphone".into(),
-                enabled: !self.testing,
+                label: tr!("tray-open"),
                 activate: Box::new(|t: &mut Self| {
-                    let _ = t.cmd_tx.send(TrayCmd::TestMic);
+                    let _ = t.cmd_tx.send(TrayCmd::Open);
                 }),
                 ..Default::default()
             }
             .into(),
-            SubMenu {
-                label: tr!("tray-mode"),
-                submenu: vec![RadioGroup {
-                    selected: mode_selected,
-                    select: Box::new(|t: &mut Self, idx| {
-                        let sel = match idx {
-                            0 => Some(RunMode::Suppress),
-                            1 => Some(RunMode::Bypass),
-                            2 => Some(RunMode::Mute),
-                            _ => None, // Off
-                        };
-                        // Optimistic local update, same pattern as the other
-                        // items; the main loop pushes authoritative state back.
-                        match sel {
-                            Some(m) => {
-                                t.cfg.enabled = true;
-                                t.mode = m;
-                            }
-                            None => t.cfg.enabled = false,
+            MenuItem::Separator,
+            RadioGroup {
+                selected: mode_selected,
+                select: Box::new(|t: &mut Self, idx| {
+                    let sel = match idx {
+                        0 => Some(RunMode::Suppress),
+                        1 => Some(RunMode::Bypass),
+                        2 => Some(RunMode::Mute),
+                        _ => None, // Off
+                    };
+                    // Optimistic local update, same pattern as the other
+                    // items; the main loop pushes authoritative state back.
+                    // Off may be asked about first (an app uses HushMic):
+                    // it shows once it happens.
+                    match sel {
+                        Some(m) => {
+                            t.cfg.enabled = true;
+                            t.mode = m;
+                            let _ = t.cmd_tx.send(TrayCmd::SetMode(sel));
                         }
-                        let _ = t.cmd_tx.send(TrayCmd::SetMode(sel));
-                    }),
-                    options: [
-                        tr!("tray-mode-suppress"),
-                        tr!("tray-mode-bypass"),
-                        tr!("tray-mode-mute"),
-                        tr!("tray-mode-off"),
-                    ]
-                    .into_iter()
-                    .map(|label| RadioItem {
-                        label,
-                        ..Default::default()
-                    })
-                    .collect(),
+                        None => {
+                            let _ = t.cmd_tx.send(TrayCmd::AskOff);
+                        }
+                    }
+                }),
+                options: [
+                    tr!("tray-mode-suppress"),
+                    tr!("tray-mode-bypass"),
+                    tr!("tray-mode-mute"),
+                    tr!("tray-mode-off"),
+                ]
+                .into_iter()
+                .map(|label| RadioItem {
+                    label,
                     ..Default::default()
-                }
-                .into()],
+                })
+                .collect(),
                 ..Default::default()
             }
             .into(),
@@ -404,15 +623,19 @@ impl Tray for HushMicTray {
                 submenu: vec![RadioGroup {
                     selected: mic_selected,
                     select: Box::new(move |t: &mut Self, idx| {
-                        let pick = if idx == 0 {
-                            None
-                        } else {
-                            match mics_for_select.get(idx - 1) {
+                        let pick = match (idx, absent_at) {
+                            (0, _) => None,
+                            // the "· unplugged" entry: already selected,
+                            // nothing to change
+                            (i, Some(at)) if i == at => return,
+                            (i, Some(at)) if i > at => match mics_for_select.get(i - 2) {
                                 Some(m) => Some(m.name.clone()),
-                                // the trailing "(unavailable)" entry: already
-                                // selected, nothing to change
                                 None => return,
-                            }
+                            },
+                            (i, _) => match mics_for_select.get(i - 1) {
+                                Some(m) => Some(m.name.clone()),
+                                None => return,
+                            },
                         };
                         t.cfg.mic = pick.clone();
                         let _ = t.cmd_tx.send(TrayCmd::SelectMic(pick));
@@ -425,114 +648,37 @@ impl Tray for HushMicTray {
             }
             .into(),
             SubMenu {
-                label: tr!("tray-model"),
+                label: tr!("tray-strength-menu"),
                 submenu: vec![RadioGroup {
-                    selected: model_selected,
+                    selected: strength_selected,
                     select: Box::new(|t: &mut Self, idx| {
-                        let id = MODELS[idx].to_string();
-                        t.profile.model = id.clone();
-                        let _ = t.cmd_tx.send(TrayCmd::SelectModel(id));
-                    }),
-                    options: MODELS
-                        .iter()
-                        .map(|id| RadioItem {
-                            label: self.model_item_label(id),
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                }
-                .into()],
-                ..Default::default()
-            }
-            .into(),
-            SubMenu {
-                label: tr!("tray-strength"),
-                submenu: vec![RadioGroup {
-                    selected: attn_selected,
-                    select: Box::new(|t: &mut Self, idx| {
-                        let v = ATTN_PRESETS[idx];
+                        let v = STRENGTHS[idx];
                         t.profile.attn_limit = v;
                         let _ = t.cmd_tx.send(TrayCmd::SetAttn(v));
                     }),
-                    options: ATTN_PRESETS
-                        .iter()
-                        .map(|v| RadioItem {
-                            label: attn_label(*v),
+                    options: (0..STRENGTHS.len())
+                        .map(|i| RadioItem {
+                            label: strength_label(i),
                             ..Default::default()
                         })
                         .collect(),
                     ..Default::default()
                 }
                 .into()],
-                ..Default::default()
-            }
-            .into(),
-            CheckmarkItem {
-                label: tr!("tray-set-default"),
-                checked: self.cfg.set_default,
-                // Hidden where changing the system default is impossible (a
-                // sandbox without Manager access — see
-                // pipewire::can_set_default): a checkbox whose click
-                // silently does nothing is worse than no checkbox.
-                visible: crate::pipewire::can_set_default(),
-                activate: Box::new(|t: &mut Self| {
-                    t.cfg.set_default = !t.cfg.set_default;
-                    let _ = t.cmd_tx.send(TrayCmd::SetDefaultToggle(t.cfg.set_default));
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                // Before setup: the compositor's bind dialog. After: its
-                // shortcut editor (ConfigureShortcuts) — the bind dialog
-                // only ever shows for unconfigured shortcuts, so the label
-                // must promise what the click actually does.
-                label: if self.cfg.shortcuts_setup {
-                    tr!("tray-shortcuts-change")
-                } else {
-                    tr!("tray-shortcuts-setup")
-                },
-                // The compositor owns the keys and the dialog; this entry
-                // only opens it. Hidden while the portal has not answered
-                // (no GlobalShortcuts on this desktop, or it is down).
-                visible: self.shortcuts_available,
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.cmd_tx.send(TrayCmd::SetupShortcuts);
-                }),
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
-            CheckmarkItem {
-                label: tr!("tray-autostart"),
-                checked: self.cfg.autostart,
-                activate: Box::new(|t: &mut Self| {
-                    t.cfg.autostart = !t.cfg.autostart;
-                    let _ = t.cmd_tx.send(TrayCmd::SetAutostart(t.cfg.autostart));
-                }),
-                ..Default::default()
-            }
-            .into(),
             StandardItem {
-                label: tr!("tray-about"),
-                icon_name: "help-about".into(),
+                label: tr!("tray-quit-hushmic"),
                 activate: Box::new(|t: &mut Self| {
-                    let _ = t.cmd_tx.send(TrayCmd::About);
+                    let _ = t.cmd_tx.send(TrayCmd::AskQuit);
                 }),
                 ..Default::default()
             }
             .into(),
-            StandardItem {
-                label: tr!("tray-quit"),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.cmd_tx.send(TrayCmd::Quit);
-                }),
-                ..Default::default()
-            }
-            .into(),
-        ]
+        ]);
+        items
     }
 }
 
@@ -719,7 +865,7 @@ mod tests {
 
     #[test]
     fn the_tray_hands_the_host_its_resolved_style() {
-        let mut tray = test_tray(false);
+        let mut tray = test_tray();
         tray.status = TrayStatus::Active;
         assert_eq!(tray.icon_name(), "hushmic-tray");
         tray.icon_style = IconStyle::Symbolic;
@@ -729,14 +875,95 @@ mod tests {
     }
 
     #[test]
+    fn the_tooltip_says_the_state_the_apps_and_the_mic() {
+        use crate::appstate::mock::{state, Scenario};
+        let mut tray = test_tray();
+        tray.status = TrayStatus::Active;
+        let mut s = state(Scenario::OnInCall);
+        s.apps.using.truncate(1);
+        tray.extras = TrayExtras::of(&s);
+        let app = s.apps.using[0].name.clone().unwrap();
+        let mic = s
+            .description_of(s.mic.active.as_deref().unwrap())
+            .unwrap()
+            .to_owned();
+        assert_eq!(tray.tip(), format!("HushMic: on · {app} · {mic}"));
+        tray.status = TrayStatus::Mute;
+        assert!(tray.tip().starts_with("HushMic: muted · "));
+        tray.status = TrayStatus::Bypass;
+        assert!(tray.tip().starts_with("HushMic: noise suppression off · "));
+        tray.status = TrayStatus::Off;
+        assert_eq!(tray.tip(), "HushMic: off", "off: nothing else to say");
+        // no app: the state and the mic
+        tray.status = TrayStatus::Active;
+        tray.extras.apps = None;
+        assert_eq!(tray.tip(), format!("HushMic: on · {mic}"));
+        assert_eq!(tray.tool_tip().title, tray.tip());
+    }
+
+    #[test]
+    fn an_unplugged_or_silent_mic_badges_the_icon() {
+        let mut tray = test_tray();
+        tray.status = TrayStatus::Active;
+        let on = tray.icon_name();
+        for notice in [
+            TrayNotice::Unplugged("RODE NT-USB".into()),
+            TrayNotice::Silent("RODE NT-USB".into()),
+        ] {
+            tray.extras.notice = Some(notice.clone());
+            assert_eq!(tray.shown_status(), TrayStatus::Error, "{notice:?}");
+            assert_ne!(tray.icon_name(), on);
+            // the title still says the state; the status line says why
+            assert_eq!(tray.title(), "HushMic");
+        }
+        // another microphone stands in: the calls are clean, no red
+        // (UX panel round 2, A4)
+        tray.extras.notice = Some(TrayNotice::StandIn("RODE NT-USB".into(), "Jabra".into()));
+        assert_eq!(tray.shown_status(), TrayStatus::Active);
+        assert_eq!(tray.icon_name(), on);
+        assert_eq!(
+            tray.status_text().unwrap(),
+            "RODE NT-USB unplugged · using Jabra"
+        );
+        // off stays off
+        tray.status = TrayStatus::Off;
+        assert_eq!(tray.shown_status(), TrayStatus::Off);
+        // a light model or reconnecting is no badge
+        tray.status = TrayStatus::Active;
+        tray.extras.notice = Some(TrayNotice::Light);
+        assert_eq!(tray.shown_status(), TrayStatus::Active);
+    }
+
+    #[test]
+    fn a_theme_switch_tells_the_host_the_icon_changed() {
+        use crate::appstate::Theme;
+        let mut tray = test_tray();
+        tray.status = TrayStatus::Active;
+        tray.extras.system_theme = Some(Theme::Dark);
+        let dark = tray.icon_pixmap();
+        tray.extras.system_theme = Some(Theme::Light);
+        let light = tray.icon_pixmap();
+        assert_ne!(
+            dark.iter().map(|i| (i.width, i.height)).collect::<Vec<_>>(),
+            light
+                .iter()
+                .map(|i| (i.width, i.height))
+                .collect::<Vec<_>>(),
+            "the pixmaps differ, so ksni sends NewIcon"
+        );
+        // the drawn ones are the same
+        assert_eq!(dark.len() + 1, light.len());
+    }
+
+    #[test]
     fn title_reflects_status() {
-        let mut tray = test_tray(false);
+        let mut tray = test_tray();
         for (status, want) in [
             (TrayStatus::Active, "HushMic"),
             (TrayStatus::Off, "HushMic"),
-            (TrayStatus::Bypass, "HushMic (bypass)"),
+            (TrayStatus::Bypass, "HushMic (noise suppression off)"),
             (TrayStatus::Mute, "HushMic (muted)"),
-            (TrayStatus::Error, "HushMic (error)"),
+            (TrayStatus::Error, "HushMic (needs attention)"),
         ] {
             tray.status = status;
             assert_eq!(tray.title(), want, "{status:?}");
@@ -747,7 +974,7 @@ mod tests {
         tray.engine = Some(EngineTier::Light);
         assert_eq!(tray.title(), "HushMic (light model)");
         tray.engine = Some(EngineTier::Passthrough);
-        assert_eq!(tray.title(), "HushMic (passthrough)");
+        assert_eq!(tray.title(), "HushMic (noise suppression paused)");
         tray.status = TrayStatus::Mute;
         assert_eq!(tray.title(), "HushMic (muted)");
         tray.status = TrayStatus::Active;
@@ -756,99 +983,49 @@ mod tests {
         assert_eq!(tray.title(), "HushMic");
     }
 
-    fn model_labels(tray: &HushMicTray) -> Vec<String> {
-        tray.menu()
-            .iter()
-            .find_map(|i| match i {
-                MenuItem::SubMenu(s) if s.label == "Model" => Some(s),
-                _ => None,
-            })
-            .expect("Model submenu")
-            .submenu
-            .iter()
-            .find_map(|i| match i {
-                MenuItem::RadioGroup(g) => {
-                    Some(g.options.iter().map(|o| o.label.clone()).collect())
-                }
-                _ => None,
-            })
-            .expect("model radio group")
-    }
-
+    /// Unfiltered for now: the call hears raw voice, so the icon is the
+    /// bypass one (the board's tray), in the name and in the pixmaps.
     #[test]
-    fn model_menu_says_which_tier_runs_now() {
-        // The selection stays on the configured model; the entry in use
-        // says so while the chain is on another tier (issue #14).
-        let mut tray = test_tray(false);
-        tray.profile.model = "dpdfnet8_48khz_hr".into();
+    fn an_unfiltered_chain_shows_the_bypass_icon() {
+        let mut tray = test_tray();
         tray.status = TrayStatus::Active;
-        let plain = vec![
-            "High quality (dpdfnet8)".to_string(),
-            "Light / low-CPU (dpdfnet2)".to_string(),
-        ];
-        assert_eq!(model_labels(&tray), plain);
-        tray.engine = Some(EngineTier::Light);
-        assert_eq!(
-            model_labels(&tray),
-            vec![
-                "High quality (dpdfnet8)".to_string(),
-                "Light / low-CPU (dpdfnet2) (running now)".to_string(),
-            ]
-        );
         tray.engine = Some(EngineTier::Passthrough);
+        assert_eq!(tray.icon_name(), "hushmic-tray-bypass");
         assert_eq!(
-            model_labels(&tray),
-            vec![
-                "High quality (dpdfnet8) (paused, mic on without filtering)".to_string(),
-                "Light / low-CPU (dpdfnet2)".to_string(),
-            ]
+            tray.icon_pixmap().len(),
+            crate::branding::tray_icon_rgba("hushmic-tray-bypass").len()
         );
-        // Off or bypassed: nothing to annotate. Light configured: plain too.
-        tray.status = TrayStatus::Bypass;
-        assert_eq!(model_labels(&tray), plain);
-        tray.status = TrayStatus::Active;
-        tray.profile.model = "dpdfnet2_48khz_hr".into();
-        tray.engine = Some(EngineTier::Light);
-        tray.engine_light_configured = true;
-        assert_eq!(model_labels(&tray), plain);
-        // The selection ahead of the running chain (a model click, the
-        // restart still under way): passthrough pauses the model the chain
-        // actually loaded, so the light entry is the one that says so.
-        tray.profile.model = "dpdfnet8_48khz_hr".into();
+        tray.engine = Some(EngineTier::Quality);
+        assert_eq!(tray.icon_name(), "hushmic-tray");
+        // Muted stays muted whatever the engine does.
+        tray.status = TrayStatus::Mute;
         tray.engine = Some(EngineTier::Passthrough);
-        tray.engine_light_configured = true;
-        assert_eq!(
-            model_labels(&tray),
-            vec![
-                "High quality (dpdfnet8)".to_string(),
-                "Light / low-CPU (dpdfnet2) (paused, mic on without filtering)".to_string(),
-            ]
-        );
+        assert_eq!(tray.icon_name(), "hushmic-tray-mute");
     }
 
-    fn radio_selected(tray: &HushMicTray, submenu: &str) -> usize {
-        tray.menu()
+    fn submenu<'a>(menu: &'a [MenuItem<HushMicTray>], label: &str) -> &'a RadioGroup<HushMicTray> {
+        let sub = menu
             .iter()
             .find_map(|i| match i {
-                MenuItem::SubMenu(s) if s.label == submenu => Some(s),
+                MenuItem::SubMenu(s) if s.label == label => Some(s),
                 _ => None,
             })
-            .expect("submenu")
-            .submenu
-            .iter()
-            .find_map(|i| match i {
-                MenuItem::RadioGroup(g) => Some(g.selected),
-                _ => None,
-            })
-            .expect("radio group")
+            .unwrap_or_else(|| panic!("{label} submenu"));
+        match sub.submenu.first() {
+            Some(MenuItem::RadioGroup(g)) => g,
+            _ => panic!("{label} submenu must hold a radio group"),
+        }
     }
 
-    /// The reported bug: the defaults say light/24 dB, the RODE profile in
-    /// effect says quality/maximum — the radios must show the profile.
+    fn labels(g: &RadioGroup<HushMicTray>) -> Vec<String> {
+        g.options.iter().map(|o| o.label.clone()).collect()
+    }
+
+    /// The reported bug: the defaults say 24 dB, the RODE profile in
+    /// effect says maximum — the radio must show the profile.
     #[test]
-    fn radios_show_the_active_profile_not_the_defaults() {
-        let mut tray = test_tray(false);
-        tray.cfg.model = "dpdfnet2_48khz_hr".into();
+    fn strength_shows_the_active_profile_weakest_first() {
+        let mut tray = test_tray();
         tray.cfg.attn_limit = 24.0;
         tray.profile = ActiveProfile {
             device: Some("alsa_input.test".into()),
@@ -856,62 +1033,52 @@ mod tests {
             model: "dpdfnet8_48khz_hr".into(),
             attn_limit: 100.0,
         };
-        assert_eq!(radio_selected(&tray, "Model"), 0);
-        assert_eq!(radio_selected(&tray, "Suppression strength"), 0);
-        tray.profile.attn_limit = 12.0;
-        tray.profile.model = "dpdfnet2_48khz_hr".into();
-        assert_eq!(radio_selected(&tray, "Model"), 1);
-        assert_eq!(radio_selected(&tray, "Suppression strength"), 2);
+        let menu = tray.menu();
+        let g = submenu(&menu, "Strength");
+        assert_eq!(labels(g), ["Gentle", "Medium", "Strong", "Maximum"]);
+        assert_eq!(g.selected, 3);
+        tray.profile.attn_limit = 6.0;
+        assert_eq!(submenu(&tray.menu(), "Strength").selected, 0);
+        // A strength set elsewhere matches no entry: none is checked.
+        tray.profile.attn_limit = 18.0;
+        assert_eq!(submenu(&tray.menu(), "Strength").selected, STRENGTHS.len());
     }
 
     #[test]
-    fn model_and_strength_clicks_update_the_profile_shown() {
-        crate::i18n::pin_english();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut tray = test_tray(false);
-        tray.cmd_tx = tx;
-        let defaults = (tray.cfg.model.clone(), tray.cfg.attn_limit);
-        for (menu, idx) in [("Model", 1), ("Suppression strength", 1)] {
-            let items = tray.menu();
-            let sub = items
-                .iter()
-                .find_map(|i| match i {
-                    MenuItem::SubMenu(s) if s.label == menu => Some(s),
-                    _ => None,
-                })
-                .unwrap();
-            let MenuItem::RadioGroup(g) = &sub.submenu[0] else {
-                panic!("radio group")
-            };
-            (g.select)(&mut tray, idx);
-        }
-        assert_eq!(tray.profile.model, "dpdfnet2_48khz_hr");
+    fn a_strength_click_updates_the_profile_shown_not_the_defaults() {
+        let (mut tray, rx) = tray_with_rx();
+        let defaults = tray.cfg.attn_limit;
+        let menu = tray.menu();
+        (submenu(&menu, "Strength").select)(&mut tray, 2);
         assert_eq!(tray.profile.attn_limit, 24.0);
-        assert_eq!((tray.cfg.model.clone(), tray.cfg.attn_limit), defaults);
-        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SelectModel(m)) if m == "dpdfnet2_48khz_hr"));
+        assert_eq!(tray.cfg.attn_limit, defaults);
         assert!(matches!(rx.try_recv(), Ok(TrayCmd::SetAttn(v)) if v == 24.0));
+        assert!(rx.try_recv().is_err(), "exactly one command per activation");
     }
 
     fn mode_radio(menu: &[MenuItem<HushMicTray>]) -> &RadioGroup<HushMicTray> {
-        // The mode radio lives in a "Mode" submenu right below "Test my
-        // mic…", matching the Microphone/Model/strength submenu pattern.
-        let MenuItem::SubMenu(s) = &menu[1] else {
-            panic!("second menu item must be the Mode submenu");
-        };
-        assert_eq!(s.label, "Mode");
-        match s.submenu.first() {
-            Some(MenuItem::RadioGroup(g)) => g,
-            _ => panic!("Mode submenu must hold the mode radio group"),
-        }
+        menu.iter()
+            .find_map(|i| match i {
+                MenuItem::RadioGroup(g) => Some(g),
+                _ => None,
+            })
+            .expect("the mode radio sits in the top level")
     }
 
     #[test]
     fn mode_radio_labels_and_selection() {
-        let mut tray = test_tray(false); // Config::default() is enabled
+        let mut tray = test_tray(); // Config::default() is enabled
         let menu = tray.menu();
         let g = mode_radio(&menu);
-        let labels: Vec<&str> = g.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(labels, ["Noise suppression", "Bypass", "Mute", "Off"]);
+        assert_eq!(
+            labels(g),
+            [
+                "Noise suppression",
+                "Noise suppression off",
+                "Mute",
+                "Turn off HushMic"
+            ]
+        );
         assert_eq!(g.selected, 0, "enabled + Suppress selects the first entry");
 
         tray.mode = RunMode::Bypass;
@@ -926,22 +1093,8 @@ mod tests {
 
     #[test]
     fn mode_radio_select_sends_commands() {
-        crate::i18n::pin_english();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut tray = HushMicTray {
-            cfg: Config::default(),
-            profile: Config::default().profile_for(None),
-            mics: vec![],
-            cmd_tx: tx,
-            status: TrayStatus::Active,
-            testing: false,
-            fallback_active: false,
-            mode: RunMode::Suppress,
-            shortcuts_available: false,
-            engine: None,
-            engine_light_configured: false,
-            icon_style: IconStyle::Color,
-        };
+        let (mut tray, rx) = tray_with_rx();
+        tray.status = TrayStatus::Active;
         let menu = tray.menu();
         let g = mode_radio(&menu);
 
@@ -954,8 +1107,11 @@ mod tests {
         assert_eq!(tray.mode, RunMode::Mute, "optimistic local state update");
 
         (g.select)(&mut tray, 3);
-        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SetMode(None))));
-        assert!(!tray.cfg.enabled, "Off maps onto the disable path");
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::AskOff)));
+        // the daemon may ask first (an app uses HushMic): Off shows once
+        // it happens
+        assert!(tray.cfg.enabled, "no optimistic Off");
+        tray.cfg.enabled = false;
 
         // From Off, picking a chain-alive state re-enables with that mode.
         (g.select)(&mut tray, 1);
@@ -971,7 +1127,7 @@ mod tests {
     fn icon_theme_path_follows_the_env_var() {
         // Set + unset probed inside ONE test: the var is process-global and
         // the test harness runs tests on parallel threads.
-        let tray = test_tray(false);
+        let tray = test_tray();
         std::env::remove_var("HUSHMIC_TRAY_THEME_DIR");
         assert_eq!(tray.icon_theme_path(), "");
         std::env::set_var("HUSHMIC_TRAY_THEME_DIR", "/opt/hushmic/icons");
@@ -980,12 +1136,16 @@ mod tests {
         assert_eq!(tray.icon_theme_path(), "");
     }
 
-    fn test_tray(testing: bool) -> HushMicTray {
+    fn test_tray() -> HushMicTray {
+        tray_with_rx().0
+    }
+
+    fn tray_with_rx() -> (HushMicTray, std::sync::mpsc::Receiver<TrayCmd>) {
         // Labels are asserted in English; pin the catalog before the
         // process-global loader initializes lazily.
         crate::i18n::pin_english();
-        let (tx, _rx) = std::sync::mpsc::channel();
-        HushMicTray {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tray = HushMicTray {
             cfg: Config::default(),
             profile: Config::default().profile_for(None),
             mics: vec![Source {
@@ -994,240 +1154,269 @@ mod tests {
             }],
             cmd_tx: tx,
             status: TrayStatus::Off,
-            testing,
-            fallback_active: false,
             mode: RunMode::Suppress,
-            shortcuts_available: false,
             engine: None,
             engine_light_configured: false,
             icon_style: IconStyle::Color,
-        }
-    }
-
-    fn mic_labels(tray: &HushMicTray) -> Vec<String> {
-        tray.menu()
-            .iter()
-            .find_map(|i| match i {
-                MenuItem::SubMenu(s) if s.label == "Microphone" => Some(s),
-                _ => None,
-            })
-            .expect("Microphone submenu")
-            .submenu
-            .iter()
-            .find_map(|i| match i {
-                MenuItem::RadioGroup(g) => {
-                    Some(g.options.iter().map(|o| o.label.clone()).collect())
-                }
-                _ => None,
-            })
-            .expect("mic radio group")
+            extras: TrayExtras::default(),
+        };
+        (tray, rx)
     }
 
     #[test]
-    fn missing_mic_label_reflects_fallback_state() {
-        let mut tray = test_tray(false);
+    fn the_microphone_submenu_names_the_default_and_an_absent_choice() {
+        let mut tray = test_tray();
+        assert_eq!(
+            labels(submenu(&tray.menu(), "Microphone")),
+            ["System default", "Test Mic"]
+        );
+        tray.extras.default_name = Some("Built-in Audio".into());
+        assert_eq!(
+            labels(submenu(&tray.menu(), "Microphone"))[0],
+            "System default (Built-in Audio)"
+        );
+        // The chosen mic is unplugged: an extra entry, selected, by its
+        // display name once the snapshot knows it, else by node name.
         tray.cfg.mic = Some("alsa_input.rode".into());
-        // Not yet fallen back (or recovery can't run): plain truth.
-        let labels = mic_labels(&tray);
-        assert_eq!(
-            labels.last().map(String::as_str),
-            Some("alsa_input.rode (unavailable)")
-        );
-        // Fallback engaged: say what the chain is actually doing.
-        tray.fallback_active = true;
-        let labels = mic_labels(&tray);
-        assert_eq!(
-            labels.last().map(String::as_str),
-            Some("alsa_input.rode (unplugged — using system default)")
-        );
-        // A present mic never gets either suffix.
-        tray.cfg.mic = Some("alsa_input.test".into());
-        let labels = mic_labels(&tray);
-        assert!(
-            !labels
-                .iter()
-                .any(|l| l.contains("unavailable") || l.contains("unplugged")),
-            "{labels:?}"
-        );
-    }
-
-    fn mic_test_item(menu: &[MenuItem<HushMicTray>]) -> &StandardItem<HushMicTray> {
-        menu.iter()
-            .find_map(|i| match i {
-                MenuItem::Standard(s)
-                    if s.label.starts_with("Test my mic") || s.label.starts_with("Mic test") =>
-                {
-                    Some(s)
-                }
-                _ => None,
-            })
-            .expect("mic test item present")
-    }
-
-    #[test]
-    fn menu_builds_non_empty() {
-        let menu = test_tray(false).menu();
-        assert!(!menu.is_empty(), "tray menu should not be empty");
-    }
-
-    #[test]
-    fn mic_test_item_disables_while_running() {
-        let idle = test_tray(false).menu();
-        let item = mic_test_item(&idle);
-        assert_eq!(item.label, "Test my mic…");
-        assert!(item.enabled);
-
-        let busy = test_tray(true).menu();
-        let item = mic_test_item(&busy);
-        assert_eq!(item.label, "Mic test running…");
-        assert!(!item.enabled);
-    }
-
-    #[test]
-    fn mic_test_item_activate_sends_the_command() {
-        crate::i18n::pin_english();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut tray = HushMicTray {
-            cfg: Config::default(),
-            profile: Config::default().profile_for(None),
-            mics: vec![],
-            cmd_tx: tx,
-            status: TrayStatus::Off,
-            testing: false,
-            fallback_active: false,
-            mode: RunMode::Suppress,
-            shortcuts_available: false,
-            engine: None,
-            engine_light_configured: false,
-            icon_style: IconStyle::Color,
-        };
         let menu = tray.menu();
-        let item = mic_test_item(&menu);
-        (item.activate)(&mut tray);
-        assert!(
-            matches!(rx.try_recv(), Ok(TrayCmd::TestMic)),
-            "activating the item must send TrayCmd::TestMic"
-        );
-        assert!(rx.try_recv().is_err(), "exactly one command per activation");
-    }
-
-    #[test]
-    fn about_item_sits_above_quit_and_sends_the_command() {
-        crate::i18n::pin_english();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut tray = HushMicTray {
-            cfg: Config::default(),
-            profile: Config::default().profile_for(None),
-            mics: vec![],
-            cmd_tx: tx,
-            status: TrayStatus::Off,
-            testing: false,
-            fallback_active: false,
-            mode: RunMode::Suppress,
-            shortcuts_available: false,
-            engine: None,
-            engine_light_configured: false,
-            icon_style: IconStyle::Color,
-        };
-        let menu = tray.menu();
-        let pos = |label: &str| {
-            menu.iter()
-                .position(|i| matches!(i, MenuItem::Standard(s) if s.label == label))
-        };
-        let about = pos("About HushMic…").expect("About item present");
-        let quit = pos("Quit").expect("Quit item present");
-        assert!(about < quit, "About must sit above Quit");
-        let MenuItem::Standard(item) = &menu[about] else {
-            unreachable!()
-        };
-        (item.activate)(&mut tray);
-        assert!(
-            matches!(rx.try_recv(), Ok(TrayCmd::About)),
-            "activating the item must send TrayCmd::About"
-        );
-        assert!(rx.try_recv().is_err(), "exactly one command per activation");
-    }
-
-    fn shortcuts_item(menu: &[MenuItem<HushMicTray>]) -> &StandardItem<HushMicTray> {
-        menu.iter()
-            .find_map(|i| match i {
-                MenuItem::Standard(s) if s.label.ends_with("shortcuts…") => Some(s),
-                _ => None,
-            })
-            .expect("shortcuts item present in the layout")
-    }
-
-    #[test]
-    fn shortcuts_label_flips_once_set_up() {
-        // Fresh install: first-time wording. After the bind dialog has
-        // succeeded once, the click opens the compositor's editor and the
-        // label must promise that instead.
-        let mut tray = test_tray(false);
-        assert_eq!(shortcuts_item(&tray.menu()).label, "Set up shortcuts…");
-        tray.cfg.shortcuts_setup = true;
-        assert_eq!(shortcuts_item(&tray.menu()).label, "Change shortcuts…");
-    }
-
-    #[test]
-    fn shortcuts_item_is_portal_gated_and_sends_the_command() {
-        // No portal answered (the default): hidden, not explained — the
-        // can_set_default pattern. The item still exists in the layout so
-        // visibility can flip without a menu rebuild.
-        let tray = test_tray(false);
-        assert!(!shortcuts_item(&tray.menu()).visible);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut tray = HushMicTray {
-            cfg: Config::default(),
-            profile: Config::default().profile_for(None),
-            mics: vec![],
-            cmd_tx: tx,
-            status: TrayStatus::Off,
-            testing: false,
-            fallback_active: false,
-            mode: RunMode::Suppress,
-            shortcuts_available: true,
-            engine: None,
-            engine_light_configured: false,
-            icon_style: IconStyle::Color,
-        };
-        let menu = tray.menu();
-        let item = shortcuts_item(&menu);
-        assert!(item.visible, "portal present => entry visible");
-        (item.activate)(&mut tray);
-        assert!(
-            matches!(rx.try_recv(), Ok(TrayCmd::SetupShortcuts)),
-            "activating the item must send TrayCmd::SetupShortcuts"
-        );
-        assert!(rx.try_recv().is_err(), "exactly one command per activation");
-    }
-
-    #[test]
-    fn menu_groups_are_separated_as_designed() {
-        let menu = test_tray(false).menu();
-        let mut groups: Vec<Vec<&str>> = vec![vec![]];
-        for item in &menu {
-            match item {
-                MenuItem::Separator => groups.push(vec![]),
-                MenuItem::Standard(s) => groups.last_mut().unwrap().push(&s.label),
-                MenuItem::Checkmark(c) => groups.last_mut().unwrap().push(&c.label),
-                MenuItem::SubMenu(m) => groups.last_mut().unwrap().push(&m.label),
-                MenuItem::RadioGroup(_) => {}
-            }
-        }
+        let g = submenu(&menu, "Microphone");
+        assert_eq!(labels(g).last().unwrap(), "alsa_input.rode · unplugged");
+        assert_eq!(g.selected, 2);
+        tray.extras.absent_name = Some("RODE NT-USB".into());
         assert_eq!(
-            groups,
-            vec![
-                vec!["Test my mic…", "Mode"],
-                vec![
-                    "Microphone",
-                    "Model",
-                    "Suppression strength",
-                    "Set as default microphone",
-                    "Set up shortcuts…",
-                ],
-                vec!["Start on login", "About HushMic…", "Quit"],
+            labels(submenu(&tray.menu(), "Microphone")).last().unwrap(),
+            "RODE NT-USB · unplugged"
+        );
+        // Seen first in the list last time: it keeps that place.
+        tray.extras.absent_slot = Some(0);
+        let menu = tray.menu();
+        let g = submenu(&menu, "Microphone");
+        assert_eq!(
+            labels(g),
+            [
+                "System default (Built-in Audio)",
+                "RODE NT-USB · unplugged",
+                "Test Mic"
             ]
         );
+        assert_eq!(g.selected, 1);
+        tray.extras.absent_slot = None;
+        // A present mic gets no extra entry.
+        tray.cfg.mic = Some("alsa_input.test".into());
+        let menu = tray.menu();
+        let g = submenu(&menu, "Microphone");
+        assert_eq!(g.options.len(), 2);
+        assert_eq!(g.selected, 1);
+    }
+
+    #[test]
+    fn picking_a_microphone_sends_it_and_the_absent_entry_does_nothing() {
+        let (mut tray, rx) = tray_with_rx();
+        tray.cfg.mic = Some("alsa_input.rode".into());
+        let menu = tray.menu();
+        let g = submenu(&menu, "Microphone");
+        (g.select)(&mut tray, 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "the unplugged entry is already chosen"
+        );
+        (g.select)(&mut tray, 1);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SelectMic(Some(m))) if m == "alsa_input.test"));
+        (g.select)(&mut tray, 0);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SelectMic(None))));
+        assert_eq!(tray.cfg.mic, None);
+        // The unplugged entry in its own place, before "Test Mic".
+        tray.cfg.mic = Some("alsa_input.rode".into());
+        tray.extras.absent_slot = Some(0);
+        let menu = tray.menu();
+        let g = submenu(&menu, "Microphone");
+        (g.select)(&mut tray, 1);
+        assert!(rx.try_recv().is_err(), "already chosen");
+        (g.select)(&mut tray, 2);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::SelectMic(Some(m))) if m == "alsa_input.test"));
+    }
+
+    /// The menu's top level as the board has it: (status line,) Open
+    /// HushMic, the modes, the two submenus, Quit.
+    fn layout(menu: &[MenuItem<HushMicTray>]) -> Vec<Vec<String>> {
+        let mut groups: Vec<Vec<String>> = vec![vec![]];
+        for item in menu {
+            let g = groups.last_mut().unwrap();
+            match item {
+                MenuItem::Separator => groups.push(vec![]),
+                MenuItem::Standard(s) => g.push(s.label.clone()),
+                MenuItem::Checkmark(c) => g.push(c.label.clone()),
+                MenuItem::SubMenu(m) => g.push(format!("{} ▸", m.label)),
+                MenuItem::RadioGroup(r) => g.extend(labels(r)),
+            }
+        }
+        groups
+    }
+
+    #[test]
+    fn the_menu_is_tray_a() {
+        let menu = test_tray().menu();
+        assert_eq!(
+            layout(&menu),
+            [
+                vec!["Open HushMic"],
+                vec![
+                    "Noise suppression",
+                    "Noise suppression off",
+                    "Mute",
+                    "Turn off HushMic"
+                ],
+                vec!["Microphone ▸", "Strength ▸"],
+                vec!["Quit HushMic"],
+            ]
+        );
+    }
+
+    #[test]
+    fn the_status_line_shows_only_when_something_is_unusual() {
+        let mut tray = test_tray();
+        for (notice, text) in [
+            (TrayNotice::Attention, "Needs attention"),
+            (TrayNotice::Reconnecting, "Reconnecting…"),
+            (
+                TrayNotice::Unplugged("RODE NT-USB".into()),
+                "RODE NT-USB unplugged",
+            ),
+            (TrayNotice::Unfiltered, "Noise suppression paused for now"),
+            (TrayNotice::Light, "Using Light for now"),
+        ] {
+            tray.extras.notice = Some(notice);
+            let menu = tray.menu();
+            let MenuItem::Standard(line) = &menu[0] else {
+                panic!("the status line comes first")
+            };
+            assert_eq!(line.label, text);
+            assert!(!line.enabled, "a line to read, not a command");
+            assert!(matches!(menu[1], MenuItem::Separator));
+            assert_eq!(layout(&menu)[1], ["Open HushMic"]);
+        }
+        tray.extras.notice = None;
+        assert_eq!(layout(&tray.menu())[0], ["Open HushMic"]);
+        // Files cleaning: a line of its own, under any other.
+        tray.extras.cleaning = 2;
+        assert_eq!(layout(&tray.menu())[0], ["Cleaning 2 files…"]);
+        tray.extras.cleaning = 1;
+        tray.extras.notice = Some(TrayNotice::Reconnecting);
+        let menu = tray.menu();
+        assert_eq!(layout(&menu)[0], ["Reconnecting…", "Cleaning 1 file…"]);
+        assert_eq!(layout(&menu)[1], ["Open HushMic"]);
+    }
+
+    #[test]
+    fn open_and_a_left_click_ask_for_the_window_and_quit_quits() {
+        let (mut tray, rx) = tray_with_rx();
+        let menu = tray.menu();
+        let item = |label: &str| {
+            menu.iter()
+                .find_map(|i| match i {
+                    MenuItem::Standard(s) if s.label == label => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{label}"))
+        };
+        (item("Open HushMic").activate)(&mut tray);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::Open)));
+        tray.activate(0, 0);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::Open)));
+        (item("Quit HushMic").activate)(&mut tray);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::AskQuit)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_status_line_follows_the_snapshot() {
+        use crate::appstate::mock::{state, Scenario};
+        for (scenario, want) in [
+            (Scenario::OnInCall, None),
+            (Scenario::Bypass, None),
+            (Scenario::Muted, None),
+            (Scenario::Starting, None),
+            (Scenario::Off, None),
+            (Scenario::LightForNow, Some(TrayNotice::Light)),
+            (Scenario::UnfilteredForNow, Some(TrayNotice::Unfiltered)),
+            (Scenario::Reconnecting, Some(TrayNotice::Reconnecting)),
+            (Scenario::NeedsAttention, Some(TrayNotice::Attention)),
+            (Scenario::PipewireUnreachable, Some(TrayNotice::Attention)),
+            (
+                Scenario::MicUnplugged,
+                Some(TrayNotice::StandIn(
+                    "RODE NT-USB".into(),
+                    "Built-in Audio".into(),
+                )),
+            ),
+        ] {
+            assert_eq!(notice_for(&state(scenario)), want, "{scenario:?}");
+        }
+        // The daemon heard 10 s of silence from a present mic.
+        let mut s = state(Scenario::OnInCall);
+        s.mic.silent = true;
+        let mic = s.description_of(s.mic.active.as_deref().unwrap()).unwrap();
+        assert_eq!(notice_for(&s), Some(TrayNotice::Silent(mic.to_string())));
+        s.mode = Mode::Off;
+        assert_eq!(notice_for(&s), None, "off: nothing to say");
+        // An unplugged mic says that instead.
+        let mut s = state(Scenario::MicUnplugged);
+        s.mic.silent = true;
+        assert!(matches!(notice_for(&s), Some(TrayNotice::StandIn(..))));
+        // With none standing in (the daemon's fallback names nobody, or
+        // the chosen one), apps hear nothing (round 2, A4).
+        for active in [None, s.mic.selected.clone()] {
+            let mut s = state(Scenario::MicUnplugged);
+            s.mic.active = active;
+            assert_eq!(
+                notice_for(&s),
+                Some(TrayNotice::Unplugged("RODE NT-USB".into()))
+            );
+        }
+        // A fallback in bypass is not audible as one: no line.
+        let mut s = state(Scenario::UnfilteredForNow);
+        s.mode = Mode::Bypass;
+        assert_eq!(notice_for(&s), None);
+        // Light by choice is not a fallback.
+        let mut s = state(Scenario::LightForNow);
+        s.engine.configured_light = true;
+        assert_eq!(notice_for(&s), None);
+    }
+
+    #[test]
+    fn the_microphone_submenu_uses_the_snapshot_names() {
+        let mut tray = test_tray();
+        tray.mics.push(Source {
+            name: "alsa_input.other".into(),
+            description: "Test Mic".into(),
+        });
+        // Before the first snapshot: PipeWire's names.
+        assert_eq!(
+            labels(submenu(&tray.menu(), "Microphone")),
+            ["System default", "Test Mic", "Test Mic"]
+        );
+        tray.extras.mic_names = vec![
+            ("alsa_input.other".into(), "Test Mic (2)".into()),
+            ("alsa_input.test".into(), "Test Mic".into()),
+        ];
+        assert_eq!(
+            labels(submenu(&tray.menu(), "Microphone")),
+            ["System default", "Test Mic", "Test Mic (2)"]
+        );
+    }
+
+    #[test]
+    fn the_extras_name_the_default_and_the_absent_mic() {
+        use crate::appstate::mock::{state, Scenario};
+        let x = TrayExtras::of(&state(Scenario::OnInCall));
+        assert_eq!(x.notice, None);
+        assert_eq!(x.default_name.as_deref(), Some("Built-in Audio"));
+        assert_eq!(x.absent_name, None);
+        let x = TrayExtras::of(&state(Scenario::MicUnplugged));
+        assert_eq!(x.absent_name.as_deref(), Some("RODE NT-USB"));
+        assert_eq!(x.absent_slot, Some(0), "first, where it was");
+        // Without PipeWire nothing is known by name.
+        let x = TrayExtras::of(&state(Scenario::PipewireUnreachable));
+        assert_eq!(x.default_name, None);
     }
 }

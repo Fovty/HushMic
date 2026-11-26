@@ -1,31 +1,25 @@
 //! Round-trip test for the global-shortcuts portal worker against a mock
 //! `org.freedesktop.portal.GlobalShortcuts` service on a PRIVATE session
-//! bus (the notify_dbus.rs pattern), so it runs headless and never touches
-//! a real desktop. Self-skips when `dbus-daemon` is unavailable.
+//! bus with no service directories (`common::private_bus`), so it runs
+//! headless, never touches a real desktop and never auto-starts a portal.
+//! Self-skips when `dbus-daemon` is unavailable.
 //!
 //! Single #[test]: the private bus address goes through the process-global
 //! `DBUS_SESSION_BUS_ADDRESS` — parallel test fns would race it. The one
 //! scenario walks the worker's whole life: no portal -> Unavailable,
 //! Retry -> Available, session-filtered signal delivery, interactive bind,
-//! and the silent re-bind of a second start.
+//! the silent re-bind of a second start, and the keys each step reports.
+
+mod common;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+use hushmic::appstate::Keys;
 use hushmic::shortcuts::{self, Action, Cmd, PortalEvent};
-
-struct BusGuard(Child);
-impl Drop for BusGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 #[derive(Default)]
 struct FakeState {
@@ -44,6 +38,54 @@ struct FakeState {
     order: Vec<String>,
     /// Answer the next BindShortcuts with response code 1 (user cancelled).
     cancel_next_bind: bool,
+    /// Sessions that bound: ListShortcuts lists nothing for the others.
+    bound: Vec<String>,
+    /// Hold ListShortcuts answers (a slow or wedged portal): each request
+    /// path waits in `held` with whether its session had bound when asked,
+    /// until the test answers it.
+    hold_lists: bool,
+    held: Vec<(String, bool)>,
+}
+
+/// The keys "the desktop" has for HushMic: toggle-mute only.
+fn desktop_trigger(id: &str) -> &'static str {
+    if id == "toggle-mute" {
+        "Ctrl+Alt+M"
+    } else {
+        ""
+    }
+}
+
+/// `a(sa{sv})` as a portal answers: every action with its keys.
+fn shortcut_list() -> Vec<(String, HashMap<String, Value<'static>>)> {
+    Action::ALL
+        .iter()
+        .map(|a| {
+            let mut props = HashMap::new();
+            props.insert("description".to_string(), Value::from(a.description()));
+            props.insert(
+                "trigger_description".to_string(),
+                Value::from(desktop_trigger(a.id())),
+            );
+            (a.id().to_string(), props)
+        })
+        .collect()
+}
+
+/// What the worker reports for that list (or for a session with none).
+fn keys_event(bound: bool) -> PortalEvent {
+    PortalEvent::Keys(
+        Action::ALL
+            .iter()
+            .map(|a| {
+                let keys = match desktop_trigger(a.id()) {
+                    t if bound && !t.is_empty() => Keys::Text(t.to_string()),
+                    _ => Keys::NotSet,
+                };
+                (*a, keys)
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Default)]
@@ -99,6 +141,14 @@ async fn respond(
     .expect("emit Response");
 }
 
+/// ListShortcuts' Response: the keys for a session that bound, else none.
+async fn answer_list(conn: &zbus::Connection, request: &str, bound: bool) {
+    let list = if bound { shortcut_list() } else { vec![] };
+    let mut results = HashMap::new();
+    results.insert("shortcuts", Value::from(list));
+    respond(conn, request, 0, results).await;
+}
+
 #[zbus::interface(name = "org.freedesktop.portal.GlobalShortcuts")]
 impl FakePortal {
     // The real portal exposes lowercase "version" (zbus would default to
@@ -139,7 +189,7 @@ impl FakePortal {
     #[allow(clippy::type_complexity)]
     async fn bind_shortcuts(
         &self,
-        _session: OwnedObjectPath,
+        session: OwnedObjectPath,
         shortcuts: Vec<(String, HashMap<String, OwnedValue>)>,
         _parent_window: String,
         options: HashMap<String, OwnedValue>,
@@ -167,10 +217,40 @@ impl FakePortal {
                     })
                     .collect();
                 st.binds.push(recorded);
+                st.bound.push(session.to_string());
                 0
             }
         };
-        respond(conn, &request, code, HashMap::new()).await;
+        let mut results = HashMap::new();
+        if code == 0 {
+            results.insert("shortcuts", Value::from(shortcut_list()));
+        }
+        respond(conn, &request, code, results).await;
+        ObjectPath::try_from(request).unwrap().into()
+    }
+
+    async fn list_shortcuts(
+        &self,
+        session: OwnedObjectPath,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> OwnedObjectPath {
+        let request = format!(
+            "/org/freedesktop/portal/desktop/request/{}/{}",
+            sender_id(&hdr),
+            token_of(&options, "handle_token")
+        );
+        let bound = {
+            let mut st = self.state.lock().unwrap();
+            let bound = st.bound.contains(&session.to_string());
+            if st.hold_lists {
+                st.held.push((request.clone(), bound));
+                return ObjectPath::try_from(request).unwrap().into();
+            }
+            bound
+        };
+        answer_list(conn, &request, bound).await;
         ObjectPath::try_from(request).unwrap().into()
     }
 
@@ -211,39 +291,19 @@ fn wait_until(mut done: impl FnMut() -> bool, what: &str) {
 
 #[test]
 fn portal_worker_round_trip_on_a_private_bus() {
-    if Command::new("dbus-daemon")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP portal_worker_round_trip_on_a_private_bus: dbus-daemon not available");
+    // No service directories: phase 0's missing portal must stay missing
+    // (a stock session bus would start the host's real one).
+    let Some(bus) = common::private_bus("portal_worker_round_trip_on_a_private_bus") else {
         return;
-    }
-    let mut daemon = Command::new("dbus-daemon")
-        .args(["--session", "--nofork", "--print-address=1"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn dbus-daemon");
-    let addr = {
-        let out = daemon.stdout.take().expect("daemon stdout");
-        let mut line = String::new();
-        let _ = BufReader::new(out).read_line(&mut line);
-        line.trim().to_string()
     };
-    let _guard = BusGuard(daemon);
-    if !addr.starts_with("unix:") {
-        eprintln!(
-            "SKIP portal_worker_round_trip_on_a_private_bus: no usable session bus \
-             address (got {addr:?})"
-        );
-        return;
-    }
+    let addr = bus.addr.clone();
     std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &addr);
 
     // --- phase 0: a bus with no portal on it -> Unavailable ---
     let (ev_tx, ev) = mpsc::channel();
     let cmds = shortcuts::spawn(ev_tx, false);
+    // Every worker first says which client serves it.
+    expect_event(&ev, PortalEvent::Backend(shortcuts::Backend::Portal));
     expect_event(&ev, PortalEvent::Unavailable);
 
     // --- phase 1: the portal appears; a Retry brings the worker up ---
@@ -275,6 +335,8 @@ fn portal_worker_round_trip_on_a_private_bus() {
     });
     cmds.send(Cmd::Retry).expect("worker alive");
     expect_event(&ev, PortalEvent::Available);
+    // Never bound: the listing has no keys.
+    expect_event(&ev, keys_event(false));
     wait_until(
         || !state.lock().unwrap().sessions.is_empty(),
         "the worker's CreateSession",
@@ -323,6 +385,8 @@ fn portal_worker_round_trip_on_a_private_bus() {
 
     // --- phase 3: interactive bind ("Set up shortcuts…") ---
     cmds.send(Cmd::Bind).expect("worker alive");
+    // The bind's answer carries the keys, ahead of the done.
+    expect_event(&ev, keys_event(true));
     expect_event(&ev, PortalEvent::BindDone);
     {
         let st = state.lock().unwrap();
@@ -346,10 +410,42 @@ fn portal_worker_round_trip_on_a_private_bus() {
         assert_eq!(st.binds.len(), 1, "configure must not re-bind");
     }
 
+    // --- phase 3c: the user changed a key in the editor: ShortcutsChanged
+    // reports it, for our session only, and only the changed action ---
+    let changed = |sess: String, id: &str, keys: &str| {
+        let mut props = HashMap::new();
+        props.insert("trigger_description".to_string(), Value::from(keys));
+        rt.block_on(async {
+            server
+                .emit_signal(
+                    Option::<&str>::None,
+                    "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.portal.GlobalShortcuts",
+                    "ShortcutsChanged",
+                    &(
+                        ObjectPath::try_from(sess).unwrap(),
+                        vec![(id.to_string(), props)],
+                    ),
+                )
+                .await
+                .expect("emit ShortcutsChanged")
+        })
+    };
+    changed(foreign.clone(), "push-to-talk", "F12");
+    changed(session.clone(), "push-to-talk", "Meta+Space");
+    expect_event(
+        &ev,
+        PortalEvent::Keys(vec![(Action::PushToTalk, Keys::Text("Meta+Space".into()))]),
+    );
+
     // --- phase 4: a second start with shortcuts_setup re-binds silently ---
     let (ev2_tx, ev2) = mpsc::channel();
     let _cmds2 = shortcuts::spawn(ev2_tx, true);
+    // Every worker first says which client serves it.
+    expect_event(&ev2, PortalEvent::Backend(shortcuts::Backend::Portal));
     expect_event(&ev2, PortalEvent::Available);
+    // The silent re-bind's keys, after Available.
+    expect_event(&ev2, keys_event(true));
     wait_until(
         || state.lock().unwrap().binds.len() == 2,
         "the silent re-bind",
@@ -365,13 +461,18 @@ fn portal_worker_round_trip_on_a_private_bus() {
     // click a fresh session ---
     let (ev3_tx, ev3) = mpsc::channel();
     let cmds3 = shortcuts::spawn(ev3_tx, false);
+    // Every worker first says which client serves it.
+    expect_event(&ev3, PortalEvent::Backend(shortcuts::Backend::Portal));
     expect_event(&ev3, PortalEvent::Available);
+    expect_event(&ev3, keys_event(false));
     state.lock().unwrap().cancel_next_bind = true;
     cmds3.send(Cmd::Bind).expect("worker alive");
     expect_event(&ev3, PortalEvent::Unavailable);
     cmds3.send(Cmd::Retry).expect("worker alive");
     expect_event(&ev3, PortalEvent::Available);
+    expect_event(&ev3, keys_event(false));
     cmds3.send(Cmd::Bind).expect("worker alive");
+    expect_event(&ev3, keys_event(true));
     expect_event(&ev3, PortalEvent::BindDone);
     assert_eq!(
         state.lock().unwrap().binds.len(),
@@ -390,7 +491,8 @@ fn portal_worker_round_trip_on_a_private_bus() {
         version: 1,
         ..FakePortal::default()
     };
-    let _server_v1 = rt.block_on(async {
+    let state_v1 = fake_v1.state.clone();
+    let server_v1 = rt.block_on(async {
         zbus::connection::Builder::session()
             .expect("mock v1: session builder")
             .name("org.freedesktop.portal.Desktop")
@@ -403,6 +505,8 @@ fn portal_worker_round_trip_on_a_private_bus() {
     });
     let (ev4_tx, ev4) = mpsc::channel();
     let cmds4 = shortcuts::spawn(ev4_tx, false);
+    // Every worker first says which client serves it.
+    expect_event(&ev4, PortalEvent::Backend(shortcuts::Backend::Portal));
     // The v2->v1 name handoff is asynchronous on the daemon side: tolerate
     // a transient failed attempt (routes to the dead old owner) and drive
     // the ordinary Retry path until the worker is up.
@@ -424,6 +528,86 @@ fn portal_worker_round_trip_on_a_private_bus() {
         }
     }
     assert!(up, "worker never reached the v1 portal");
+    expect_event(&ev4, keys_event(false));
     cmds4.send(Cmd::Configure).expect("worker alive");
     expect_event(&ev4, PortalEvent::ConfigureUnavailable);
+
+    // --- phase 8: a portal that never answers ListShortcuts must not hold
+    // key presses back (the listing runs beside the event loop) ---
+    state_v1.lock().unwrap().hold_lists = true;
+    let (ev5_tx, ev5) = mpsc::channel();
+    let cmds5 = shortcuts::spawn(ev5_tx, false);
+    expect_event(&ev5, PortalEvent::Backend(shortcuts::Backend::Portal));
+    let mut up = false;
+    for _ in 0..20 {
+        match ev5
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker5 event")
+        {
+            PortalEvent::Available => {
+                up = true;
+                break;
+            }
+            PortalEvent::Unavailable => {
+                std::thread::sleep(Duration::from_millis(100));
+                cmds5.send(Cmd::Retry).expect("worker alive");
+            }
+            other => panic!("unexpected event while connecting: {other:?}"),
+        }
+    }
+    assert!(up, "worker5 never came up");
+    let session5 = state_v1.lock().unwrap().sessions.last().unwrap().clone();
+    rt.block_on(async {
+        server_v1
+            .emit_signal(
+                Option::<&str>::None,
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.GlobalShortcuts",
+                "Activated",
+                &(
+                    ObjectPath::try_from(session5).unwrap(),
+                    "toggle-mute",
+                    7u64,
+                    HashMap::<String, Value>::new(),
+                ),
+            )
+            .await
+            .expect("emit Activated")
+    });
+    match ev5.recv_timeout(Duration::from_secs(2)) {
+        Ok(got) => assert_eq!(got, PortalEvent::Activated(Action::ToggleMute)),
+        Err(e) => panic!("a key press waited on the unanswered listing: {e}"),
+    }
+
+    // --- phase 9: a listing asked before a bind and answered after it
+    // must not overwrite the bind's keys with its older answer ---
+    wait_until(
+        || {
+            state_v1
+                .lock()
+                .unwrap()
+                .held
+                .iter()
+                .any(|(_, bound)| !bound)
+        },
+        "the listing to reach the portal",
+    );
+    cmds5.send(Cmd::Bind).expect("worker alive");
+    expect_event(&ev5, keys_event(true));
+    expect_event(&ev5, PortalEvent::BindDone);
+    let held: Vec<(String, bool)> = std::mem::take(&mut state_v1.lock().unwrap().held);
+    assert!(
+        held.iter().any(|(_, bound)| !bound),
+        "the pre-bind listing is still unanswered"
+    );
+    rt.block_on(async {
+        for (request, bound) in &held {
+            answer_list(&server_v1, request, *bound).await;
+        }
+    });
+    match ev5.recv_timeout(Duration::from_millis(1500)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(got) => panic!("the stale listing was reported after the bind: {got:?}"),
+        Err(e) => panic!("worker5 gone: {e}"),
+    }
 }

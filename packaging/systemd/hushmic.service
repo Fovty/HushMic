@@ -7,9 +7,10 @@ Wants=pipewire.service
 [Service]
 ExecStart=/usr/bin/hushmic --headless
 Restart=on-failure
+RestartPreventExitStatus=3
 RestartSec=3
 KillMode=mixed
-TimeoutStopSec=10
+TimeoutStopSec=25
 Slice=session.slice
 
 [Install]

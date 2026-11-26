@@ -17,7 +17,8 @@ let cleaned: &[f32] = stream.process(&mic_chunk);
 `Denoiser` works on fixed 480-sample hops (10 ms) and is `Send`, so you can
 create it at startup and move it into your audio thread. `StreamDenoiser`
 wraps it for arbitrary chunk sizes. Bypass and mute modes, an attenuation
-limit and latency reporting are covered in the rustdoc.
+limit, latency reporting and the voice hold (`set_voice_hold`: keep to the
+talker's voice, off by default) are covered in the rustdoc.
 
 ## Installation
 

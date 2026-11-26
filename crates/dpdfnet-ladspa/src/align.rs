@@ -103,6 +103,13 @@ impl Aligner {
         }
     }
 
+    /// The output lead in force: [`OUTPUT_LEAD`], or more once a host
+    /// cycle longer than designed grew it. The stream's latency is the
+    /// engine's plus this.
+    pub fn lead_total(&self) -> usize {
+        self.total
+    }
+
     /// Back to the startup state (fresh prefill, no debt).
     pub fn reset(&mut self) {
         *self = Aligner::new();

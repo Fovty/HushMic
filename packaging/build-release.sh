@@ -2,6 +2,7 @@
 # Build all hushmic release artifacts into dist/ (version from Cargo.toml):
 #   * hushmic-<ver>-x86_64.tar.gz   (portable tarball + install.sh)
 #   * hushmic_<ver>-1_amd64.deb     (Debian/Ubuntu package)
+#   * hushmic_amd64.deb             (the same file, for links without a version)
 #   * hushmic-x86_64.AppImage       (self-contained AppImage, + .zsync)
 #   * <model>.onnx, <model>.weights.f32 (standalone models + native weights)
 #   * sha256sums.txt                (checksums over the above)
@@ -25,6 +26,9 @@ NAME="hushmic-${VERSION}-${ARCH}"
 DIST="$REPO_ROOT/dist"
 TOOLS="$REPO_ROOT/.build-tools"
 
+# The app icon at every hicolor size, plus scalable/apps/hushmic.svg; must
+# stay in lockstep with packaging/tray/hicolor/ (packaging/tray/make-icons.py).
+APP_ICON_SIZES="16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512"
 # Tray status-icon ladder (five SNI names x eight sizes) shipped alongside the
 # app icon in every artifact; must stay in lockstep with packaging/tray/hicolor/
 # and the names the tray requests over SNI.
@@ -42,6 +46,19 @@ export HUSHMIC_BUILD_DYLIB="/usr/lib/hushmic/libonnxruntime.so"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 
+# install_app_icons <hicolor dir>: the app icon at every size plus scalable/,
+# one explicit install per file so a missing size fails the build. Every
+# directory level gets 755 (see the umask note at the tarball).
+install_app_icons() {
+  install -d -m 755 "${1%/*}" "$1"
+  for size in $APP_ICON_SIZES; do
+    install -d -m 755 "$1/$size" "$1/$size/apps"
+    install -m 644 "$REPO_ROOT/packaging/tray/hicolor/$size/apps/hushmic.png" "$1/$size/apps/hushmic.png"
+  done
+  install -d -m 755 "$1/scalable" "$1/scalable/apps"
+  install -m 644 "$REPO_ROOT/packaging/tray/hicolor/scalable/apps/hushmic.svg" "$1/scalable/apps/hushmic.svg"
+}
+
 # ---------------------------------------------------------------------------
 # 0. Assets + release build
 # ---------------------------------------------------------------------------
@@ -49,12 +66,32 @@ log "Provisioning assets"
 bash "$REPO_ROOT/scripts/setup-assets.sh"
 
 log "Building release (baking install-layout paths)"
-cargo build --release
+# Opus recordings decode through libopus, linked in statically: the
+# tarball, the .deb, the AppImage and hushmic-bin then run without the
+# system's libopus (opusic-sys links libopus.a from libopus-dev when
+# OPUS_LIB_STATIC is set). Distro-built packages link the system one.
+# rustc bundles a static library into the crate itself and looks for it
+# only in -L folders, not the linker's default ones: OPUS_LIB_DIR names
+# the folder.
+OPUS_A="$(gcc -print-file-name=libopus.a 2>/dev/null || true)"
+case "$OPUS_A" in
+  /*) OPUS_A="$(readlink -f "$OPUS_A")" ;;
+  *) echo "error: libopus.a not found on the build host (apt install libopus-dev)" >&2; exit 1 ;;
+esac
+# HUSHMIC_EXTRA_FEATURES: more cargo features, comma-separated, for a build
+# to try them (hushmic/speakers); a release sets none.
+OPUS_LIB_STATIC=true OPUS_LIB_DIR="$(dirname "$OPUS_A")" \
+  cargo build --release --features "hushmic/opus${HUSHMIC_EXTRA_FEATURES:+,$HUSHMIC_EXTRA_FEATURES}"
 
 BIN="$REPO_ROOT/target/release/hushmic"
 PLUGIN="$REPO_ROOT/target/release/libdpdfnet_ladspa.so"
 [ -x "$BIN" ] || { echo "error: $BIN not built" >&2; exit 1; }
 [ -f "$PLUGIN" ] || { echo "error: $PLUGIN not built" >&2; exit 1; }
+# A cached build from before the static link would still need libopus.so.
+if objdump -p "$BIN" | grep -q 'NEEDED.*libopus'; then
+  echo "error: $BIN links libopus.so; release builds link it statically" >&2
+  exit 1
+fi
 
 rm -rf "$DIST"
 mkdir -p "$DIST"
@@ -69,8 +106,7 @@ rm -rf "$DIST/.stage"
 # and a hardened build-host umask would otherwise record 700/750 dirs that a
 # root `tar -xzp` faithfully reproduces as unreadable-to-users directories.
 install -d -m 755 "$STAGE/bin" "$STAGE/lib/ladspa" "$STAGE/lib/hushmic" \
-         "$STAGE/share/hushmic/models" "$STAGE/share/applications" \
-         "$STAGE/share/icons/hicolor/256x256/apps"
+         "$STAGE/share/hushmic/models" "$STAGE/share/applications"
 # install -m / explicit chmod everywhere: plain cp preserves source modes, and
 # the models arrive 0600 from dpdfnet's download cache — shipped that way, a
 # root extraction (tar -p is the default for root) leaves them unreadable to
@@ -87,9 +123,10 @@ install -m 644 "$REPO_ROOT/assets/models/dpdfnet8_48khz_hr.weights.f32" \
                "$REPO_ROOT/assets/models/dpdfnet2_48khz_hr.weights.f32" \
                "$STAGE/share/hushmic/models/"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$STAGE/share/applications/hushmic.desktop"
+install -m 644 "$REPO_ROOT/packaging/hushmic-clean.desktop" "$STAGE/share/applications/hushmic-clean.desktop"
 install -d -m 755 "$STAGE/lib/systemd/user"
 install -m 644 "$REPO_ROOT/packaging/systemd/hushmic.service" "$STAGE/lib/systemd/user/hushmic.service"
-install -m 644 "$REPO_ROOT/packaging/hushmic-256.png" "$STAGE/share/icons/hicolor/256x256/apps/hushmic.png"
+install_app_icons "$STAGE/share/icons/hicolor"
 # Tray status icons: explicit per-name installs (not a glob) so a missing size
 # or state fails the build instead of silently shipping an incomplete ladder.
 for size in $TRAY_SIZES; do
@@ -128,6 +165,12 @@ DEB="$REPO_ROOT/target/debian/hushmic_${VERSION}-1_amd64.deb"
 [ -f "$DEB" ] || { echo "error: expected $DEB" >&2; exit 1; }
 cp "$DEB" "$DIST/"
 echo "  -> dist/$(basename "$DEB")"
+# The same package under a name without the version: what the website and the
+# README link as releases/latest/download/hushmic_amd64.deb, so those links hold
+# from one release to the next. A release is immutable once published: this
+# file has to be among its assets from the start (release.yml lists it).
+cp "$DEB" "$DIST/hushmic_amd64.deb"
+echo "  -> dist/hushmic_amd64.deb"
 
 # ---------------------------------------------------------------------------
 # 3. AppImage
@@ -142,9 +185,10 @@ install -m 644 "$PLUGIN" "$APPDIR/usr/lib/ladspa/libdpdfnet_ladspa.so"
 cp -P "$REPO_ROOT"/assets/lib/libonnxruntime.so* "$APPDIR/usr/lib/"
 chmod 755 "$APPDIR/usr/lib/"libonnxruntime.so*
 # winit dlopens libxkbcommon-x11 for its X11 windows; minimal X11 systems
-# (and the AppImage catalog's test runner) lack it and the A/B and About
-# windows panic on open. Bundle it with its libxcb-xkb dependency; NOT
+# (and the AppImage catalog's test runner) lack it and the window panics on
+# open. Bundle it with its libxcb-xkb dependency; NOT
 # libxkbcommon itself, which is everywhere and must match the host's.
+# (libopus is linked into the binary.)
 for lib in libxkbcommon-x11.so.0 libxcb-xkb.so.1; do
   src=$(ldconfig -p | awk -v l="$lib" '$1 == l && /x86-64/ { print $NF; exit }')
   [ -n "$src" ] || { echo "error: $lib not found on the build host (apt install libxkbcommon-x11-0 libxcb-xkb1)" >&2; exit 1; }
@@ -170,6 +214,8 @@ for size in $TRAY_SYMBOLIC_DIRS; do
              "$APPDIR/usr/share/icons/hicolor/$size/status/hushmic-mono${icon#hushmic-tray}-symbolic.svg"
   done
 done
+# The app icon ladder too, for AppImage integration tools that install it.
+install_app_icons "$APPDIR/usr/share/icons/hicolor"
 install -m755 "$REPO_ROOT/packaging/AppRun" "$APPDIR/AppRun"
 install -m 644 "$REPO_ROOT/packaging/hushmic.desktop" "$APPDIR/hushmic.desktop"
 # AppStream metainfo (the AppImage catalog reads summary, license and
@@ -187,15 +233,8 @@ grep -q '<launchable type="desktop-id">hushmic.desktop</launchable>' \
   "$APPDIR/usr/share/metainfo/io.github.fovty.HushMic.appdata.xml" \
   || { echo "error: AppImage metainfo launchable was not rewritten" >&2; exit 1; }
 
-# Icon: use the repo icon if present, else decode the embedded placeholder.
-if [ -f "$REPO_ROOT/packaging/hushmic.png" ]; then
-  cp "$REPO_ROOT/packaging/hushmic.png" "$APPDIR/hushmic.png"
-else
-  echo "  generating placeholder icon"
-  base64 -d > "$APPDIR/hushmic.png" <<'ICON_B64'
-iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAFEUlEQVR4nO3dwXETWxBAUfsXQbDwmkAcg6MhAEdDDE7Nf8UCV1GWsDTz+t1z1i7Uoug7b2RJPH5/+vH+ACT9d/YAwHkEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMIEAMK+nT0Ax3r+9fPTn3l7eT1gElbw+P3px/vZQ3A/lyz8ZwRhXwKwqVss/kdCsB8B2Mw9Fv8jIdiHFwE3csTyH/k43J8TwAbOXEingdmcAIY7+2p89uPzNQIw2CrLt8ocXE8Ahlpt6Vabh8sIwECrLtuqc/F3AgBhAjDM6lfZ1efjTwIwyJTlmjInAgBpAjDEtKvqtHmrBADCBGCAqVfTqXOXCACECQCECQCECcDipt9HT59/dwIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQIAYQKwuLeX17NH+JLp8+9OACBMACBMACBMAAaYeh89de6Sb2cPsLvnXz8v+rnisvi7OZ8TwBDTlmDavFUCAGECMMiUq+qUORGAcVZfrtXn408CAGECsIhLXxF/eFj3KnvNXNc8X+5HAO7sXsu6WgQqz3M3AjDYKsuxyhxcTwCGO3v5zn58vkYAFvKv98VvL6+HL+JXHtP9/zoE4ABHLafH4Vo+C7CZ30tzj6ushdyPE8BibrW4t7wtuOWf5fi/FieAg7y9vJ7yj//j4l4ywwpX+hVmKBCABT3/+rnl79Vd/dfjFgDCBOBA5bfK7vBW5x0JwMJ2icAuz2NHAnCwa69u05fn2vld/Y8lABAmACeonAJc/dcnACfZPQKWfwYBGGRKBKbMycPD4/enH+9nD1H2lU8Arman51LhBHCyXT5Sa/lnEoAFTI+A5Z/LZwGG+718ZyzTKgHi33kNYCG3WKgjQjBlTj4nAIu55VX1lku26lx8jQAs6F5H6xU+jGT51yIAC9vpHtvir8lvARa2y9Ls8jx2JACLm7480+ffnVuAQSbdElj8GZwABpmyVFPmxAlgrBVPAxZ/HgEYboUQWPy5BGAjR8bA0u9BADblvwbjEgIQ8S9BsPD7E4CYS0Ng+Rv8GhDCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCBADCfCXYYlb4mu9783Vj63ACgDABgDABgDABgDABgDABgDABgDABgDABgDDvBIQwJwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAIEwAI+x8xEwaUjw6b6gAAAABJRU5ErkJggg==
-ICON_B64
-fi
+# The AppImage's own icon (appimagetool also makes .DirIcon from it).
+install -m 644 "$REPO_ROOT/packaging/hushmic-256.png" "$APPDIR/hushmic.png"
 
 # Resolve appimagetool: $APPIMAGETOOL env, PATH, or auto-download. Downloads
 # are PINNED to a tagged release + sha256 (the old 'continuous' tag is mutable:

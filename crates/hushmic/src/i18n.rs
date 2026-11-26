@@ -90,7 +90,7 @@ mod tests {
         i18n_embed::select(&loader, &Localizations, &["en".parse().unwrap()])
             .expect("English catalog embeds");
         loader.set_use_isolating(false);
-        assert_eq!(loader.get("tray-quit"), "Quit");
+        assert_eq!(loader.get("tray-quit-hushmic"), "Quit HushMic");
     }
 
     #[test]
@@ -122,7 +122,10 @@ mod tests {
             let entry = keys.entry(lang).or_default();
             for item in resource.body {
                 if let fluent_syntax::ast::Entry::Message(m) = item {
-                    entry.insert(m.id.name.to_string());
+                    // a second definition is dropped when the bundle loads
+                    // (the first one wins): never two of one key
+                    let id = m.id.name.to_string();
+                    assert!(entry.insert(id.clone()), "{path} defines {id} twice");
                 }
             }
         }

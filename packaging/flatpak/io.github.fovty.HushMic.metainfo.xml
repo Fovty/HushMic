@@ -20,29 +20,55 @@
     </p>
     <p>
       Processing is local and CPU-only: audio never leaves the machine and no
-      network connection is ever made. A tray menu switches models, picks the
-      microphone and sets the suppression strength, and the built-in A/B test
-      window shows your raw and cleaned signal side by side so you can hear
-      and see the difference before a call.
+      network connection is ever made. The HushMic window shows your voice
+      going in and the cleaned sound going out, which app is using HushMic,
+      and picks the microphone, the strength and the model. It keeps the
+      last 10 seconds while it is open, so you can replay them and hear your
+      original microphone and the cleaned voice at the same moment before a
+      call. A tray menu switches modes, the microphone and the strength.
+    </p>
+    <p>
+      Files cleans recordings you already have, audio or video, and saves a
+      cleaned copy in the original's format.
     </p>
   </description>
 
   <launchable type="desktop-id">io.github.fovty.HushMic.desktop</launchable>
 
   <branding>
-    <color type="primary" scheme_preference="light">#9be5ea</color>
-    <color type="primary" scheme_preference="dark">#0d3c44</color>
+    <color type="primary" scheme_preference="light">#8ce9ee</color>
+    <color type="primary" scheme_preference="dark">#00666b</color>
   </branding>
 
   <content_rating type="oars-1.1" />
 
-  <url type="homepage">https://github.com/Fovty/HushMic</url>
+  <url type="homepage">https://hushmic.org</url>
   <url type="bugtracker">https://github.com/Fovty/HushMic/issues</url>
   <url type="vcs-browser">https://github.com/Fovty/HushMic</url>
 
   <screenshots>
+    <!-- Keep pinned to a PUBLISHED release tag, not a branch: the CI lint
+         fetches these URLs, so they must exist when a pipeline runs. The
+         window's screenshots go in with the post-release packaging pin,
+         once a published tag has them (v1.0.0):
     <screenshot type="default">
-      <!-- keep pinned to the release tag, not a branch -->
+      <image>https://raw.githubusercontent.com/Fovty/HushMic/v1.0.0/docs/img/hushmic-live.png</image>
+      <caption>Live: the sound going in and coming out, the app using it, and a replay of the last 10 seconds with the original at the same moment</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Fovty/HushMic/v1.0.0/docs/img/hushmic-files.png</image>
+      <caption>Files: clean recordings and videos, and hear the result before you save</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Fovty/HushMic/v1.0.0/docs/img/hushmic-shortcuts.png</image>
+      <caption>Shortcuts in Settings: mute, bypass, push to talk and push to mute from any app</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Fovty/HushMic/v1.0.0/docs/img/hushmic-settings.png</image>
+      <caption>Settings: start on login, notifications, appearance and the tray icon</caption>
+    </screenshot>
+    -->
+    <screenshot type="default">
       <image>https://raw.githubusercontent.com/Fovty/HushMic/v0.3.0/docs/img/hushmic-ab-window.png</image>
       <caption>Live A/B mic test: raw input next to the cleaned output other apps receive</caption>
     </screenshot>

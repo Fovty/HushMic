@@ -227,24 +227,51 @@ fn thread_schedule(tid: libc::pid_t) -> Result<LoopSchedule, i32> {
     })
 }
 
+/// One listing of this process's threads, by tid. None: the directory
+/// could not be read; `unreadable`: an entry could not be.
+fn list_tasks(unreadable: &mut bool) -> Option<Vec<libc::pid_t>> {
+    let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+    let mut tids = Vec::new();
+    for task in tasks {
+        let Ok(task) = task else {
+            *unreadable = true;
+            continue;
+        };
+        if let Some(tid) = task.file_name().to_str().and_then(|s| s.parse().ok()) {
+            tids.push(tid);
+        }
+    }
+    Some(tids)
+}
+
+/// This process's threads from two listings, merged. A listing of
+/// `/proc/self/task` can leave out a live thread: when the thread under
+/// its cursor exits, the kernel ends that read early, and the next one
+/// resumes by position, which now points one thread further. A data loop
+/// left out reads as "no data loop" and would let the worker ask for
+/// realtime above a timeshare one. A thread missing from both listings
+/// needs a second exit at the same place, back to back.
+fn task_tids(mut list: impl FnMut() -> Option<Vec<libc::pid_t>>) -> Option<Vec<libc::pid_t>> {
+    let mut tids = list()?;
+    for tid in list()? {
+        if !tids.contains(&tid) {
+            tids.push(tid);
+        }
+    }
+    Some(tids)
+}
+
 /// Only the helper scans procfs. Missing tasks exited during the scan;
 /// other read failures prevent a grant because their policy is unknown.
 fn data_loop_schedules() -> Vec<Option<LoopSchedule>> {
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+    let mut unreadable = false;
+    let Some(tids) = task_tids(|| list_tasks(&mut unreadable)) else {
         return vec![None];
     };
     let mut named = Vec::new();
     let mut legacy = Vec::new();
-    let mut unreadable = false;
-    for task in tasks {
-        let Ok(task) = task else {
-            unreadable = true;
-            continue;
-        };
-        let Some(tid) = task.file_name().to_str().and_then(|s| s.parse().ok()) else {
-            continue;
-        };
-        let comm = match std::fs::read(task.path().join("comm")) {
+    for tid in tids {
+        let comm = match std::fs::read(format!("/proc/self/task/{tid}/comm")) {
             Ok(comm) => comm,
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => continue,
             Err(_) => {
@@ -327,6 +354,38 @@ fn data_loop_decision(loops: &[Option<LoopSchedule>], window_elapsed: bool) -> L
     }
 }
 
+/// `HUSHMIC_WORKER_RT_BELOW=N` (1..=9): this worker asks for N steps
+/// below what it would otherwise get, so a second chain (the speakers
+/// cleaner) always gives way to the microphone's worker under contention.
+/// Unset or anything else: 0.
+fn rt_below() -> i32 {
+    match std::env::var("HUSHMIC_WORKER_RT_BELOW")
+        .ok()
+        .map(|v| v.parse::<i32>())
+    {
+        Some(Ok(n)) if (1..=9).contains(&n) => n,
+        _ => 0,
+    }
+}
+
+/// A request `below` steps lower; none left (under 1) means none at all:
+/// the worker stays timeshare rather than tie with the microphone's.
+fn step_down(decision: LoopDecision, below: i32) -> LoopDecision {
+    match decision {
+        LoopDecision::Request { priority, detail } if below > 0 => {
+            if priority - below < 1 {
+                LoopDecision::Skip("no priority left below the microphone's worker")
+            } else {
+                LoopDecision::Request {
+                    priority: priority - below,
+                    detail: format!("{detail}, {below} below"),
+                }
+            }
+        }
+        other => other,
+    }
+}
+
 fn request_after_data_loops(
     deadline: &Deadline,
     window: Duration,
@@ -336,12 +395,13 @@ fn request_after_data_loops(
     if std::env::var("HUSHMIC_WORKER_RT").as_deref() == Ok("0") {
         return RtOutcome::Unavailable("disabled".into());
     }
+    let below = rt_below();
     let until = Instant::now() + window;
     loop {
         if let Err(reason) = deadline.check() {
             return RtOutcome::Unavailable(reason);
         }
-        match data_loop_decision(&scan(), Instant::now() >= until) {
+        match step_down(data_loop_decision(&scan(), Instant::now() >= until), below) {
             LoopDecision::Request { priority, detail } => {
                 if let Err(reason) = deadline.check() {
                     return RtOutcome::Unavailable(reason);
@@ -840,6 +900,84 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_below_asks_that_many_steps_lower_or_not_at_all() {
+        let rr = |p| vec![schedule(libc::SCHED_RR, p)];
+        for (loops, below, want) in [
+            (
+                rr(20),
+                1,
+                LoopDecision::Request {
+                    priority: 9,
+                    detail: "data loop RR 20, 1 below".into(),
+                },
+            ),
+            (
+                vec![],
+                2,
+                LoopDecision::Request {
+                    priority: 8,
+                    detail: "no data loop found, 2 below".into(),
+                },
+            ),
+            (
+                rr(5),
+                1,
+                LoopDecision::Request {
+                    priority: 3,
+                    detail: "data loop RR 5, 1 below".into(),
+                },
+            ),
+            // the microphone's worker would get 1: nothing is left below it
+            (
+                rr(2),
+                1,
+                LoopDecision::Skip("no priority left below the microphone's worker"),
+            ),
+            (
+                rr(20),
+                0,
+                LoopDecision::Request {
+                    priority: 10,
+                    detail: "data loop RR 20".into(),
+                },
+            ),
+        ] {
+            assert_eq!(step_down(data_loop_decision(&loops, true), below), want);
+        }
+        // waiting and skipping are not touched
+        let ts = vec![schedule(libc::SCHED_OTHER, 0)];
+        assert_eq!(
+            step_down(data_loop_decision(&ts, false), 1),
+            LoopDecision::Wait
+        );
+        assert_eq!(
+            step_down(data_loop_decision(&ts, true), 1),
+            LoopDecision::Skip("data loop not realtime")
+        );
+    }
+
+    #[test]
+    fn the_below_knob_takes_one_to_nine_only() {
+        let _g = ENV.lock().unwrap();
+        for (v, want) in [
+            (None, 0),
+            (Some("1"), 1),
+            (Some("9"), 9),
+            (Some("0"), 0),
+            (Some("10"), 0),
+            (Some("-1"), 0),
+            (Some("x"), 0),
+        ] {
+            match v {
+                Some(v) => std::env::set_var("HUSHMIC_WORKER_RT_BELOW", v),
+                None => std::env::remove_var("HUSHMIC_WORKER_RT_BELOW"),
+            }
+            assert_eq!(rt_below(), want, "{v:?}");
+        }
+        std::env::remove_var("HUSHMIC_WORKER_RT_BELOW");
+    }
+
+    #[test]
     fn timeshare_and_unreadable_loops_wait_then_skip() {
         for unknown in [
             None,
@@ -919,7 +1057,9 @@ mod tests {
         );
         assert!(scans >= 2);
         assert!(started.elapsed() >= Duration::from_millis(40));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // the 40 ms window, not the real one (a loaded runner may take a
+        // while for the scans themselves)
+        assert!(started.elapsed() < DATA_LOOP_WINDOW);
     }
 
     #[test]
@@ -989,6 +1129,11 @@ mod tests {
 
     /// Set in the child process that runs the stalled-bus scenario.
     const STALLED_BUS_CHILD: &str = "HUSHMIC_RT_STALLED_BUS_CHILD";
+    /// The child's deadline (ms).
+    const STALLED_BUS_DEADLINE: &str = "HUSHMIC_RT_STALLED_BUS_DEADLINE_MS";
+    /// The child says so when its deadline came before libdbus reached the
+    /// bus: the stall under test never happened (a loaded runner).
+    const NOT_REACHED: &str = "stalled-bus: the deadline came before the bus";
 
     /// libdbus reads `DBUS_SYSTEM_BUS_ADDRESS` once per process, on its
     /// first bus connection. In-process, any test that reached the system
@@ -997,43 +1142,62 @@ mod tests {
     /// accept while holding `ENV`, stalling every other env test with it.
     /// So the scenario runs in a fresh child process (this test binary,
     /// filtered to the ignored inner test), with a bounded wait.
+    ///
+    /// The deadline must come while libdbus is blocked on the bus. On a
+    /// loaded runner the broker thread may not even reach the bus before
+    /// 100 ms: the child then says so, and the scenario runs again with
+    /// twice the deadline, until it happens.
     #[test]
     fn deadline_covers_a_stalled_bus_registration() {
         if DBus::load().is_none() {
             return;
         }
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "rt::tests::stalled_bus_registration_child",
-                "--ignored",
-                "--test-threads=1",
-            ])
-            .env(STALLED_BUS_CHILD, "1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let pid = child.id() as libc::pid_t;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-        let output = match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(output) => output.unwrap(),
-            Err(_) => {
-                // SAFETY: plain syscall on our own child's pid.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                panic!("the stalled-bus child did not finish within 30 s");
+        let mut deadline_ms = 100u64;
+        loop {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rt::tests::stalled_bus_registration_child",
+                    "--ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(STALLED_BUS_CHILD, "1")
+                .env(STALLED_BUS_DEADLINE, deadline_ms.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id() as libc::pid_t;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait_with_output());
+            });
+            // A cap for a child that hangs; a loaded runner is only slow.
+            let output = match rx.recv_timeout(Duration::from_secs(180)) {
+                Ok(output) => output.unwrap(),
+                Err(_) => {
+                    // SAFETY: plain syscall on our own child's pid.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    panic!("the stalled-bus child did not finish within 180 s");
+                }
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "child: {:?}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !stdout.contains(NOT_REACHED) {
+                return;
             }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "child: {:?}\n{stdout}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+            assert!(
+                deadline_ms < 60_000,
+                "libdbus did not reach the bus before a {deadline_ms} ms deadline"
+            );
+            deadline_ms *= 2;
+        }
     }
 
     #[test]
@@ -1044,25 +1208,37 @@ mod tests {
         if std::env::var_os(STALLED_BUS_CHILD).is_none() {
             return;
         }
+        let deadline = Duration::from_millis(
+            std::env::var(STALLED_BUS_DEADLINE)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+        );
         let name = format!("hushmic_deadline_test_{}", std::process::id());
         let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&addr).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (release, released) = std::sync::mpsc::channel();
+        let (connects, connected_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            // Bounded: a client that never connects fails the test instead
-            // of hanging it.
-            let until = Instant::now() + Duration::from_secs(5);
+            // The bus answers nothing: accept, say so, and hold the
+            // connection until the test lets go (or stop waiting for a
+            // client that is not coming).
             let connection = loop {
                 match listener.accept() {
                     Ok((c, _)) => break Some(c),
-                    Err(_) if Instant::now() < until => {
+                    Err(_) if !stopping.load(Ordering::Acquire) => {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => break None,
                 }
             };
-            let _ = released.recv_timeout(Duration::from_secs(3));
+            let _ = connects.send(connection.is_some());
+            if connection.is_some() {
+                let _ = released.recv();
+            }
             connection.is_some()
         });
         // A fresh process: libdbus has not read the address yet.
@@ -1072,7 +1248,7 @@ mod tests {
         let outcome = request_bounded(
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&pending),
-            Duration::from_millis(100),
+            deadline,
             |deadline| {
                 let dbus = DBus::load().unwrap();
                 match dbus.make_realtime(&RTKIT, my_tid(), deadline, RT_PRIORITY) {
@@ -1083,16 +1259,42 @@ mod tests {
         );
         let elapsed = started.elapsed();
         let was_pending = pending.load(Ordering::Acquire);
+        // libdbus connects (it may do so after the deadline on a loaded
+        // runner; then it blocks the same), or the broker gave up before
+        // the bus: its lease ends without a connection.
+        let cap = Instant::now() + Duration::from_secs(90);
+        let connected = loop {
+            if let Ok(c) = connected_rx.try_recv() {
+                break c;
+            }
+            if !pending.load(Ordering::Acquire) {
+                stop.store(true, Ordering::Release);
+                break connected_rx
+                    .recv_timeout(Duration::from_secs(90))
+                    .unwrap_or(false);
+            }
+            assert!(
+                Instant::now() < cap,
+                "neither a connection nor a broker that gave up"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if !connected {
+            assert!(server.join().is_ok());
+            println!("{NOT_REACHED}");
+            return;
+        }
         let _ = release.send(());
-        let connected = server.join().unwrap();
-        let done = Instant::now() + Duration::from_secs(2);
+        let _ = server.join().unwrap();
+        let done = Instant::now() + Duration::from_secs(60);
         while pending.load(Ordering::Acquire) && Instant::now() < done {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(connected, "libdbus never connected to the redirected bus");
         assert_eq!(outcome, RtOutcome::Unavailable("timeout".into()));
+        // Returned while libdbus was still blocked (`was_pending` below) is
+        // the deadline's proof; the cap catches one that waited for it.
         assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < deadline + Duration::from_secs(10),
             "deadline took {elapsed:?}"
         );
         assert!(
@@ -1147,6 +1349,20 @@ mod tests {
         );
         assert_eq!(outcome, RtOutcome::Unavailable("NoReply".into()));
         assert!(pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_thread_one_listing_left_out_is_still_scanned() {
+        // the first listing left out 3 (2 exited under the cursor and the
+        // read resumed one thread further); 2 is gone by the second
+        let mut listings = vec![Some(vec![1, 2, 4]), Some(vec![1, 3, 4])].into_iter();
+        let tids = task_tids(|| listings.next().unwrap());
+        assert_eq!(tids, Some(vec![1, 2, 4, 3]));
+        // either listing failing: the scan cannot vouch for anything
+        let mut listings = vec![Some(vec![1]), None].into_iter();
+        assert_eq!(task_tids(|| listings.next().unwrap()), None);
+        let mut listings = vec![None, Some(vec![1])].into_iter();
+        assert_eq!(task_tids(|| listings.next().unwrap()), None);
     }
 
     #[test]

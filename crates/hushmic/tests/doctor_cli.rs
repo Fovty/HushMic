@@ -28,5 +28,5 @@ fn doctor_rejects_extra_flags_as_usage_error() {
         .args(["--doctor", "--version"])
         .output()
         .expect("spawn");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
 }

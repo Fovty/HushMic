@@ -90,6 +90,8 @@ pub struct AdaptiveEngine<E: HopEngine, P: Policy> {
     baseline: Vec<f32>,
     baseline_done: bool,
     announced_tier: Option<Tier>,
+    /// The last hop played the raw path alone (see `HopEngine::unfiltered`).
+    unfiltered: bool,
 }
 
 impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
@@ -134,6 +136,7 @@ impl<E: HopEngine, P: Policy> AdaptiveEngine<E, P> {
             baseline: Vec::with_capacity(BASELINE_WINDOW),
             baseline_done: false,
             announced_tier: None,
+            unfiltered: false,
         }
     }
 
@@ -255,6 +258,14 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
         self.hops += 1;
 
         let step = self.policy.step();
+        self.unfiltered = matches!(
+            step,
+            Step::Steady { live: Tier::Raw }
+                | Step::Shadow {
+                    live: Tier::Raw,
+                    ..
+                }
+        );
         self.raw_silent = match step {
             Step::Steady { live } | Step::Shadow { live, .. } => live != Tier::Raw,
             Step::Crossfade { .. } => false,
@@ -364,6 +375,9 @@ impl<E: HopEngine, P: Policy> HopEngine for AdaptiveEngine<E, P> {
 
     fn note_pause(&mut self, pause: Duration) {
         self.pause_hops += pause.as_secs_f32() * 100.0;
+    }
+    fn unfiltered(&self) -> bool {
+        self.unfiltered
     }
 }
 
@@ -675,6 +689,19 @@ mod tests {
         let paused = paused.lock().unwrap();
         assert!((paused[0] - 1.0).abs() < 1e-3, "{paused:?}");
         assert_eq!(paused[1], 0.0);
+    }
+
+    #[test]
+    fn the_raw_tier_reports_its_hops_unfiltered() {
+        let f = Fakes::new();
+        let mut out = [0.0; HOP];
+        let mut e = f.engine(Some(f.gain(2.0, 0.1)), None, Pinned(Tier::Raw));
+        assert!(!e.unfiltered(), "nothing played yet");
+        e.process_hop(&dc(0.5), &mut out).unwrap();
+        assert!(e.unfiltered());
+        let mut e = f.engine(Some(f.gain(2.0, 0.1)), None, Pinned(Tier::Quality));
+        e.process_hop(&dc(0.5), &mut out).unwrap();
+        assert!(!e.unfiltered());
     }
 
     #[test]
